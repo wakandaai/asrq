@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-asrq-cli = "asrq.cli:main"
+asrq-exp = "asrq.exp:main"
 
 [tool.setuptools.packages.find]
 include = ["asrq*"]

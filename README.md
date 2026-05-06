@@ -33,15 +33,6 @@ Transforms improve weight and activation distributions before quantization:
 
 ## Installation
 
-```bash
-pip install -e .
-```
-
-Additional dependencies (not listed in `pyproject.toml`) are needed at runtime:
-
-```bash
-pip install torch transformers datasets evaluate lhotse soundfile scikit-learn
-```
 
 For NeMo models (Parakeet, Canary):
 
@@ -49,22 +40,31 @@ For NeMo models (Parakeet, Canary):
 pip install "nemo-toolkit[asr]"
 ```
 
+```bash
+pip install "transformers==4.57.6" "datasets==3.6.0" evaluate lhotse soundfile scikit-learn
+```
+
+
 ## Quick Start
 
 ASRQ uses [Hydra](https://hydra.cc/) for configuration. Run via the CLI:
 
 ```bash
 # Quantize Whisper with GPTQ (4-bit, group size 128)
-asrq-cli model=whisper quantizer=gptq
+python asrq/exp.py model=whisper quantizer=gptq
 
 # Quantize with RTN (no calibration)
-asrq-cli model=whisper quantizer=rtn
+python asrq/exp.py model=whisper quantizer=rtn
+
+# Learn rotation transform
+python asrq/rot-exp.py
 
 # Apply rotation transform before quantizing
-asrq-cli model=whisper quantizer=gptq transform=rotation
+python asrq/exp.py model=whisper quantizer=gptq transform=rotation
+
 
 # Override specific parameters
-asrq-cli model=whisper quantizer=gptq quantizer.bits=3 quantizer.group_size=64
+python asrq/exp.py model=whisper quantizer=gptq quantizer.bits=3 quantizer.group_size=64 transform=scaling
 ```
 
 ---
@@ -146,13 +146,6 @@ Override any value from the command line:
 ```bash
 asrq/asrq-exp.py model=parakeet quantizer.bits=2 quantizer.group_size=64 transform=scaling
 ```
-
-## How Quantization Works
-
-1. **LinearQ** replaces `nn.Linear` layers with quantized versions that store weights as packed uint8 tensors with per-group float16 scales and zeros.
-2. **Dequantization** happens on-the-fly during the forward pass: `W = packed_weight × scale + zero`.
-3. **Calibration-based methods** (GPTQ, ULBQ) collect Hessian information from calibration batches to make adaptive rounding decisions.
-4. **Modules listed in `exclude_modules`** are kept in full precision.
 
 ## Evaluation
 
