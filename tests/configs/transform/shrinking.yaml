@@ -1,0 +1,5 @@
+name: shrinking
+path: ""
+obtain_factors: True
+use: True
+alpha: 0.5

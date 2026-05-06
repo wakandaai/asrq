@@ -1,0 +1,9 @@
+name: openai/whisper-large-v3
+
+# Quantization settings
+exclude_modules:
+  - proj_out
+
+# evaluation
+eval_batch_size: 64
+generate_fn: generate_whisper

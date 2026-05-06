@@ -1,0 +1,15 @@
+defaults:
+  - quantizer: gptq
+  - model: whisper
+  - transform: rotation
+  - _self_
+
+output_dir: ./outputs
+seed: 42
+
+calibration:
+  num_samples: 4
+
+evaluate: True
+method: "test"
+activation_bits: 16

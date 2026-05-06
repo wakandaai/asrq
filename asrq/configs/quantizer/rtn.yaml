@@ -1,0 +1,4 @@
+name: rtn
+bits: 4
+group_size: 128
+symmetric: True

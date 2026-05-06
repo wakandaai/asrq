@@ -1,0 +1,8 @@
+name: rotation
+num_samples: 8
+epochs: 1
+learning_rate: 1.5
+batch_size: 4
+path: ""
+learn_rotation: False
+use: True

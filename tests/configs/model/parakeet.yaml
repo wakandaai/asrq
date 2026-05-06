@@ -1,0 +1,8 @@
+name: nvidia/parakeet-ctc-1.1b
+
+# Quantization settings
+exclude_modules: []
+
+# evaluation
+eval_batch_size: 192
+generate_fn: generate_parakeet

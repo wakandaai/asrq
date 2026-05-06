@@ -1,0 +1,15 @@
+defaults:
+  - quantizer: gptq
+  - model: canary_qwen
+  - transform: rotscaling
+  - _self_
+
+seed: 42
+
+calibration:
+  num_samples: 2048
+
+evaluate: True
+method: "asrq"
+activation_bits: 16
+create_audio_files: False

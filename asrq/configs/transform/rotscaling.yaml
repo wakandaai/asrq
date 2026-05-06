@@ -1,0 +1,5 @@
+name: rotscaling
+path: ""
+obtain_scales: True
+use: True
+type: max

@@ -1,0 +1,4 @@
+name: ulbq
+bits: 4
+block_size: 128
+percdamp: 0.01

@@ -1,0 +1,5 @@
+name: scaling
+path: ""
+obtain_scales: True
+use: True
+type: smoothquant # or awq
