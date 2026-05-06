@@ -17,7 +17,6 @@ ASRQ lets you quantize large pre-trained ASR models to lower bit-widths (2–8 b
 |--------|-------------|
 | **RTN** | Round-to-nearest baseline. No calibration needed. |
 | **GPTQ** | Hessian-aware quantization that minimizes quantization-induced loss. |
-| **ASRQ** | Custom ASR-specific quantization. |
 | **ULBQ** | Ultra-low-bit mixed-precision quantization with K-Means clustering and outlier handling. |
 
 ## Pre-Quantization Transforms
