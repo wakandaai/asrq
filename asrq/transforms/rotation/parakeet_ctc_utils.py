@@ -651,11 +651,13 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
     mode = "hadamard"
     encoder_hidden_size = model.encoder.layers[0].conv.d_model
     num_encoder_layers = len(model.encoder.layers)
-    Qe = get_orthogonal_matrix(encoder_hidden_size, mode=mode, device="cuda")
+    _seed = torch.initial_seed() & 0xFFFFFFFF
+    _sc = 0
+    Qe = get_orthogonal_matrix(encoder_hidden_size, mode=mode, device="cuda", seed=_seed + _sc); _sc += 1
     Q2s = {}
     for i in range(num_encoder_layers):
         head_dim = model.encoder.layers[i].self_attn.d_k
-        rot = get_orthogonal_matrix(head_dim, mode=mode, device="cuda")
+        rot = get_orthogonal_matrix(head_dim, mode=mode, device="cuda", seed=_seed + _sc); _sc += 1
         Q2s[f"encoder.layers.{i}.self_attn"] = rot
     
     # Make Q, Q2s trainable parameters
@@ -684,13 +686,16 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
 
     # Build calibration dataset and dataloader
     from functools import partial
-    calib_ds = ParakeetCalibrationDataset(model, num_samples=calib_samples)
+    calib_ds = ParakeetCalibrationDataset(model, num_samples=calib_samples, seed=_seed)
     pad_id = model.tokenizer.pad_id if hasattr(model.tokenizer, "pad_id") and model.tokenizer.pad_id > 0 else 0
     collate_fn = partial(parakeet_ctc_collate_fn, pad_id=pad_id)
+    _dl_generator = torch.Generator()
+    _dl_generator.manual_seed(_seed + _sc)
     train_loader = torch.utils.data.DataLoader(
         calib_ds,
         batch_size=batch_size,
         shuffle=True,
+        generator=_dl_generator,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=True,
@@ -700,6 +705,12 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
     trainable_params = [Qe] + list(Q2s.values())
     optimizer = SGDG(trainable_params, lr=lr, stiefel=True)
     model.train()
+    # This is for just one epoch
+    # I want the learning rate to decay linearly to 0
+    # starting with 1.5, it decays to 0
+    num_steps = len(train_loader) * epochs
+    lr_lambda = lambda step: max(0, (num_steps - step) / num_steps)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     
     for epoch in range(epochs):
         total_loss = 0.0
@@ -707,13 +718,17 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
         for batch in train_loader:
             optimizer.zero_grad()
             loss = parakeet_ctc_loss_fn(model, batch)
+            # ctc_loss_backward_gpu has no deterministic kernel; disable only for this call
+            torch.use_deterministic_algorithms(False)
             loss.backward()
+            torch.use_deterministic_algorithms(True)
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
             num_batches += 1
         avg_loss = total_loss / num_batches
         print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
-        
+        # breakpoint()
 
     to_save = {
         "Qe": Qe.data.detach().cpu(),

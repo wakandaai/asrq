@@ -59,6 +59,7 @@ def main(cfg: DictConfig) -> None:
     # Transforms
     if cfg.transform.name == "none":
         print("No transform will be applied.")
+        modelQ.model.to("cuda")
     else:
         transform_cfg = TransformConfig.from_dictconfig(cfg.transform)
         transform = BaseTransform.from_config(transform_cfg)

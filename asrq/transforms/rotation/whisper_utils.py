@@ -572,19 +572,21 @@ def obtain_rotations_for_whisper(
 
     # create model rotations
     mode = "hadamard"
-    Qe = get_orthogonal_matrix(model.config.d_model, mode=mode, device=device)
-    Qd = get_orthogonal_matrix(model.config.d_model, mode=mode, device=device)
+    _seed = torch.initial_seed() & 0xFFFFFFFF
+    _sc = 0
+    Qe = get_orthogonal_matrix(model.config.d_model, mode=mode, device=device, seed=_seed + _sc); _sc += 1
+    Qd = get_orthogonal_matrix(model.config.d_model, mode=mode, device=device, seed=_seed + _sc); _sc += 1
     Q2s = {}
     for i in range(model.config.encoder_layers):
         head_dim: int = model.model.encoder.layers[i].self_attn.head_dim # type: ignore
-        rot = get_orthogonal_matrix(head_dim, mode=mode, device=device)
+        rot = get_orthogonal_matrix(head_dim, mode=mode, device=device, seed=_seed + _sc); _sc += 1
         Q2s[f"model.encoder.layers.{i}.self_attn"] = rot
     for i in range(model.config.decoder_layers):
         head_dim: int = model.model.decoder.layers[i].self_attn.head_dim # type: ignore
-        rot = get_orthogonal_matrix(head_dim, mode=mode, device=device)
+        rot = get_orthogonal_matrix(head_dim, mode=mode, device=device, seed=_seed + _sc); _sc += 1
         Q2s[f"model.decoder.layers.{i}.self_attn"] = rot
         head_dim: int = model.model.decoder.layers[i].encoder_attn.head_dim # type: ignore
-        rot = get_orthogonal_matrix(head_dim, mode=mode, device=device)
+        rot = get_orthogonal_matrix(head_dim, mode=mode, device=device, seed=_seed + _sc); _sc += 1
         Q2s[f"model.decoder.layers.{i}.encoder_attn"] = rot
 
     # Qs are parameters
@@ -605,7 +607,7 @@ def obtain_rotations_for_whisper(
     # -----------------------------------------------------------------------
 
 
-    calib_ds = WhisperCalibrationDataset(processor, num_samples=calib_samples)
+    calib_ds = WhisperCalibrationDataset(processor, num_samples=calib_samples, seed=_seed)
     train_loader = torch.utils.data.DataLoader(
         calib_ds,
         batch_size=batch_size,

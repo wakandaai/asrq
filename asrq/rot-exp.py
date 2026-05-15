@@ -20,14 +20,15 @@ import asrq.evaluation.openasr as openasr
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 
+
 def set_seed(seed=42):
-    torch.random.manual_seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-    # Ensure deterministic behavior for some ops
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=False)
     transformers.set_seed(seed)
 
 # Load configs from tests/configs using Hydra
@@ -54,6 +55,8 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
     # Transform
     transform = BaseTransform.from_config(transform_cfg)
     modelQ.model.to("cuda")
+    set_seed(cfg.seed)  # re-seed after model loading to ensure deterministic Q init + DataLoader shuffle
     transform.obtain_transform(modelQ)
+    
 
     print("Done with obtaining rotations")

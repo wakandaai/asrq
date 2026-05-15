@@ -104,7 +104,7 @@ class SGDG(Optimizer):
         )
         if nesterov and (momentum <= 0 or dampening != 0):
             raise ValueError("Nesterov momentum requires a momentum and zero dampening")
-        random.seed(42)
+        # Do not re-seed random here — let the caller's set_seed(cfg.seed) control the sequence.
         super(SGDG, self).__init__(params, defaults)
 
     def __setstate__(self, state) -> None:

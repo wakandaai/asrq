@@ -105,9 +105,11 @@ def random_orthogonal_matrix(
         Orthogonal ``(n, n)`` tensor in ``float64``.
     """
     if seed is not None:
-        torch.manual_seed(seed)
-
-    random_matrix = torch.randn(n, n, dtype=torch.float64, device=device)
+        _gen = torch.Generator()
+        _gen.manual_seed(seed)
+        random_matrix = torch.randn(n, n, dtype=torch.float64, generator=_gen).to(device)
+    else:
+        random_matrix = torch.randn(n, n, dtype=torch.float64, device=device)
     q, r = torch.linalg.qr(random_matrix)
     # Fix the sign ambiguity so we sample from Haar measure
     q *= torch.sign(torch.diag(r)).unsqueeze(0)
@@ -132,8 +134,7 @@ def get_orthogonal_matrix(
         Orthogonal ``(n, n)`` tensor in ``float64``.
     """
     if mode == "hadamard":
-        # return random_hadamard_matrix(n, device=device, seed=seed)
-        return random_hadamard_matrix(n, device)
+        return random_hadamard_matrix(n, device, seed=seed)
     elif mode == "random":
         return random_orthogonal_matrix(n, device=device, seed=seed)
     else:

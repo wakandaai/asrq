@@ -84,9 +84,14 @@ def matmul_hadU(X, transpose=False):
 def matmul_hadUt(X):
     return matmul_hadU(X, transpose=True)
 
-def random_hadamard_matrix(size, device):
+def random_hadamard_matrix(size, device, seed=None):
     # See https://cornell-relaxml.github.io/quip-sharp/ , Section "Randomized Hadamard Transformation"
-    Q = torch.randint(low=0, high=2, size=(size,)).to(torch.float64)
+    if seed is not None:
+        _gen = torch.Generator()
+        _gen.manual_seed(seed)
+        Q = torch.randint(low=0, high=2, size=(size,), generator=_gen).to(torch.float64)
+    else:
+        Q = torch.randint(low=0, high=2, size=(size,)).to(torch.float64)
     Q = Q * 2 - 1
     Q = torch.diag(Q)
     return matmul_hadU(Q).to(device)

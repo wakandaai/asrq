@@ -4,16 +4,20 @@ import os
 
 # Important: Provide the absolute path to your CUTLASS include directory here
 # Example: CUTLASS_INCLUDE_DIR = "/home/user/cutlass/include"
-CUTLASS_INCLUDE_DIR = os.environ.get("CUTLASS_INCLUDE_DIR", "/usr/local/cuda/include")
+CUTLASS_INCLUDE_DIR = os.environ.get("CUTLASS_INCLUDE_DIR", "cutlass/include")
 
 print("Compiling CUDA kernel with PyTorch (this might take a minute)...")
 int4_ext = load(
     name="int4_ext",
-    sources=["gemm.cu", "bindings.cpp"],
+    sources=["asrq/kernel/gemm.cu", "asrq/kernel/bindings.cpp"],
     extra_include_paths=[CUTLASS_INCLUDE_DIR],
+    extra_cflags=["-std=c++17"],
     extra_cuda_cflags=[
         "-O3",
+        "-std=c++17",
         "-arch=sm_90",          # Target H100 (Hopper)
+        "--expt-relaxed-constexpr",   # required by CUTLASS 3.x / CuTe
+        "--expt-extended-lambda",     # required by CuTe closures
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",

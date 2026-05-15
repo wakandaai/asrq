@@ -68,9 +68,10 @@ class CanaryQwenCalibrationDataset(torch.utils.data.Dataset):
         # Append transcription tokens and EOS
         text_tokens = torch.tensor(self.model.tokenizer.text_to_ids(text), dtype=torch.long)
         eos = torch.tensor([self.model.tokenizer.eos], dtype=torch.long)
-        tokens = torch.cat([base_tokens, text_tokens, eos])
+        tokens = torch.cat([text_tokens, eos])
 
         return audio, audio_len, tokens
+    
 
 
 def canaryqwen_collate_fn(batch, pad_id):
@@ -86,10 +87,15 @@ def canaryqwen_collate_fn(batch, pad_id):
         audios[i, : a.shape[0]] = a
 
     # Left-pad tokens (SALM convention)
-    max_token_len = max(t.shape[0] for t in tokens_list)
+    # <|im_start|>user\nTranscribe the following: <audio_alocator_tag>\n<|im_start|>assistant\n
+    init_tokens = torch.tensor(
+        [151644, 872, 198, 3167, 3114, 279, 2701, 25, 220, 151669, 151645, 198, 151644, 77091, 198]
+    )
+    max_token_len = max(t.shape[0] for t in tokens_list) + init_tokens.shape[0]
     tokens = torch.full((len(batch), max_token_len), pad_id, dtype=torch.long)
     for i, t in enumerate(tokens_list):
         tokens[i, -t.shape[0] :] = t
+        tokens[i, -(init_tokens.shape[0] + t.shape[0]) : -t.shape[0]] = init_tokens
 
     return {"audios": audios, "audio_lens": audio_lens, "tokens": tokens}
 
@@ -100,6 +106,7 @@ def canaryqwen_loss_fn(model, batch):
     audios = batch["audios"].to(device)
     audio_lens = batch["audio_lens"].to(device)
     tokens = batch["tokens"].to(device)
+
 
     # Encode audio through perception module
     audio_embeds, audio_embed_lens = model.perception(
@@ -424,6 +431,10 @@ def canaryqwen_model_forward(
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        if torch.isnan(hidden_states).any():
+            breakpoint()
+        if torch.isinf(hidden_states).any():
+            breakpoint()
 
     # ====== ROTATION: Inverse-rotate before final norm ======
     hidden_states = self.process_residual_stream_output(hidden_states)
@@ -434,6 +445,7 @@ def canaryqwen_model_forward(
         past_key_values=past_key_values if use_cache else None,
     )
 
+from transformers.models.qwen3.modeling_qwen3 import Qwen3Model
 
 def conformer_encoder_forward(
     self,
@@ -846,9 +858,9 @@ def transcribe(model, filepath):
 
 
 def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:int, epochs:int, batch_size:int, lr:float, save_path:str):
-    if os.path.exists(save_path):
-        # exit
-        sys.exit(0)
+    # if os.path.exists(save_path):
+    #     # exit
+    #     sys.exit(0)
 
     model.to("cuda")
 
@@ -875,16 +887,18 @@ def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:i
     encoder_hidden_size = model.perception.encoder.layers[0].conv.d_model
     num_decoder_layers = model.llm.config.num_hidden_layers
     num_encoder_layers = len(model.perception.encoder.layers)
-    Qe = get_orthogonal_matrix(encoder_hidden_size, mode=mode, device="cuda")
-    Qd = get_orthogonal_matrix(hidden_size, mode=mode, device="cuda")
+    _seed = torch.initial_seed() & 0xFFFFFFFF
+    _sc = 0
+    Qe = get_orthogonal_matrix(encoder_hidden_size, mode=mode, device="cuda", seed=_seed + _sc); _sc += 1
+    Qd = get_orthogonal_matrix(hidden_size, mode=mode, device="cuda", seed=_seed + _sc); _sc += 1
     Q2s = {}
     for i in range(num_decoder_layers):
         head_dim = model.llm.base_model.model.model.layers[i].self_attn.head_dim
-        rot = get_orthogonal_matrix(head_dim, mode=mode, device="cuda")
+        rot = get_orthogonal_matrix(head_dim, mode=mode, device="cuda", seed=_seed + _sc); _sc += 1
         Q2s[f"llm.base_model.model.model.layers.{i}.self_attn"] = rot
     for i in range(num_encoder_layers):
         head_dim = model.perception.encoder.layers[i].self_attn.d_k
-        rot = get_orthogonal_matrix(head_dim, mode=mode, device="cuda")
+        rot = get_orthogonal_matrix(head_dim, mode=mode, device="cuda", seed=_seed + _sc); _sc += 1
         Q2s[f"perception.encoder.layers.{i}.self_attn"] = rot
     
     # Make Q, Q2s trainable parameters
@@ -915,12 +929,15 @@ def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:i
 
     # Build calibration dataset and dataloader
     from functools import partial
-    calib_ds = CanaryQwenCalibrationDataset(model, num_samples=calib_samples)
+    calib_ds = CanaryQwenCalibrationDataset(model, num_samples=calib_samples, seed=_seed)
     collate_fn = partial(canaryqwen_collate_fn, pad_id=model.text_pad_id)
+    _dl_generator = torch.Generator()
+    _dl_generator.manual_seed(_seed + _sc)
     train_loader = torch.utils.data.DataLoader(
         calib_ds,
         batch_size=batch_size,
         shuffle=True,
+        generator=_dl_generator,
         collate_fn=collate_fn,
         num_workers=0,
         pin_memory=True,
@@ -930,6 +947,13 @@ def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:i
     trainable_params = [Qe, Qd] + list(Q2s.values())
     optimizer = SGDG(trainable_params, lr=lr, stiefel=True)
     model.train()
+
+    # This is for just one epoch
+    # I want the learning rate to decay linearly to 0
+    # starting with 1.5, it decays to 0
+    num_steps = len(train_loader) * epochs
+    lr_lambda = lambda step: max(0, (num_steps - step) / num_steps)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     
     for epoch in range(epochs):
         total_loss = 0.0
@@ -939,6 +963,7 @@ def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:i
             loss = canaryqwen_loss_fn(model, batch)
             loss.backward()
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
             num_batches += 1
         avg_loss = total_loss / num_batches

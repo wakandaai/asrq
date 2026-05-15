@@ -85,3 +85,6 @@ metrics.txt
 dump/
 slurm-*
 slurm_*
+
+# cuda
+cutlass/
