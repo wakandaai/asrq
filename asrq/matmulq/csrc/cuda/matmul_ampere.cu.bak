@@ -1,0 +1,263 @@
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include "ptx.h"
+
+namespace ap = asrq_ptx;
+
+// ---------- Tile config ----------
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 32;
+
+constexpr int WM = 32;            // warp tile rows
+constexpr int WN = 64;            // warp tile cols
+constexpr int WARPS_M = BM / WM;  // 4
+constexpr int WARPS_N = BN / WN;  // 2
+constexpr int NWARPS  = WARPS_M * WARPS_N; // 8
+constexpr int NTHREADS = NWARPS * 32;      // 256
+
+constexpr int MMA_M = 16;
+constexpr int MMA_N = 8;
+constexpr int MMA_K = 16;
+constexpr int FRAGS_M = WM / MMA_M;   // 2
+constexpr int FRAGS_N = WN / MMA_N;   // 8
+constexpr int FRAGS_K = BK / MMA_K;   // 2
+
+constexpr int STAGES = 3;             // pipeline depth
+constexpr int SK = BK + 8;            // row padding -> avoid bank conflicts
+
+constexpr int SMEM_STAGE_HALFS = (BM + BN) * SK;            // halfs per stage
+constexpr int SMEM_BYTES       = STAGES * SMEM_STAGE_HALFS * 2;
+constexpr int AS_OFFSET_HALFS  = 0;
+constexpr int BS_OFFSET_HALFS  = BM * SK;
+
+__device__ __forceinline__ void zero_16(__half* smem_ptr) {
+    uint4 z = {0, 0, 0, 0};
+    *reinterpret_cast<uint4*>(smem_ptr) = z;
+}
+
+__global__ __launch_bounds__(NTHREADS)
+void matmul_tc_kernel(
+    const __half* __restrict__ A,
+    const __half* __restrict__ B,
+    __half* __restrict__ C, int M, int N, int K)
+{
+    extern __shared__ __align__(16) __half smem[];
+    auto As = [&](int stage, int m, int k) -> __half& {
+        return smem[stage * SMEM_STAGE_HALFS + AS_OFFSET_HALFS + m * SK + k];
+    };
+    auto Bs = [&](int stage, int n, int k) -> __half& {
+        return smem[stage * SMEM_STAGE_HALFS + BS_OFFSET_HALFS + n * SK + k];
+    };
+
+    const int offset_m = blockIdx.y * BM;
+    const int offset_n = blockIdx.x * BN;
+    const int tid  = threadIdx.x;
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp / WARPS_N;
+    const int warp_n = warp % WARPS_N;
+
+    // Per-thread accumulators: 4 fp32 per (i_frag, j_frag) for mma.m16n8k16
+    float Cf[FRAGS_M][FRAGS_N][4];
+    #pragma unroll
+    for (int i = 0; i < FRAGS_M; i++)
+        #pragma unroll
+        for (int j = 0; j < FRAGS_N; j++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) Cf[i][j][e] = 0.0f;
+
+    // cp.async transfer plan: each cp.async = 16 B = 8 fp16
+    constexpr int VEC = 8;
+    constexpr int COLS_VEC = BK / VEC;             // 4
+    constexpr int A_VECS = BM * BK / VEC;          // 512
+    constexpr int B_VECS = BN * BK / VEC;          // 512
+    constexpr int A_VPT  = A_VECS / NTHREADS;      // 2
+    constexpr int B_VPT  = B_VECS / NTHREADS;      // 2
+
+    auto issue_load = [&](int stage, int k_global) {
+        #pragma unroll
+        for (int v = 0; v < A_VPT; v++) {
+            int idx = v * NTHREADS + tid;
+            int row = idx / COLS_VEC;
+            int col = (idx % COLS_VEC) * VEC;
+            int gm = offset_m + row;
+            int gk = k_global  + col;
+            __half* sptr = &As(stage, row, col);
+            if (gm < M && gk + VEC <= K)
+                ap::cp_async_16(ap::cvta_to_shared(sptr), &A[gm * K + gk]);
+            else
+                zero_16(sptr);
+        }
+        #pragma unroll
+        for (int v = 0; v < B_VPT; v++) {
+            int idx = v * NTHREADS + tid;
+            int row = idx / COLS_VEC;
+            int col = (idx % COLS_VEC) * VEC;
+            int gn = offset_n + row;
+            int gk = k_global  + col;
+            __half* sptr = &Bs(stage, row, col);
+            if (gn < N && gk + VEC <= K)
+                ap::cp_async_16(ap::cvta_to_shared(sptr), &B[gn * K + gk]);
+            else
+                zero_16(sptr);
+        }
+        ap::cp_async_commit_group();
+    };
+
+    const int num_k_iters = (K + BK - 1) / BK;
+
+    // Prologue: prime STAGES-1 stages
+    int k_iter  = 0;
+    int stage_w = 0;
+    #pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (k_iter < num_k_iters) {
+            issue_load(stage_w, k_iter * BK);
+            k_iter++;
+            stage_w = (stage_w + 1) % STAGES;
+        } else {
+            ap::cp_async_commit_group();
+        }
+    }
+
+    int stage_r = 0;
+
+    const int warp_m_base = warp_m * WM;
+    const int warp_n_base = warp_n * WN;
+    const int row_in_16 = lane % 16;
+    const int col_off_8 = (lane / 16) * 8;
+
+    for (int ki = 0; ki < num_k_iters; ki++) {
+        ap::cp_async_wait_group<STAGES - 2>();
+        __syncthreads();
+
+        // ---------- Compute on stage_r (inner-K software pipeline) ----------
+        // Two register sets ping-pong: load kk+1 while computing kk.
+        uint32_t Af[2][FRAGS_M][4];
+        uint32_t Bf[2][FRAGS_N][2];
+
+        auto load_k = [&](int kk, int slot) {
+            const int k_base = kk * MMA_K;
+            #pragma unroll
+            for (int i = 0; i < FRAGS_M; i++) {
+                __half* a_ptr = &As(stage_r,
+                                    warp_m_base + i * MMA_M + row_in_16,
+                                    k_base + col_off_8);
+                ap::ldmatrix_x4(Af[slot][i], ap::cvta_to_shared(a_ptr));
+            }
+            #pragma unroll
+            for (int jj = 0; jj < FRAGS_N / 2; jj++) {
+                int n_base = warp_n_base + jj * 16;
+                __half* b_ptr = &Bs(stage_r,
+                                    n_base + row_in_16,
+                                    k_base + col_off_8);
+                uint32_t tmp[4];
+                ap::ldmatrix_x4(tmp, ap::cvta_to_shared(b_ptr));
+                Bf[slot][jj * 2 + 0][0] = tmp[0];
+                Bf[slot][jj * 2 + 0][1] = tmp[2];
+                Bf[slot][jj * 2 + 1][0] = tmp[1];
+                Bf[slot][jj * 2 + 1][1] = tmp[3];
+            }
+        };
+
+        // Prime slot 0 with kk=0
+        load_k(0, 0);
+
+        #pragma unroll
+        for (int kk = 0; kk < FRAGS_K; kk++) {
+            int cur = kk & 1;
+            int nxt = (kk + 1) & 1;
+            // Prefetch kk+1 while we issue mma for kk
+            if (kk + 1 < FRAGS_K) load_k(kk + 1, nxt);
+
+            #pragma unroll
+            for (int i = 0; i < FRAGS_M; i++) {
+                #pragma unroll
+                for (int j = 0; j < FRAGS_N; j++) {
+                    ap::mma_m16n8k16_f32_f16(
+                        Cf[i][j], Af[cur][i], Bf[cur][j], Cf[i][j]);
+                }
+            }
+        }
+
+        // ---------- Schedule next stage's load ----------
+        if (k_iter < num_k_iters) {
+            issue_load(stage_w, k_iter * BK);
+            k_iter++;
+            stage_w = (stage_w + 1) % STAGES;
+        } else {
+            ap::cp_async_commit_group();
+        }
+        stage_r = (stage_r + 1) % STAGES;
+    }
+
+    ap::cp_async_wait_all();
+    __syncthreads();
+
+    // ---------- Store C ----------
+    // mma.m16n8k16 fp32 accumulator layout:
+    //   c[0] at (r0,    c0)   c[1] at (r0,    c0+1)
+    //   c[2] at (r0+8,  c0)   c[3] at (r0+8,  c0+1)
+    const int r0 = lane / 4;
+    const int r1 = r0 + 8;
+    const int c0 = (lane % 4) * 2;
+
+    // Fast path: block fully inside the matrix -> pack 2 fp16 -> 1 st.b32.
+    const bool full_tile =
+        (offset_m + BM <= M) && (offset_n + BN <= N);
+
+    if (full_tile) {
+        #pragma unroll
+        for (int i = 0; i < FRAGS_M; i++) {
+            #pragma unroll
+            for (int j = 0; j < FRAGS_N; j++) {
+                int row_base = offset_m + warp_m * WM + i * MMA_M;
+                int col_base = offset_n + warp_n * WN + j * MMA_N;
+                int gm0 = row_base + r0;
+                int gm1 = row_base + r1;
+                int gn0 = col_base + c0;
+                __half2 p0 = __floats2half2_rn(Cf[i][j][0], Cf[i][j][1]);
+                __half2 p1 = __floats2half2_rn(Cf[i][j][2], Cf[i][j][3]);
+                *reinterpret_cast<__half2*>(&C[gm0 * N + gn0]) = p0;
+                *reinterpret_cast<__half2*>(&C[gm1 * N + gn0]) = p1;
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < FRAGS_M; i++) {
+            #pragma unroll
+            for (int j = 0; j < FRAGS_N; j++) {
+                int row_base = offset_m + warp_m * WM + i * MMA_M;
+                int col_base = offset_n + warp_n * WN + j * MMA_N;
+                int gm0 = row_base + r0;
+                int gm1 = row_base + r1;
+                int gn0 = col_base + c0;
+                int gn1 = gn0 + 1;
+                if (gm0 < M && gn0 < N) C[gm0 * N + gn0] = __float2half(Cf[i][j][0]);
+                if (gm0 < M && gn1 < N) C[gm0 * N + gn1] = __float2half(Cf[i][j][1]);
+                if (gm1 < M && gn0 < N) C[gm1 * N + gn0] = __float2half(Cf[i][j][2]);
+                if (gm1 < M && gn1 < N) C[gm1 * N + gn1] = __float2half(Cf[i][j][3]);
+            }
+        }
+    }
+}
+
+void matmul_16x16_launcher(
+    const __half* A, const __half* B, __half* C, int M, int N, int K)
+{
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(
+            (const void*) matmul_tc_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            SMEM_BYTES);
+        attr_set = true;
+    }
+    int numBlocksM = (M + BM - 1) / BM;
+    int numBlocksN = (N + BN - 1) / BN;
+    dim3 gridDim(numBlocksN, numBlocksM);
+    dim3 blockDim(NTHREADS);
+    matmul_tc_kernel<<<gridDim, blockDim, SMEM_BYTES>>>(A, B, C, M, N, K);
+}

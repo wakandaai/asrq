@@ -1,0 +1,246 @@
+// sm_90 (Hopper) GEMM: wgmma + cp.async, no-swizzle "core-matrix tiled" SMEM.
+// 2 warpgroups per CTA (256 threads). Block tile = BM x BN with each
+// warpgroup computing a 64-row stripe; each warpgroup issues 2 wgmma per
+// K-tile to cover BN=256 (two N-halves of 128 each, two D-accumulators).
+
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include "ptx.h"
+
+namespace ap = asrq_ptx;
+
+// ---------- Tile config ----------
+constexpr int BM = 128;
+constexpr int BN = 256;
+constexpr int BK = 64;
+constexpr int NWG       = 2;
+constexpr int NTHREADS  = NWG * 128;        // 256
+constexpr int WG_M      = BM / NWG;         // 64
+constexpr int WGMMA_M   = 64;
+constexpr int WGMMA_N   = 128;
+constexpr int WGMMA_K   = 16;
+constexpr int N_HALVES  = BN / WGMMA_N;     // 2
+constexpr int FRAGS_K   = BK / WGMMA_K;     // 4
+
+constexpr int STAGES = 4;
+
+// Core matrix = 8 rows x 8 fp16 = 128 bytes = 64 halfs.
+constexpr int CMAT_HALFS = 64;
+constexpr int CMAT_BYTES = 128;
+constexpr int NK_GRPS = BK / 8;             // 8
+constexpr int NM_GRPS = BM / 8;             // 16
+constexpr int NN_GRPS = BN / 8;             // 32
+
+constexpr int AS_TILE_HALFS = NM_GRPS * NK_GRPS * CMAT_HALFS;       // 8192  (16 KB)
+constexpr int BS_TILE_HALFS = NN_GRPS * NK_GRPS * CMAT_HALFS;       // 16384 (32 KB)
+constexpr int SMEM_STAGE_HALFS = AS_TILE_HALFS + BS_TILE_HALFS;     // 24576 (48 KB)
+constexpr int SMEM_BYTES       = STAGES * SMEM_STAGE_HALFS * 2;     // 192 KB @ STAGES=4
+
+constexpr int AS_OFFSET_HALFS  = 0;
+constexpr int BS_OFFSET_HALFS  = AS_TILE_HALFS;
+
+constexpr uint32_t LBO_BYTES = CMAT_BYTES;
+constexpr uint32_t SBO_BYTES = (uint32_t)NK_GRPS * CMAT_BYTES;
+
+__device__ __forceinline__ void zero_16(__half* smem_ptr) {
+    uint4 z = {0, 0, 0, 0};
+    *reinterpret_cast<uint4*>(smem_ptr) = z;
+}
+
+__device__ __forceinline__ int as_off(int m, int k) {
+    int m_grp = m >> 3;
+    int k_grp = k >> 3;
+    int r     = m & 7;
+    int c     = k & 7;
+    return (m_grp * NK_GRPS + k_grp) * CMAT_HALFS + r * 8 + c;
+}
+__device__ __forceinline__ int bs_off(int n, int k) {
+    int n_grp = n >> 3;
+    int k_grp = k >> 3;
+    int r     = n & 7;
+    int c     = k & 7;
+    return (n_grp * NK_GRPS + k_grp) * CMAT_HALFS + r * 8 + c;
+}
+
+__global__ __launch_bounds__(NTHREADS)
+void matmul_tc_kernel(
+    const __half* __restrict__ A,
+    const __half* __restrict__ B,
+    __half* __restrict__ C, int M, int N, int K)
+{
+    extern __shared__ __align__(16) __half smem[];
+    auto AS = [&](int s) -> __half* { return smem + s * SMEM_STAGE_HALFS + AS_OFFSET_HALFS; };
+    auto BS = [&](int s) -> __half* { return smem + s * SMEM_STAGE_HALFS + BS_OFFSET_HALFS; };
+
+    const int offset_m = blockIdx.y * BM;
+    const int offset_n = blockIdx.x * BN;
+    const int tid  = threadIdx.x;
+    const int wg   = tid / 128;
+    const int wgt  = tid % 128;
+    const int warp = wgt / 32;
+    const int lane = wgt & 31;
+    const int wg_m_off = wg * WG_M;
+
+    float D0[64];
+    float D1[64];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) { D0[i] = 0.0f; D1[i] = 0.0f; }
+
+    // ---------- cp.async transfer plan ----------
+    constexpr int VEC = 8;
+    constexpr int COLS_VEC = BK / VEC;             // 8
+    constexpr int A_VECS   = BM * BK / VEC;        // 1024
+    constexpr int B_VECS   = BN * BK / VEC;        // 2048
+    constexpr int A_VPT    = A_VECS / NTHREADS;    // 4
+    constexpr int B_VPT    = B_VECS / NTHREADS;    // 8
+
+    auto issue_load = [&](int stage, int k_global) {
+        __half* a_tile = AS(stage);
+        __half* b_tile = BS(stage);
+        #pragma unroll
+        for (int v = 0; v < A_VPT; v++) {
+            int idx = v * NTHREADS + tid;
+            int row = idx / COLS_VEC;
+            int col = (idx % COLS_VEC) * VEC;
+            int gm  = offset_m + row;
+            int gk  = k_global + col;
+            __half* sptr = a_tile + as_off(row, col);
+            if (gm < M && gk + VEC <= K)
+                ap::cp_async_16(ap::cvta_to_shared(sptr), &A[gm * K + gk]);
+            else
+                zero_16(sptr);
+        }
+        #pragma unroll
+        for (int v = 0; v < B_VPT; v++) {
+            int idx = v * NTHREADS + tid;
+            int row = idx / COLS_VEC;
+            int col = (idx % COLS_VEC) * VEC;
+            int gn  = offset_n + row;
+            int gk  = k_global + col;
+            __half* sptr = b_tile + bs_off(row, col);
+            if (gn < N && gk + VEC <= K)
+                ap::cp_async_16(ap::cvta_to_shared(sptr), &B[gn * K + gk]);
+            else
+                zero_16(sptr);
+        }
+        ap::cp_async_commit_group();
+    };
+
+    const int num_k_iters = (K + BK - 1) / BK;
+
+    int k_iter  = 0;
+    int stage_w = 0;
+    #pragma unroll
+    for (int s = 0; s < STAGES - 1; s++) {
+        if (k_iter < num_k_iters) {
+            issue_load(stage_w, k_iter * BK);
+            k_iter++;
+            stage_w = (stage_w + 1) % STAGES;
+        } else {
+            ap::cp_async_commit_group();
+        }
+    }
+
+    int  stage_r = 0;
+    bool first   = true;
+
+    for (int ki = 0; ki < num_k_iters; ki++) {
+        ap::cp_async_wait_group<STAGES - 2>();
+        __syncthreads();
+        ap::fence_proxy_async_shared_cta();
+
+        ap::wgmma_fence();
+        #pragma unroll
+        for (int kk = 0; kk < FRAGS_K; kk++) {
+            uint32_t a_smem  = ap::cvta_to_shared(
+                AS(stage_r) + as_off(wg_m_off, kk * WGMMA_K));
+            uint32_t b_smem0 = ap::cvta_to_shared(
+                BS(stage_r) + bs_off(0, kk * WGMMA_K));
+            uint32_t b_smem1 = ap::cvta_to_shared(
+                BS(stage_r) + bs_off(WGMMA_N, kk * WGMMA_K));
+            uint64_t a_desc  = ap::make_smem_desc(a_smem,  LBO_BYTES, SBO_BYTES, 0);
+            uint64_t b_desc0 = ap::make_smem_desc(b_smem0, LBO_BYTES, SBO_BYTES, 0);
+            uint64_t b_desc1 = ap::make_smem_desc(b_smem1, LBO_BYTES, SBO_BYTES, 0);
+            if (first && kk == 0) {
+                ap::wgmma_m64n128k16_f32_f16_ss<0, 0, 0>(D0, a_desc, b_desc0);
+                ap::wgmma_m64n128k16_f32_f16_ss<0, 0, 0>(D1, a_desc, b_desc1);
+            } else {
+                ap::wgmma_m64n128k16_f32_f16_ss<1, 0, 0>(D0, a_desc, b_desc0);
+                ap::wgmma_m64n128k16_f32_f16_ss<1, 0, 0>(D1, a_desc, b_desc1);
+            }
+        }
+        first = false;
+        ap::wgmma_commit_group();
+        ap::wgmma_wait_group<STAGES - 2>();
+
+        if (k_iter < num_k_iters) {
+            issue_load(stage_w, k_iter * BK);
+            k_iter++;
+            stage_w = (stage_w + 1) % STAGES;
+        } else {
+            ap::cp_async_commit_group();
+        }
+        stage_r = (stage_r + 1) % STAGES;
+    }
+
+    ap::cp_async_wait_all();
+    ap::wgmma_wait_group<0>();
+    __syncthreads();
+
+    // ---------- Store ----------
+    const int r0 = lane / 4;
+    const int r1 = r0 + 8;
+    const int c0 = (lane % 4) * 2;
+    const int warp_row_base = offset_m + wg_m_off + warp * 16;
+
+    const bool full_tile = (offset_m + BM <= M) && (offset_n + BN <= N);
+
+    auto store_acc = [&](float* D, int n_base) {
+        if (full_tile) {
+            #pragma unroll
+            for (int g = 0; g < 16; g++) {
+                int gm0 = warp_row_base + r0;
+                int gm1 = warp_row_base + r1;
+                int gn0 = n_base + g * 8 + c0;
+                __half2 p0 = __floats2half2_rn(D[g*4 + 0], D[g*4 + 1]);
+                __half2 p1 = __floats2half2_rn(D[g*4 + 2], D[g*4 + 3]);
+                *reinterpret_cast<__half2*>(&C[gm0 * N + gn0]) = p0;
+                *reinterpret_cast<__half2*>(&C[gm1 * N + gn0]) = p1;
+            }
+        } else {
+            #pragma unroll
+            for (int g = 0; g < 16; g++) {
+                int gm0 = warp_row_base + r0;
+                int gm1 = warp_row_base + r1;
+                int gn0 = n_base + g * 8 + c0;
+                int gn1 = gn0 + 1;
+                if (gm0 < M && gn0 < N) C[gm0 * N + gn0] = __float2half(D[g*4 + 0]);
+                if (gm0 < M && gn1 < N) C[gm0 * N + gn1] = __float2half(D[g*4 + 1]);
+                if (gm1 < M && gn0 < N) C[gm1 * N + gn0] = __float2half(D[g*4 + 2]);
+                if (gm1 < M && gn1 < N) C[gm1 * N + gn1] = __float2half(D[g*4 + 3]);
+            }
+        }
+    };
+
+    store_acc(D0, offset_n);
+    store_acc(D1, offset_n + WGMMA_N);
+}
+
+void matmul_16x16_launcher(
+    const __half* A, const __half* B, __half* C, int M, int N, int K)
+{
+    static bool attr_set = false;
+    if (!attr_set) {
+        cudaFuncSetAttribute(
+            (const void*) matmul_tc_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            SMEM_BYTES);
+        attr_set = true;
+    }
+    int numBlocksM = (M + BM - 1) / BM;
+    int numBlocksN = (N + BN - 1) / BN;
+    dim3 gridDim(numBlocksN, numBlocksM);
+    dim3 blockDim(NTHREADS);
+    matmul_tc_kernel<<<gridDim, blockDim, SMEM_BYTES>>>(A, B, C, M, N, K);
+}
