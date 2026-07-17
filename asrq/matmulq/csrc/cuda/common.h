@@ -15,8 +15,7 @@ __host__ __device__ inline
 constexpr int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 constexpr int WARP_SIZE = 32;
-constexpr int MMA_M = 16;
-constexpr int MMA_N = 8;
+
 
 // convert generic address (C++ address, 64-bit) to shared state space address (32-bit)
 // all PTX instructions expect share memory address to be in shared state space (not 100%)
