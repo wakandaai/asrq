@@ -337,7 +337,8 @@ def modify_linear_with_rotation_param(
 
     def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
         # quantize the input activations with STE quantization
-        # x = STEQuantize.apply(x, 8, True)
+        if getattr(self, "_rotation_quantize_activation", False):
+            x = STEQuantize.apply(x, getattr(self, "_rotation_activation_bits", 8), True)
         # Apply the rotation to the weight
         rotated_bias = self.bias
         dtype = self.weight.dtype
@@ -367,16 +368,43 @@ def modify_linear_with_rotation_param(
                 temp = rotated_weight.reshape(-1, org_shape[-1]//hdim, hdim)
                 temp = (temp.to(double_type) @ Q2.to(double_type)).to(dtype)
                 rotated_weight = temp.reshape(org_shape)
-        
+
         
         # Perform RTN quantization of weights           
-        # w = STEQuantize.apply(rotated_weight, bit, quantize_row_wise)
-        w = rotated_weight
+        if getattr(self, "_rotation_quantize_weight", False):
+            w = STEQuantize.apply(
+                rotated_weight,
+                getattr(self, "_rotation_weight_bits", bit),
+                quantize_row_wise,
+            )
+        else:
+            w = rotated_weight
         # w = rotated_weight.to(dtype)
         # continue with the normal linear forward using the rotated weight
         return F.linear(x, w.to(x.dtype), rotated_bias)
 
+    linear._rotation_search_ready = True
+    linear._rotation_quantize_weight = False
+    linear._rotation_quantize_activation = False
+    linear._rotation_weight_bits = bit
+    linear._rotation_activation_bits = 8
     linear.forward = types.MethodType(modified_forward, linear)
+
+
+def set_rotation_fake_quant_state(
+        model: nn.Module,
+        *,
+        enabled: bool,
+        activation_bits: int = 8,
+        weight_bits: int = 4,
+) -> None:
+    """Toggle fake-quantized replay for linears patched by rotation utilities."""
+    for module in model.modules():
+        if getattr(module, "_rotation_search_ready", False):
+            module._rotation_quantize_weight = enabled
+            module._rotation_quantize_activation = enabled and activation_bits < 16
+            module._rotation_weight_bits = weight_bits
+            module._rotation_activation_bits = activation_bits
 
 
 def fuse_rotation_param_into_linear(
@@ -426,4 +454,3 @@ def fuse_rotation_param_into_linear(
             temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
             temp = (temp.double() @ Q2.double())
             linear.weight.data = temp.reshape(org_shape).to(dtype=dtype, device=device)
-

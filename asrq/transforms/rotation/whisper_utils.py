@@ -19,8 +19,18 @@ from asrq.transforms.rotation.utils import (
     modify_linear_with_rotation_param,
     fuse_rotation_param_into_linear,
     get_orthogonal_matrix,
+    set_rotation_fake_quant_state,
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
+from asrq.transforms.rotation.search import (
+    RotationSearchParams,
+    RotationSearchSite,
+    SignHadamardCandidate,
+    normalized_hadamard_matrix,
+    random_sign_candidate,
+    run_rotation_search,
+    save_rotation_search_artifacts,
+)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -574,7 +584,9 @@ def obtain_rotations_for_whisper(
     mode = "hadamard"
     _seed = torch.initial_seed() & 0xFFFFFFFF
     _sc = 0
+    #Qe encoder vs Decoder?
     Qe = get_orthogonal_matrix(model.config.d_model, mode=mode, device=device, seed=_seed + _sc); _sc += 1
+    #increase seed so that its different...
     Qd = get_orthogonal_matrix(model.config.d_model, mode=mode, device=device, seed=_seed + _sc); _sc += 1
     Q2s = {}
     for i in range(model.config.encoder_layers):
@@ -617,15 +629,22 @@ def obtain_rotations_for_whisper(
         pin_memory=True,
     )
     trainable_params = [Qe, Qd] + list(Q2s.values())
+    print(f"Total number of trainable rotations: {len(trainable_params)}")
+    print(f"Total number of trainable parameters: {sum(p.numel() for p in trainable_params)}")
+    
+
     optimizer = SGDG(trainable_params, lr=lr, stiefel=True)
     model.train()
     model.to(device) # type: ignore
     # This is for just one epoch
     # I want the learning rate to decay linearly to 0
     # starting with 1.5, it decays to 0
+    start = time.time()
+
     num_steps = len(train_loader) * epochs
     lr_lambda = lambda step: max(0, (num_steps - step) / num_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    losses = []
     for epoch in range(epochs):
         total_loss = 0.0
         num_batches = 0
@@ -639,15 +658,354 @@ def obtain_rotations_for_whisper(
             num_batches += 1
         avg_loss = total_loss / num_batches
         print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
-        
-
+    print(f"total training time {time.time()-start}")    
+    plt.plot(losses)
+    plt.xlabel("step")
+    plt.ylabel("loss")
+    plt.legend()
+    plt.savefig("outputs/rotation/whisper_train.png")
+    
     to_save = {
         "Qe": Qe.data.detach().cpu(),
         "Qd": Qd.data.detach().cpu(),
         "Q2s": {k: v.data.detach().cpu() for k, v in Q2s.items()},
     }
     torch.save(to_save, save_path)
-    
+
+
+def _clone_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone_tree(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_tree(v) for v in value]
+    return value
+
+
+def _extract_hidden_state(output):
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
+def _replace_first_arg(args: Tuple[torch.Tensor, ...], hidden: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    if not args:
+        return (hidden,)
+    return (hidden, *args[1:])
+
+
+class _WhisperRotationSearchAdapter:
+    def __init__(
+        self,
+        model: WhisperForConditionalGeneration,
+        calibration_batches: List[dict[str, torch.Tensor]],
+        q2_params: Dict[str, nn.Parameter],
+        sites: List[RotationSearchSite],
+        *,
+        device: str,
+        weight_bits: int,
+        activation_bits: int,
+    ) -> None:
+        self.model = model
+        self.calibration_batches = calibration_batches
+        self.q2_params = q2_params
+        self._sites = sites
+        self.device = device
+        self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
+        self._block_cache: Dict[str, List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor], torch.Tensor]]] = {}
+        self._named_modules = dict(model.named_modules())
+
+    def sites(self) -> List[RotationSearchSite]:
+        return self._sites
+
+    def refresh_caches(self) -> None:
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        self._block_cache = {}
+        self._block_cache.update(self._build_encoder_block_cache())
+        self._block_cache.update(self._build_decoder_block_cache())
+
+    def score_site_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> float:
+        self._apply_candidate(site, candidate)#update rotation at layer with candidate
+        block = self._named_modules[site.block_id]
+        numerator = 0.0
+        denominator = 0.0
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=True,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        with torch.no_grad():
+            for args, kwargs, fp_output in self._block_cache[site.block_id]:
+                out = block(*_clone_tree(args), **_clone_tree(kwargs))
+                hidden = _extract_hidden_state(out)
+                diff = hidden.float() - fp_output.float()
+                numerator += diff.pow(2).sum().item()
+                denominator += fp_output.float().pow(2).sum().item()
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        return numerator / max(denominator, 1e-12)
+
+    def commit_site_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> None:
+        self._apply_candidate(site, candidate)
+        site.current_candidate = candidate.clone()
+
+    def _apply_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> None:
+        q2 = self.q2_params[site.site_id]
+        rotation = candidate.to_rotation(site.base_h, device=q2.device, dtype=q2.dtype)
+        q2.data.copy_(rotation)
+
+    def _capture_first_encoder_block_inputs(self) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]:
+        blocks = self.model.model.encoder.layers
+        captured: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]] = []
+
+        class Catcher(nn.Module):
+            def __init__(self, module: nn.Module) -> None:
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                captured.append((_clone_tree(args), _clone_tree(kwargs)))
+                raise Exception("Caught input")
+
+        original = blocks[0]
+        blocks[0] = Catcher(original)
+        try:
+            for batch in self.calibration_batches:
+                try:
+                    self.model.model.encoder(batch["input_features"], return_dict=True)
+                except Exception as exc:
+                    assert str(exc) == "Caught input", str(exc)
+        finally:
+            blocks[0] = original
+        return captured
+
+    def _build_encoder_block_cache(self):
+        current = self._capture_first_encoder_block_inputs()
+        cache: Dict[str, List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor], torch.Tensor]]] = {}
+        blocks = self.model.model.encoder.layers
+        for index, block in enumerate(blocks):
+            block_id = f"model.encoder.layers.{index}"
+            entries = []
+            next_inputs = []
+            with torch.no_grad():
+                for args, kwargs in current:
+                    replay_args = _clone_tree(args)
+                    replay_kwargs = _clone_tree(kwargs)
+                    out = block(*replay_args, **replay_kwargs)
+                    hidden = _extract_hidden_state(out).detach()
+                    entries.append((_clone_tree(args), _clone_tree(kwargs), hidden.clone()))
+                    next_inputs.append((_replace_first_arg(args, hidden.clone()), _clone_tree(kwargs)))
+            cache[block_id] = entries
+            current = next_inputs
+        return cache
+
+    def _capture_first_decoder_block_inputs(self) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]:
+        blocks = self.model.model.decoder.layers
+        captured: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]] = []
+
+        class Catcher(nn.Module):
+            def __init__(self, module: nn.Module) -> None:
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                captured.append((_clone_tree(args), _clone_tree(kwargs)))
+                raise Exception("Caught input")
+
+        original = blocks[0]
+        blocks[0] = Catcher(original)
+        use_cache = self.model.config.use_cache
+        self.model.config.use_cache = False
+        try:
+            for batch in self.calibration_batches:
+                try:
+                    self.model(
+                        input_features=batch["input_features"],
+                        labels=batch["labels"],
+                        return_dict=True,
+                    )
+                except Exception as exc:
+                    assert str(exc) == "Caught input", str(exc)
+        finally:
+            blocks[0] = original
+            self.model.config.use_cache = use_cache
+        return captured
+
+    def _build_decoder_block_cache(self):
+        current = self._capture_first_decoder_block_inputs()
+        cache: Dict[str, List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor], torch.Tensor]]] = {}
+        blocks = self.model.model.decoder.layers
+        use_cache = self.model.config.use_cache
+        self.model.config.use_cache = False
+        try:
+            for index, block in enumerate(blocks):
+                block_id = f"model.decoder.layers.{index}"
+                entries = []
+                next_inputs = []
+                with torch.no_grad():
+                    for args, kwargs in current:
+                        replay_args = _clone_tree(args)
+                        replay_kwargs = _clone_tree(kwargs)
+                        out = block(*replay_args, **replay_kwargs)
+                        hidden = _extract_hidden_state(out).detach()
+                        entries.append((_clone_tree(args), _clone_tree(kwargs), hidden.clone()))
+                        next_inputs.append((_replace_first_arg(args, hidden.clone()), _clone_tree(kwargs)))
+                cache[block_id] = entries
+                current = next_inputs
+        finally:
+            self.model.config.use_cache = use_cache
+        return cache
+
+
+def obtain_rotations_for_whisper_search(
+        model: WhisperForConditionalGeneration,
+        processor: WhisperProcessor,
+        test_audio: np.ndarray,
+        test_audio_sr: int,
+        calib_samples: int,
+        batch_size: int,
+        search_params: RotationSearchParams,
+        save_path: str,
+        *,
+        weight_bits: int = 4,
+        activation_bits: int = 16,
+    ) -> None:
+    device = "cuda"
+    model.to(device)  # type: ignore
+    dtype = model.dtype
+    inputs = processor(test_audio, sampling_rate=test_audio_sr, return_tensors="pt")
+    with torch.no_grad():
+        out_a = model.generate(inputs.input_features.to(device).to(dtype), max_new_tokens=128)
+        orig_transcription = processor.batch_decode(out_a, skip_special_tokens=True)[0].strip()
+
+    prepare_whisper_for_rotation(model)
+
+    seed = torch.initial_seed() & 0xFFFFFFFF
+    seed_counter = 0
+    qe = get_orthogonal_matrix(model.config.d_model, mode="hadamard", device=device, seed=seed + seed_counter); seed_counter += 1
+    qd = get_orthogonal_matrix(model.config.d_model, mode="hadamard", device=device, seed=seed + seed_counter); seed_counter += 1
+
+    q2_params: Dict[str, nn.Parameter] = {}
+    sites: List[RotationSearchSite] = []
+    generator = torch.Generator().manual_seed(search_params.seed)
+    for i in range(model.config.encoder_layers):
+        head_dim: int = model.model.encoder.layers[i].self_attn.head_dim  # type: ignore
+        base_h = normalized_hadamard_matrix(head_dim)
+        candidate = random_sign_candidate(head_dim, generator)
+        stem = f"model.encoder.layers.{i}.self_attn"
+        q2_params[stem] = nn.Parameter(
+            candidate.to_rotation(base_h, device=device, dtype=torch.float32),
+            requires_grad=False,
+        )
+        sites.append(
+            RotationSearchSite(
+                site_id=stem,
+                block_id=f"model.encoder.layers.{i}",
+                dimension=head_dim,
+                base_h=base_h,
+                current_candidate=candidate,
+            )
+        )
+    for i in range(model.config.decoder_layers):
+        for attn_name in ("self_attn", "encoder_attn"):
+            attn = getattr(model.model.decoder.layers[i], attn_name)  # type: ignore
+            head_dim = attn.head_dim
+            base_h = normalized_hadamard_matrix(head_dim)
+            candidate = random_sign_candidate(head_dim, generator)
+            stem = f"model.decoder.layers.{i}.{attn_name}"
+            q2_params[stem] = nn.Parameter(
+                candidate.to_rotation(base_h, device=device, dtype=torch.float32),
+                requires_grad=False,
+            )
+            sites.append(
+                RotationSearchSite(
+                    site_id=stem,
+                    block_id=f"model.decoder.layers.{i}",
+                    dimension=head_dim,
+                    base_h=base_h,
+                    current_candidate=candidate,
+                )
+            )
+
+    qe_param = nn.Parameter(qe.float(), requires_grad=False)
+    qd_param = nn.Parameter(qd.float(), requires_grad=False)
+    modify_whisper_layers_with_rotation_params(model, qe_param, qd_param, q2_params)
+    monkey_patch_whisper(model, qe_param, qd_param)
+    set_rotation_fake_quant_state(
+        model,
+        enabled=False,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+    )
+
+    with torch.no_grad():
+        out_a = model.generate(inputs.input_features.to(device).to(dtype), max_new_tokens=128)
+        rot_transcription = processor.batch_decode(out_a, skip_special_tokens=True)[0].strip()
+        assert orig_transcription == rot_transcription, (
+            f"Transcriptions do not match after applying rotations! \n"
+            f"Original: '{orig_transcription}', \nAfter Rotation: '{rot_transcription}'"
+        )
+
+    calib_ds = WhisperCalibrationDataset(processor, num_samples=calib_samples, seed=seed)
+    train_loader = torch.utils.data.DataLoader(
+        calib_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
+    )
+    calibration_batches = []
+    for batch in train_loader:
+        calibration_batches.append({k: v.to(device) for k, v in batch.items()})
+
+    adapter = _WhisperRotationSearchAdapter(
+        model,
+        calibration_batches,
+        q2_params,
+        sites,
+        device=device,
+        weight_bits=weight_bits,
+        activation_bits=activation_bits,
+    )
+    result = run_rotation_search(adapter, search_params)
+
+    to_save = {
+        "Qe": qe_param.data.detach().cpu(),
+        "Qd": qd_param.data.detach().cpu(),
+        "Q2s": {k: v.data.detach().cpu() for k, v in q2_params.items()},
+    }
+    torch.save(to_save, save_path)
+    artifacts = save_rotation_search_artifacts(result, save_path)
+    print(f"[rotation-search] saved history to {artifacts['history_path']}")
+    print(f"[rotation-search] saved plot to {artifacts['plot_path']}")
+
 
 def rotate_whisper_model(
     model: WhisperForConditionalGeneration, processor: WhisperProcessor, test_audio: np.ndarray, sr:int, rotation_path:str, device="cuda"

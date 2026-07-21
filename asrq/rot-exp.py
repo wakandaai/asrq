@@ -43,6 +43,10 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
     with open_dict(cfg.transform):
         cfg.transform.model_name = cfg.model.name
         cfg.transform.learn_rotation = True
+        cfg.transform.wbits = cfg.quantizer.bits
+        cfg.transform.abits = cfg.activation_bits
+    
+
     print(OmegaConf.to_yaml(cfg))
 
     quant_cfg = QuantConfig.from_dictconfig(cfg.quantizer)
@@ -54,6 +58,9 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
 
     # Transform
     transform = BaseTransform.from_config(transform_cfg)
+    print(f"==="*10)
+
+    print(f"transform",transform)
     modelQ.model.to("cuda")
     set_seed(cfg.seed)  # re-seed after model loading to ensure deterministic Q init + DataLoader shuffle
     transform.obtain_transform(modelQ)

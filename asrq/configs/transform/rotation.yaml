@@ -1,4 +1,5 @@
 name: rotation
+type: cayley
 num_samples: 800
 epochs: 1
 learning_rate: 0.01
@@ -6,3 +7,15 @@ batch_size: 4
 path: ""
 learn_rotation: False
 use: True
+population_size: 8
+elite_count: 2
+parent_pool_fraction: 0.5
+generations: 16
+patience: 4
+mutate_both_probability: 0.1
+large_mutation_probability: 0.1
+small_mutation_min: 1
+small_mutation_max: 2
+medium_mutation_min: 4
+medium_mutation_max: 8
+large_mutation_fraction: 0.25

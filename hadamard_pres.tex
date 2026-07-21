@@ -1,0 +1,681 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+
+% White, minimal slides
+\usetheme{default}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamercolor{background canvas}{bg=white}
+\setbeamercolor{normal text}{fg=black,bg=white}
+\setbeamercolor{frametitle}{fg=black,bg=white}
+\setbeamercolor{title}{fg=black,bg=white}
+\setbeamercolor{block title}{fg=black,bg=white}
+\setbeamercolor{block body}{fg=black,bg=white}
+\setbeamertemplate{blocks}[default]
+\setbeamertemplate{itemize item}{--}
+\setbeamertemplate{itemize subitem}{--}
+
+\usepackage{amsmath, amssymb, bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{mathtools}
+\usepackage{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\KL}{D_{\mathrm{KL}}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\Had}{\mathrm{Had}}
+
+\title{From Learned Rotations to Search-Based Hadamard Rotations}
+
+\author{}
+\date{}
+
+\begin{document}
+
+% 1
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% 2
+\begin{frame}{why SpinQuant works}
+\vspace{0.2cm}
+LLM quantization is hard because a few large coordinates dominate the quantization range.
+
+\vspace{0.3cm}
+For a tensor $X$, uniform quantization roughly uses
+\[
+\alpha \propto \frac{\max |X|}{2^{b-1}-1}.
+\]
+A large outlier increases $\alpha$, so most ordinary values are represented with fewer effective levels.
+
+\vspace{0.4cm}
+\textbf{Rotation idea:}
+\[
+XW = (XR)(R^{-1}W), \qquad R^\top R = I.
+\]
+In full precision, the model is unchanged. After quantization, the rotated tensors may have fewer outliers and smaller quantization error.
+\end{frame}
+
+% 3
+\begin{frame}{Small example: rotation spreads an outlier}
+Consider four activation channels with a large value only in the first coordinate:
+\[
+ x = \begin{bmatrix} 10 & 0 & 0 & 0 \end{bmatrix}.
+\]
+Use the normalized $4\times 4$ Hadamard rotation
+\[
+R = \frac{1}{2}
+\begin{bmatrix}
+1&1&1&1\\
+1&-1&1&-1\\
+1&1&-1&-1\\
+1&-1&-1&1
+\end{bmatrix}.
+\]
+Then
+\[
+ xR = \begin{bmatrix}5&5&5&5\end{bmatrix}.
+\]
+
+\vspace{0.2cm}
+The norm is unchanged:
+\[
+\|x\|_2 = 10, \qquad \|xR\|_2 = 10,
+\]
+but the maximum coordinate drops:
+\[
+\|x\|_\infty = 10, \qquad \|xR\|_\infty = 5.
+\]
+\end{frame}
+
+% 4
+% \begin{frame}{Why random rotations already help}
+% For a high-dimensional vector $x\in\R^d$, a random orthogonal rotation tends to spread energy across coordinates.
+
+% \vspace{0.3cm}
+% If
+% \[
+%  x = (10,0,\ldots,0),
+% \]
+% then after a random orthogonal rotation $R$,
+% \[
+% \|xR\|_2 = 10,
+% \]
+% but a typical coordinate has scale
+% \[
+% \frac{\|x\|_2}{\sqrt d} = \frac{10}{\sqrt d}.
+% \]
+
+% \vspace{0.3cm}
+% So random rotations often reduce coordinate outliers. The limitation is variance: different random rotations can give noticeably different quantized accuracy. SpinQuant uses this observation to motivate learning the rotation.
+% \end{frame}
+
+% 5
+\begin{frame}{What SpinQuant optimizes}
+SpinQuant inserts rotations into the Transformer in places that preserve the full-precision function.
+
+\vspace{0.2cm}
+Two important learned rotations:
+\begin{itemize}
+  \item $R_1$: residual-stream rotation, mergeable into nearby weights.
+  \item $R_2$: attention value/output rotation, also mergeable.
+\end{itemize}
+
+\vspace{0.2cm}
+The optimization problem is
+\[
+\min_{R_1,R_2\in\mathcal M} \mathcal L_Q(R_1,R_2\mid W,X),
+\]
+where
+\[
+\mathcal M = \{R: R^\top R = I\}.
+\]
+
+\vspace{0.2cm}
+SpinQuant uses Cayley SGD to keep the rotations orthonormal while minimizing the quantized-model loss.
+\end{frame}
+
+% 6
+\begin{frame}{Motivation: can we avoid dense Cayley optimization?}
+SpinQuant is accurate, but the optimization can be costly.
+
+and very sensitive to the learning rate.
+
+\vspace{0.2cm}
+Potential concerns:
+\begin{itemize}
+  \item We need large GPU memory before to produce the quantised model.
+  \item Very sensitive to the learning rates.
+  % \item Backpropagation through quantized forward passes needs calibration activations and gradients.
+  % \item Cayley-style updates preserve orthogonality but are more complex than simple sign or permutation search.
+\end{itemize}
+
+\vspace{0.3cm}
+% \textbf{Research question:}
+
+Can we get much of the benefit of learned rotations using a cheaper, discrete, search-based fast-Hadamard family?
+\end{frame}
+
+% 7
+\begin{frame}{EvoPress: the search-based pruning inspiration}
+EvoPress studies dynamic LLM compression: choose different compression levels for different layers while satisfying a global budget.
+
+% \vspace{0.2cm}
+% Instead of assuming additive layer importance,
+% \[
+% \text{total error} \approx \sum_{\ell} \text{layer error}_{\ell},
+% \]
+EvoPress evaluates whole compressed candidates.
+
+\vspace{0.2cm}
+formulation:
+\[
+\hat M^* = \arg\min_{v\in[m]^n} \KL(P_M\,\\|\,Q_{\hat M_v})
+\quad\text{s.t.}\quad g(\hat M_v)\le C.
+\]
+
+\vspace{0.2cm}
+Key algorithmic idea:
+\begin{itemize}
+   \item search space is large
+  \item Maintain one parent compression profile.
+  \item Generate local budget-preserving mutations.
+  \item Use multi-step selection: many cheap evaluations first, few expensive evaluations later.
+\end{itemize}
+\end{frame}
+
+% 8
+% \begin{frame}{Key lesson from EvoPress}
+% EvoPress is useful because the search space is huge, but candidate evaluation can be staged.
+
+% \vspace{0.3cm}
+% \begin{center}
+% \begin{tabular}{>{\raggedright\arraybackslash}p{0.33\linewidth} >{\raggedright\arraybackslash}p{0.52\linewidth}}
+% \toprule
+% Problem & EvoPress design choice \\
+% \midrule
+% Huge discrete space & Local mutations, not exhaustive search \\
+% Expensive model evaluation & Multi-step selection with increasing tokens \\
+% Layer interactions & Evaluate whole candidate models \\
+% Global compression budget & Mutations preserve the budget \\
+% \bottomrule
+% \end{tabular}
+% \end{center}
+
+% \vspace{0.3cm}
+% This suggests a similar strategy for rotation search: do not optimize dense matrices; search over structured rotations and evaluate candidates cheaply before full quantization.
+% \end{frame}
+
+% 9
+\begin{frame}{search over structured Hadamard rotations?}
+
+  \vspace{0.2cm}
+A valid Hadamard matrix must satisfy
+\[
+HH^\top = dI.
+\]
+Most random sign matrices are not Hadamard.
+
+\vspace{0.2cm}
+Instead, search over fast structured families such as
+\[
+R(s) = \frac{1}{\sqrt d} D(s)H,
+\qquad
+D(s)=\diag(s_1,\ldots,s_d),\quad s_i\in\{\pm1\}.
+\]
+Now the search space is
+\[
+2^d
+\]
+not
+\[
+2^{d^2}.
+\]
+
+\vspace{0.2cm}
+Richer but still fast families are possible:
+\[
+R = D_0 H D_1 H D_2 \cdots H D_k.
+\]
+\end{frame}
+
+% 10
+\begin{frame}{Why sign-Hadamard search may help}
+For a signed Hadamard rotation,
+\[
+(xR(s))_j = \frac{1}{\sqrt d}\sum_i x_i s_i H_{ij}.
+\]
+The signs $s_i$ determine which channels cancel or reinforce after mixing.
+
+\vspace{0.2cm}
+Random signs already spread energy, but a searched sign pattern may better reduce:
+\[
+\max_j |(xR(s))_j|,
+\]
+or the actual fake-quantization loss:
+\[
+\|Q(xR(s)) - xR(s)\|^2.
+\]
+
+\vspace{0.2cm}
+The idea is strongest when LLM outliers are structured across channels, rather than isolated single-coordinate spikes.
+\end{frame}
+
+% 11
+\begin{frame}{Search over layers}
+\textbf{Candidate:} sign vectors, permutations, or multiple signed-Hadamard factors for each rotation location.
+\[
+\theta = \{s_{R_1}, s_{R_2}^{(1)},\ldots,s_{R_2}^{(L)}, s_{R_3}, s_{R_4}\}.
+\]
+
+\vspace{0.2cm}
+\textbf{Search objective:}
+\[
+\min_{\theta}\; \KL(P_{\mathrm{FP}}\,\|\,P_{\mathrm{fake\text{-}quant}}(\theta)).
+\]
+
+\vspace{0.2cm}
+% \textbf{Multi-stage evaluation:}
+% \begin{enumerate}
+%   \item Cheap proxy: activation outlier score or quantization error on cached activations.
+%   \item Medium proxy: fake-quantized KL on a small token batch.
+%   \item Final selection: larger calibration set; then run final quantization once.
+% \end{enumerate}
+\end{frame}
+
+% 12
+\begin{frame}{Methodology: first implementation target}
+\textbf{Goal:} start with the smallest search problem that still tests the core idea.
+
+\vspace{0.2cm}
+\textbf{Search sites:}
+\begin{itemize}
+  \item Search only the per-layer attention value/output rotations $R_2^{(\ell)}$.
+  \item Keep the global residual rotation $R_1$ fixed at a random Hadamard-style initialization.
+  \item This isolates whether search can improve over random Hadamard without the harder global search over $R_1$.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Rotation family per site:}
+\[
+R_2^{(\ell)} = D_0^{(\ell)} H D_1^{(\ell)},
+\qquad
+D_0^{(\ell)}, D_1^{(\ell)} \in \{\pm1\}^{d_{\mathrm{head}}\times d_{\mathrm{head}}}
+\]
+where each $D$ is diagonal with $\pm 1$ entries.
+
+\vspace{0.2cm}
+This uses one fast Hadamard mixing step per site, but still gives a searchable family through the sign patterns.
+\end{frame}
+
+% 13
+\begin{frame}{Methodology: search operators}
+\textbf{Per-site evolutionary search:}
+\begin{itemize}
+  \item Maintain a small population of candidate sign patterns for one site at a time.
+  \item Evaluate, select top candidates, mutate them, and repeat for a fixed number of generations.
+  \item Move layer by layer: optimize one $R_2^{(\ell)}$ while holding all other sites fixed.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Candidate encoding:}
+\[
+\phi^{(\ell)} = \bigl(s_0^{(\ell)}, s_1^{(\ell)}\bigr),
+\qquad
+s_0^{(\ell)}, s_1^{(\ell)} \in \{\pm1\}^{d_{\mathrm{head}}}
+\]
+which defines the diagonals of $D_0^{(\ell)}$ and $D_1^{(\ell)}$.
+
+\vspace{0.2cm}
+\textbf{Mutation examples:}
+\begin{itemize}
+  \item Flip a small random subset of signs in $s_0^{(\ell)}$ or $s_1^{(\ell)}$.
+  \item Apply multiple mutation strengths, e.g. small flips for local refinement and larger flips for exploration.
+  \item Optionally keep one elite candidate unchanged each generation.
+\end{itemize}
+\end{frame}
+
+% 14
+\begin{frame}{Methodology: initialization}
+\textbf{Search one site at a time.}
+
+\vspace{0.2cm}
+For layer $\ell$, keep all other rotations fixed and optimize
+\[
+R_2^{(\ell)} = D_0^{(\ell)} H D_1^{(\ell)}.
+\]
+
+\vspace{0.2cm}
+\textbf{Initial population for site $\ell$:}
+\begin{itemize}
+  \item Include the current deployed candidate as the first parent.
+  \item If this is the first sweep, use a random signed-Hadamard initialization.
+  \item Add $P-1$ additional candidates by randomizing the sign vectors
+  \[
+  s_0^{(\ell)}, s_1^{(\ell)} \in \{\pm 1\}^{d_{\mathrm{head}}}.
+  \]
+  \item Optionally bias a few initial candidates to be small perturbations of the current parent rather than fully random.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Why this initialization?}
+\begin{itemize}
+  \item It preserves a strong random-Hadamard baseline.
+  \item It gives immediate diversity without requiring gradients.
+  \item It supports repeated layer sweeps: later passes can start from the best candidate found so far.
+\end{itemize}
+\end{frame}
+
+% 15
+\begin{frame}{Methodology: mutation operators}
+\textbf{Goal:} combine local refinement and occasional exploration.
+
+\vspace{0.2cm}
+For a parent candidate $\phi^{(\ell)} = (s_0^{(\ell)}, s_1^{(\ell)})$, generate offspring by:
+\begin{itemize}
+  \item choosing one of the two sign vectors $s_0^{(\ell)}$ or $s_1^{(\ell)}$,
+  \item flipping a random subset of entries,
+  \item and optionally mutating both vectors in the same offspring with small probability.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{First version: mutation-only evolution.}
+\begin{itemize}
+  \item No crossover between parent candidates.
+  \item Each offspring is produced by mutating a single parent.
+  \item This keeps the algorithm simple and makes the effect of each mutation easier to analyze.
+  \item Most offspring mutate only one of $s_0^{(\ell)}$ or $s_1^{(\ell)}$; a small probability is reserved for mutating both in the same offspring.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Mutation strengths:}
+\begin{itemize}
+  \item Small mutation: flip $1$ to $2$ signs.
+  \item Medium mutation: flip $4$ to $8$ signs.
+  \item Large mutation: flip a larger fraction of the vector for exploration.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Practical schedule:}
+\begin{itemize}
+  \item Most offspring use small or medium mutations.
+  \item A minority use large mutations to escape poor local optima.
+  \item Keep mutation sizes fixed initially; later one can adapt them based on search progress.
+\end{itemize}
+\end{frame}
+
+% 16
+\begin{frame}{Methodology: selection and update rule}
+\textbf{Per generation for site $\ell$:}
+\begin{enumerate}
+  \item Evaluate every candidate in the site population with the local fake-quant fitness.
+  \item Rank candidates by lower block-output reconstruction error.
+  \item Keep the top $E$ elites unchanged.
+  \item Sample parents from the top fraction of the population and generate offspring until the population is refilled.
+  \item Replace the site rotation with the best candidate of the new generation.
+\end{enumerate}
+
+\vspace{0.2cm}
+\textbf{Parent sampling rule:}
+\begin{itemize}
+  \item Keep the population size fixed at $P$.
+  \item Keep $E=1$ or $2$ elites unchanged.
+  \item Define a parent pool as the top $25\%-50\%$ of candidates in the current generation.
+  \item Sample parents from this pool with probability biased toward better fitness.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Stopping rule for a site:}
+\begin{itemize}
+  \item stop after a fixed number of generations, or
+  \item stop early if the best fitness has not improved for $T$ consecutive generations.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Layer schedule:}
+\begin{itemize}
+  \item sweep through layers from shallow to deep,
+  \item then optionally do a second full sweep using the updated site rotations as the new parents.
+\end{itemize}
+\end{frame}
+
+% 17
+\begin{frame}{Methodology: fitness for the first version}
+\textbf{Primary local fitness: normalized block-output reconstruction error under fake quantization.}
+
+\vspace{0.2cm}
+For a candidate $R_2^{(\ell)}$, run the block with the rotated value/output pathway and fake quantization, then compare the block output to the floating-point block output:
+\[
+\mathcal F_{\ell}(R_2^{(\ell)}) =
+\frac{
+\left\|
+Y_{\ell}^{\mathrm{FP}} -
+Y_{\ell}^{\mathrm{fake\text{-}quant}}(R_2^{(\ell)})
+\right\|_2^2
+}{
+\left\|
+Y_{\ell}^{\mathrm{FP}}
+\right\|_2^2 + \varepsilon
+}.
+\]
+
+\vspace{0.2cm}
+\textbf{Why use this first?}
+\begin{itemize}
+  \item It is much cheaper than end-to-end ASR evaluation.
+  \item It is more faithful than simple outlier or activation-only proxies.
+  \item It directly tests whether the searched rotation reduces quantization damage at the block level.
+  \item The normalization makes scores more comparable across layers with different activation scales.
+\end{itemize}
+\end{frame}
+
+% 18
+\begin{frame}{Methodology: recommended first hyperparameters}
+\textbf{Start simple and stable.}
+
+\vspace{0.2cm}
+Suggested initial choices:
+\begin{itemize}
+  \item Population size $P$: small, e.g. $8$ to $16$ candidates per site.
+  \item Elites $E$: keep the top $1$ to $2$ candidates.
+  \item Parent pool: top $25\%-50\%$ of the population.
+  \item Generations per site: modest, e.g. $10$ to $30$.
+  \item Site sweeps: start with one forward sweep, then add a second sweep if helpful.
+  \item Calibration minibatch for local scoring: small fixed subset for reproducibility and low cost.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Reasoning:}
+\begin{itemize}
+  \item We want to validate the search mechanism before scaling up budget.
+  \item A small population keeps evaluation cost under control.
+  \item Repeated sweeps can recover some of the benefit of larger populations.
+\end{itemize}
+\end{frame}
+
+% 19
+\begin{frame}{Methodology: staged evaluation and later extension}
+\textbf{Phase 1: stable local search}
+\begin{itemize}
+  \item Optimize each $R_2^{(\ell)}$ using block-output reconstruction error only.
+  \item Sweep across layers for one or more passes.
+  \item Measure whether this beats random Hadamard and best-of-$N$ random baselines.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Phase 2: add periodic global reranking}
+\begin{itemize}
+  \item Every few generations or after each layer sweep, collect the top few full-model candidates.
+  \item Re-rank them using end-to-end fake-quantized CTC loss on calibration audio:
+  \[
+  \mathcal L_{\mathrm{CTC}}^{\mathrm{fake\text{-}quant}}(\theta).
+  \]
+  \item This lets cheap local fitness drive most of the search while the task-level objective corrects for cross-layer interactions.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Longer-term extension:}
+\begin{itemize}
+  \item After validating $R_2$ search, extend the same framework to the harder global rotation $R_1$ using a richer family such as
+  \[
+  R_1 = D_0 H D_1 H D_2.
+  \]
+\end{itemize}
+\end{frame}
+
+% 20
+\begin{frame}{Methodology: reusable search module}
+\textbf{Design goal:} the search algorithm should work for both Whisper and Parakeet.
+
+\vspace{0.2cm}
+\textbf{Split the system into:}
+\begin{itemize}
+  \item \textbf{Search engine}: population, elites, parent sampling, mutation, stopping rule.
+  \item \textbf{Model adapter}: model-specific site discovery and block replay logic.
+  \item \textbf{Site evaluator}: computes the local NMSE fitness for one candidate at one site.
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Why this split?}
+\begin{itemize}
+  \item The search logic is generic.
+  \item Whisper and Parakeet differ mainly in where rotations are inserted and how a block is replayed.
+  \item This makes it easy to add more models later without rewriting the search loop.
+\end{itemize}
+\end{frame}
+
+% 21
+\begin{frame}{Methodology: common site abstraction}
+\textbf{First shared site type:} attention value/output rotation.
+
+\vspace{0.2cm}
+For both Whisper and Parakeet, define a site as:
+\begin{itemize}
+  \item a block index $\ell$,
+  \item the value/output rotation parameters for that block,
+  \item the candidate family
+  \[
+  R_2^{(\ell)} = D_0^{(\ell)} H D_1^{(\ell)}.
+  \]
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Common site API idea:}
+\begin{itemize}
+  \item initialize a candidate population,
+  \item mutate a candidate,
+  \item temporarily apply a candidate to the block,
+  \item score the resulting fake-quantized block output with NMSE.
+\end{itemize}
+\end{frame}
+
+% 22
+\begin{frame}{Methodology: caching for efficient local search}
+\textbf{Cache once, search many times.}
+
+\vspace{0.2cm}
+For each searchable block, cache:
+\begin{itemize}
+  \item the block input on a small calibration subset,
+  \item all masks and auxiliary tensors needed to replay the block exactly,
+  \item the floating-point block output
+  \[
+  Y_{\ell}^{\mathrm{FP}}.
+  \]
+\end{itemize}
+
+\vspace{0.2cm}
+Then candidate evaluation only needs:
+\begin{itemize}
+  \item insert the candidate rotation at that site,
+  \item replay the block on cached inputs under fake quantization,
+  \item compute
+  \[
+  \frac{\|Y_{\ell}^{\mathrm{FP}}-Y_{\ell}^{\mathrm{fake\text{-}quant}}\|_2^2}
+  {\|Y_{\ell}^{\mathrm{FP}}\|_2^2+\varepsilon}.
+  \]
+\end{itemize}
+
+\vspace{0.2cm}
+This avoids re-running the full ASR model for every offspring candidate.
+
+\vspace{0.2cm}
+\textbf{First implementation choice:}
+\begin{itemize}
+  \item Cache only block inputs, required auxiliary tensors, and floating-point block outputs.
+  \item Do \emph{not} cache deeper internal attention-path tensors in the first version.
+  \item This keeps the replay logic simple and ensures the local score reflects the true block behavior.
+  \item In practice, the adapter should store the full block-call context, i.e. the input tensor plus replay kwargs, rather than only the main hidden-state tensor.
+\end{itemize}
+\end{frame}
+
+% 12
+% \begin{frame}{Positioning and expected contribution}
+% \begin{center}
+% \begin{tabular}{>{\raggedright\arraybackslash}p{0.26\linewidth} >{\raggedright\arraybackslash}p{0.30\linewidth} >{\raggedright\arraybackslash}p{0.26\linewidth}}
+% \toprule
+% Method & Rotation family & Optimization cost \\
+% \midrule
+% QuaRot-style & Random Hadamard & Very low \\
+% SpinQuant & Dense orthonormal matrices & High memory / gradient-based \\
+% Proposed direction & Searched signed-Hadamard family & Low-memory / gradient-free \\
+% \bottomrule
+% \end{tabular}
+% \end{center}
+
+% \vspace{0.3cm}
+% The goal is not necessarily to beat SpinQuant in absolute accuracy.
+
+% \vspace{0.2cm}
+% A strong contribution would be:
+% \[
+% \text{recover most of SpinQuant's gain with QuaRot-like efficiency.}
+% \]
+
+% \vspace{0.2cm}
+% Important metrics:
+% \[
+% \text{accuracy gap},\quad \text{search time},\quad \text{peak GPU memory},\quad \text{inference overhead}.
+% \]
+% \end{frame}
+
+% 13
+% \begin{frame}{Takeaway}
+% \vspace{0.2cm}
+% \textbf{SpinQuant:}
+% \[
+% \text{Learn rotations to make tensors easier to quantize.}
+% \]
+
+% \vspace{0.3cm}
+% \textbf{EvoPress:}
+% \[
+% \text{Use efficient search when compression choices interact globally.}
+% \]
+
+% \vspace{0.3cm}
+% \textbf{Proposed idea:}
+% \[
+% \text{Search over fast Hadamard-like rotations for outlier reduction.}
+% \]
+
+% \vspace{0.4cm}
+% This gives a clean research direction:
+% \[
+% \boxed{\text{Adaptive rotations without dense rotation learning.}}
+% \]
+% \end{frame}
+
+% 14
+% \begin{frame}{References}
+% \small
+% \begin{itemize}
+%   \item Liu et al., \textit{SpinQuant: LLM Quantization with Learned Rotations}, ICLR 2025.
+%   \item Sieberling et al., \textit{EvoPress: Accurate Dynamic Model Compression via Evolutionary Search}, ICML 2025.
+%   \item Ashkboos et al., \textit{QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs}.
+% \end{itemize}
+% \end{frame}
+
+\end{document}

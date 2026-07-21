@@ -12,6 +12,7 @@ from asrq.transforms.rotation.utils import (
     convert_model_layernorms_to_rmsnorms,
     fuse_normalization_weights_and_bias_into_adjacent_linears,
     get_orthogonal_matrix,
+    set_rotation_fake_quant_state,
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
 
@@ -23,10 +24,19 @@ except ImportError:
     random = None
 from datasets import load_dataset
 from itertools import islice
-
+import time
 from typing import List, Tuple, Optional, Union, Dict
 
-
+import matplotlib.pyplot as plt
+from asrq.transforms.rotation.search import (
+    RotationSearchParams,
+    RotationSearchSite,
+    SignHadamardCandidate,
+    normalized_hadamard_matrix,
+    random_sign_candidate,
+    run_rotation_search,
+    save_rotation_search_artifacts,
+)
 
 
 class ParakeetCalibrationDataset(torch.utils.data.Dataset):
@@ -108,8 +118,8 @@ def modify_linear_with_rotation_param(
 
     def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
         # quantize the input activations with STE quantization
-        if include_activation_quant:
-            x = STEQuantize.apply(x, bit=8) # type: ignore
+        if getattr(self, "_rotation_quantize_activation", include_activation_quant):
+            x = STEQuantize.apply(x, bit=getattr(self, "_rotation_activation_bits", 8)) # type: ignore
         # Apply the rotation to the weight
         rotated_bias = self.bias
         rotated_weight = self.weight
@@ -154,7 +164,12 @@ def modify_linear_with_rotation_param(
                 rotated_weight = temp.reshape(org_shape)
         
         
-        # Perform RTN quantization of weights   
+        # Perform RTN quantization of weights
+        if getattr(self, "_rotation_quantize_weight", False):
+            rotated_weight = STEQuantize.apply(
+                rotated_weight,
+                bit=getattr(self, "_rotation_weight_bits", bit),
+            )
         if for_norm_out and rotated_weight.shape != orig_shape:
             w = rotated_weight
             if rotated_bias is not None: rotated_bias = rotated_bias.squeeze(0).to(x.dtype)
@@ -174,6 +189,11 @@ def modify_linear_with_rotation_param(
             raise Exception()
         
 
+    linear._rotation_search_ready = True
+    linear._rotation_quantize_weight = False
+    linear._rotation_quantize_activation = include_activation_quant
+    linear._rotation_weight_bits = bit
+    linear._rotation_activation_bits = 8
     linear.forward = types.MethodType(modified_forward, linear)
 
 
@@ -525,7 +545,7 @@ def monkey_patch_parakeet_ctc_for_train(model: nn.Module, Qe: nn.Parameter) -> N
 
     def process_residual_stream_output_encoder(self, x):
         dtype = x.dtype
-        return (x.double() @ Qe.t().double().to(x.device)).to(dtype)
+        return (x.double() @ Qe.t().double().to(x.device)).to(dtype) #rotation
 
     conformer_encoder.forward = types.MethodType(conformer_encoder_forward, conformer_encoder) # type: ignore
     conformer_encoder.process_residual_stream_input = types.MethodType( # type: ignore
@@ -667,7 +687,7 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
 
     # Modify linear layers to include rotation in their forward pass
     modify_parakeet_ctc_layers_with_rotation_params(
-        model, Qe, Q2s, include_activation_quant=False
+        model, Qe, Q2s, include_activation_quant=True
     )
     # Monkey-patch the Qwen3Model forward to rotate residual stream
     monkey_patch_parakeet_ctc_for_train(model, Qe)
@@ -703,6 +723,9 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
 
     # Train rotation parameters
     trainable_params = [Qe] + list(Q2s.values())
+    print(f"Total number of trainable rotations: {len(trainable_params)}")
+    print(f"Total number of trainable parameters: {sum(p.numel() for p in trainable_params)}")
+    
     optimizer = SGDG(trainable_params, lr=lr, stiefel=True)
     model.train()
     # This is for just one epoch
@@ -711,7 +734,8 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
     num_steps = len(train_loader) * epochs
     lr_lambda = lambda step: max(0, (num_steps - step) / num_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    
+    start = time.time()
+    losses = []
     for epoch in range(epochs):
         total_loss = 0.0
         num_batches = 0
@@ -721,6 +745,7 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
             # ctc_loss_backward_gpu has no deterministic kernel; disable only for this call
             torch.use_deterministic_algorithms(False)
             loss.backward()
+            losses.append(loss.item())
             torch.use_deterministic_algorithms(True)
             optimizer.step()
             scheduler.step()
@@ -728,13 +753,289 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
             num_batches += 1
         avg_loss = total_loss / num_batches
         print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
-        # breakpoint()
+    plt.plot(losses)
+    plt.xlabel("step")
+    plt.ylabel("loss")
+    plt.legend()
+    plt.savefig("outputs/rotation/parakeet_train.png")
 
+        # breakpoint()
+    print(f"total training time {time.time()-start}")  
     to_save = {
         "Qe": Qe.data.detach().cpu(),
         "Q2s": {k: v.data.detach().cpu() for k, v in Q2s.items()},
     }
     torch.save(to_save, save_path)
+
+
+def _clone_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().clone()
+    if isinstance(value, dict):
+        return {k: _clone_tree(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_tree(v) for v in value]
+    return value
+
+
+def _extract_hidden_state(output):
+    if isinstance(output, tuple):
+        return output[0]
+    return output
+
+
+class _ParakeetRotationSearchAdapter:
+    def __init__(
+        self,
+        model: nn.Module,
+        calibration_batches: List[dict[str, torch.Tensor]],
+        q2_params: Dict[str, nn.Parameter],
+        sites: List[RotationSearchSite],
+        *,
+        device: str,
+        weight_bits: int,
+        activation_bits: int,
+    ) -> None:
+        self.model = model
+        self.calibration_batches = calibration_batches
+        self.q2_params = q2_params
+        self._sites = sites
+        self.device = device
+        self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
+        self._block_cache: Dict[str, List[Tuple[dict[str, torch.Tensor], torch.Tensor]]] = {}
+        self._named_modules = dict(model.named_modules())
+
+    def sites(self) -> List[RotationSearchSite]:
+        return self._sites
+
+    def refresh_caches(self) -> None:
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        self._block_cache = self._build_block_cache()
+
+    def score_site_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> float:
+        self._apply_candidate(site, candidate)
+        block = self._named_modules[site.block_id]
+        numerator = 0.0
+        denominator = 0.0
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=True,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        with torch.no_grad():
+            for kwargs, fp_output in self._block_cache[site.block_id]:
+                replay_kwargs = _clone_tree(kwargs)
+                out = block(**replay_kwargs)
+                hidden = _extract_hidden_state(out)
+                diff = hidden.float() - fp_output.float()
+                numerator += diff.pow(2).sum().item()
+                denominator += fp_output.float().pow(2).sum().item()
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        return numerator / max(denominator, 1e-12)
+
+    def commit_site_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> None:
+        self._apply_candidate(site, candidate)
+        site.current_candidate = candidate.clone()
+
+    def _apply_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> None:
+        q2 = self.q2_params[site.site_id]
+        rotation = candidate.to_rotation(site.base_h, device=q2.device, dtype=q2.dtype)
+        q2.data.copy_(rotation)
+
+    def _capture_first_block_inputs(self) -> List[dict[str, torch.Tensor]]:
+        blocks = self.model.encoder.layers  # type: ignore[attr-defined]
+        captured: List[dict[str, torch.Tensor]] = []
+
+        class Catcher(nn.Module):
+            def __init__(self, module: nn.Module) -> None:
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                captured.append(_clone_tree(kwargs))
+                raise Exception("Caught Input")
+
+        original = blocks[0]
+        blocks[0] = Catcher(original)  # type: ignore[index]
+        try:
+            for batch in self.calibration_batches:
+                try:
+                    self.model(
+                        input_signal=batch["audios"],
+                        input_signal_length=batch["audio_lens"],
+                    )
+                except Exception as exc:
+                    assert str(exc) == "Caught Input", f"Unexpected exception {exc}"
+        finally:
+            blocks[0] = original  # type: ignore[index]
+        return captured
+
+    def _build_block_cache(self) -> Dict[str, List[Tuple[dict[str, torch.Tensor], torch.Tensor]]]:
+        current_kwargs = self._capture_first_block_inputs()
+        block_cache: Dict[str, List[Tuple[dict[str, torch.Tensor], torch.Tensor]]] = {}
+        blocks = self.model.encoder.layers  # type: ignore[attr-defined]
+
+        for index, block in enumerate(blocks):
+            block_id = f"encoder.layers.{index}"
+            entries: List[Tuple[dict[str, torch.Tensor], torch.Tensor]] = []
+            next_kwargs: List[dict[str, torch.Tensor]] = []
+            with torch.no_grad():
+                for kwargs in current_kwargs:
+                    replay_kwargs = _clone_tree(kwargs)
+                    out = block(**replay_kwargs)
+                    hidden = _extract_hidden_state(out).detach()
+                    entries.append((_clone_tree(kwargs), hidden.clone()))
+                    advanced_kwargs = _clone_tree(kwargs)
+                    advanced_kwargs["x"] = hidden.clone()
+                    next_kwargs.append(advanced_kwargs)
+            block_cache[block_id] = entries
+            current_kwargs = next_kwargs
+        return block_cache
+
+
+def obtain_rotations_for_parakeet_search(
+    model,
+    text_audio_path: str,
+    calib_samples: int,
+    batch_size: int,
+    search_params: RotationSearchParams,
+    save_path: str,
+    device: str = "cuda",
+    *,
+    weight_bits: int = 4,
+    activation_bits: int = 16,
+) -> None:
+    model.to(device)
+    with torch.no_grad():
+        orig_transcription = transcribe(model, text_audio_path)
+
+    prepare_parakeet_ctc_for_rotation(model)
+
+    with torch.no_grad():
+        prep_transcription = transcribe(model, text_audio_path)
+        assert orig_transcription == prep_transcription, (
+            f"Transcriptions do not match after preparation steps!\n"
+            f"Original: '{orig_transcription}'\n"
+            f"After Preparation: '{prep_transcription}'"
+        )
+
+    mode = "hadamard"
+    encoder_hidden_size = model.encoder.layers[0].conv.d_model
+    num_encoder_layers = len(model.encoder.layers)
+    seed = torch.initial_seed() & 0xFFFFFFFF
+    seed_counter = 0
+    
+    #qe: encoder R1 parameters
+    qe = get_orthogonal_matrix(encoder_hidden_size, mode=mode, device=device, seed=seed + seed_counter)
+    seed_counter += 1
+
+    q2_params: Dict[str, nn.Parameter] = {}
+    sites: List[RotationSearchSite] = []
+    generator = torch.Generator().manual_seed(search_params.seed)
+
+    #create all the candidate Rs for each layer and store in q2_params...
+    for i in range(num_encoder_layers):
+        head_dim = model.encoder.layers[i].self_attn.d_k
+        base_h = normalized_hadamard_matrix(head_dim)
+        candidate = random_sign_candidate(head_dim, generator) #returns d0,d1
+        stem = f"encoder.layers.{i}.self_attn"
+        q2_tensor = candidate.to_rotation(base_h, device=device, dtype=torch.float64)# do*h*d1
+        q2_params[stem] = nn.Parameter(q2_tensor, requires_grad=False)
+        sites.append(
+            RotationSearchSite(
+                site_id=stem,
+                block_id=f"encoder.layers.{i}",
+                dimension=head_dim,
+                base_h=base_h,
+                current_candidate=candidate,
+            )
+        )
+
+    qe_param = nn.Parameter(qe.float(), requires_grad=False)
+    modify_parakeet_ctc_layers_with_rotation_params(
+        model,
+        qe_param,
+        q2_params,
+        include_activation_quant=False,
+    )
+    monkey_patch_parakeet_ctc_for_train(model, qe_param)
+    set_rotation_fake_quant_state(
+        model,
+        enabled=False,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+    )
+
+    with torch.no_grad():
+        rot_transcription = transcribe(model, "outputs/rotation_test_audio.wav")
+        assert orig_transcription == rot_transcription, (
+            f"Transcriptions do not match after applying rotations!\n"
+            f"Original: '{orig_transcription}'\n"
+            f"After Rotation: '{rot_transcription}'"
+        )
+
+    from functools import partial
+
+    calib_ds = ParakeetCalibrationDataset(model, num_samples=calib_samples, seed=seed)
+    pad_id = model.tokenizer.pad_id if hasattr(model.tokenizer, "pad_id") and model.tokenizer.pad_id > 0 else 0
+    collate_fn = partial(parakeet_ctc_collate_fn, pad_id=pad_id)
+    train_loader = torch.utils.data.DataLoader(
+        calib_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
+    )
+    calibration_batches = []
+    for batch in train_loader:
+        calibration_batches.append({k: v.to(device) for k, v in batch.items()})
+
+    adapter = _ParakeetRotationSearchAdapter(
+        model,
+        calibration_batches,
+        q2_params,
+        sites,
+        device=device,
+        weight_bits=weight_bits,
+        activation_bits=activation_bits,
+    )
+    result = run_rotation_search(adapter, search_params)
+
+    to_save = {
+        "Qe": qe_param.data.detach().cpu(),
+        "Q2s": {k: v.data.detach().cpu() for k, v in q2_params.items()},
+    }
+    torch.save(to_save, save_path)
+    artifacts = save_rotation_search_artifacts(result, save_path)
+    print(f"[rotation-search] saved history to {artifacts['history_path']}")
+    print(f"[rotation-search] saved plot to {artifacts['plot_path']}")
 
 
 def rotate_parakeet(model, test_audio_file:str, rotation_path:str, device="cuda"):

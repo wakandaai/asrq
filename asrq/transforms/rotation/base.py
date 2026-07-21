@@ -17,8 +17,11 @@ from asrq.transforms.rotation import (
     obtain_rotations_for_canary_qwen, 
     rotate_canary_qwen, 
     obtain_rotations_for_parakeet, 
-    rotate_parakeet
+    rotate_parakeet,
+    obtain_rotations_for_whisper_search,
+    obtain_rotations_for_parakeet_search,
 )
+from asrq.transforms.rotation.search import RotationSearchParams
 from datasets import load_dataset
 import soundfile as sf
 
@@ -28,11 +31,43 @@ import soundfile as sf
 class RotationTransformConfig(TransformConfig):
     def __init__(self, cfg: DictConfig) -> None:
         super().__init__(cfg)
+        self.type = cfg.type
         self.num_samples = cfg.num_samples
         self.epochs = cfg.epochs
         self.learning_rate = cfg.learning_rate
         self.batch_size = cfg.batch_size
         self.learn_rotation = cfg.learn_rotation
+        self.population_size = cfg.population_size
+        self.elite_count = cfg.elite_count
+        self.parent_pool_fraction = cfg.parent_pool_fraction
+        self.generations = cfg.generations
+        self.patience = cfg.patience
+        self.mutate_both_probability = cfg.mutate_both_probability
+        self.large_mutation_probability = cfg.large_mutation_probability
+        self.small_mutation_min = cfg.small_mutation_min
+        self.small_mutation_max = cfg.small_mutation_max
+        self.medium_mutation_min = cfg.medium_mutation_min
+        self.medium_mutation_max = cfg.medium_mutation_max
+        self.large_mutation_fraction = cfg.large_mutation_fraction
+        self.wbits = getattr(cfg, "wbits", 4)
+        self.abits = getattr(cfg, "abits", 16)
+
+    def search_params(self, seed: int) -> RotationSearchParams:
+        return RotationSearchParams(
+            population_size=self.population_size,
+            elite_count=self.elite_count,
+            parent_pool_fraction=self.parent_pool_fraction,
+            generations=self.generations,
+            patience=self.patience,
+            mutate_both_probability=self.mutate_both_probability,
+            large_mutation_probability=self.large_mutation_probability,
+            small_mutation_min=self.small_mutation_min,
+            small_mutation_max=self.small_mutation_max,
+            medium_mutation_min=self.medium_mutation_min,
+            medium_mutation_max=self.medium_mutation_max,
+            large_mutation_fraction=self.large_mutation_fraction,
+            seed=seed,
+        )
 
 
 @register_transform(TransformNames.rotation)
@@ -51,18 +86,47 @@ class RotationTransform(BaseTransform):
             return
         if self.cfg.model_name == ModelNames.OPENAI_WHISPER_LARGE_V3:
             assert isinstance(model, WhisperForConditionalGeneration)
-            obtain_rotations_for_whisper(
-                model, processor, self.audio, self.sr, self.cfg.num_samples, 
-                self.cfg.epochs, self.cfg.learning_rate, self.cfg.batch_size,
-                self.cfg.path
-            )
+            if self.cfg.type == "search":
+                obtain_rotations_for_whisper_search(
+                    model,
+                    processor,
+                    self.audio,
+                    self.sr,
+                    self.cfg.num_samples,
+                    self.cfg.batch_size,
+                    self.cfg.search_params(int(torch.initial_seed() & 0xFFFFFFFF)),
+                    self.cfg.path,
+                    weight_bits=self.cfg.wbits,
+                    activation_bits=self.cfg.abits,
+                )
+            else:
+                obtain_rotations_for_whisper(
+                    model, processor, self.audio, self.sr, self.cfg.num_samples, 
+                    self.cfg.epochs, self.cfg.learning_rate, self.cfg.batch_size,
+                    self.cfg.path
+                )
         elif self.cfg.model_name == ModelNames.NVIDIA_PARAKEET_CTC_1_1B:
-            obtain_rotations_for_parakeet(
-                model, "outputs/rotation_test_audio.wav", self.cfg.num_samples,
-                self.cfg.epochs, self.cfg.batch_size, self.cfg.learning_rate,
-                self.cfg.path, device="cuda"
-            )
+            if self.cfg.type == "search":
+                obtain_rotations_for_parakeet_search(
+                    model,
+                    "outputs/rotation_test_audio.wav",
+                    self.cfg.num_samples,
+                    self.cfg.batch_size,
+                    self.cfg.search_params(int(torch.initial_seed() & 0xFFFFFFFF)),
+                    self.cfg.path,
+                    device="cuda",
+                    weight_bits=self.cfg.wbits,
+                    activation_bits=self.cfg.abits,
+                )
+            else:
+                obtain_rotations_for_parakeet(
+                    model, "outputs/rotation_test_audio.wav", self.cfg.num_samples,
+                    self.cfg.epochs, self.cfg.batch_size, self.cfg.learning_rate,
+                    self.cfg.path, device="cuda"
+                )
         elif self.cfg.model_name == ModelNames.NVIDIA_CANARY_QWEN_2_5B:
+            if self.cfg.type == "search":
+                raise ValueError("Rotation search is not implemented for Canary-Qwen yet.")
             obtain_rotations_for_canary_qwen(
                 model, "outputs/rotation_test_audio.wav", self.cfg.num_samples,
                 self.cfg.epochs, self.cfg.batch_size, self.cfg.learning_rate,

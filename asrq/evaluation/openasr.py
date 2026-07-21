@@ -2,9 +2,11 @@
 
 import os
 import json
+import tempfile
 from typing import Any, Dict
 import torch
-from datasets import load_dataset, Audio
+from datasets import load_dataset, Audio, DownloadMode
+from datasets.exceptions import NonMatchingSplitsSizesError
 from asrq.evaluation.english_text_normalizer import normalizer
 import numpy as np
 import io
@@ -22,6 +24,43 @@ from transformers import GenerationConfig
 
 # metric - WER
 wer_metric = evaluate.load("wer")
+
+
+def load_openasr_dataset(dataset_path: str, dataset_name: str, split: str):
+    try:
+        return load_dataset(
+            dataset_path,
+            dataset_name,
+            split=split,
+        )
+    except NonMatchingSplitsSizesError:
+        print(
+            "Detected inconsistent cached split metadata for "
+            f"{dataset_name}/{split}; retrying with force_redownload."
+        )
+        try:
+            return load_dataset(
+                dataset_path,
+                dataset_name,
+                split=split,
+                download_mode=DownloadMode.FORCE_REDOWNLOAD,
+            )
+        except NonMatchingSplitsSizesError:
+            fresh_cache_dir = tempfile.mkdtemp(
+                prefix=f"asrq-hf-cache-{dataset_name}-{split}-"
+            )
+            print(
+                "Shared cache is still inconsistent for "
+                f"{dataset_name}/{split}; retrying with a fresh cache dir at "
+                f"{fresh_cache_dir}."
+            )
+            return load_dataset(
+                dataset_path,
+                dataset_name,
+                split=split,
+                cache_dir=fresh_cache_dir,
+                download_mode=DownloadMode.FORCE_REDOWNLOAD,
+            )
 
 
 
@@ -382,12 +421,10 @@ def evaluate_model(
 
     torch.set_float32_matmul_precision("medium")
 
-    ds = load_dataset(
-        dataset_path,
-        dataset,
+    ds = load_openasr_dataset(
+        dataset_path=dataset_path,
+        dataset_name=dataset,
         split=split,
-        # streaming=True,
-        # token=True
     )
     if batches_to_eval is not None:
         ds = ds.take(batches_to_eval * batch_size) # type: ignore

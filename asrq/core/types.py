@@ -2,6 +2,6 @@
 
 from typing import Any, Dict, Tuple
 
-type Processor =  Any
-type InpArgs = Tuple[Any, ...]
-type InpKwargs = Dict[str, Any]
+Processor =  Any
+InpArgs = Tuple[Any, ...]
+InpKwargs = Dict[str, Any]

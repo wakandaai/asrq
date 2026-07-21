@@ -56,7 +56,7 @@ python asrq/exp.py model=whisper quantizer=gptq
 python asrq/exp.py model=whisper quantizer=rtn
 
 # Learn rotation transform
-python asrq/rot-exp.py
+python -m asrq.rot-exp
 
 # Apply rotation transform before quantizing
 python asrq/exp.py model=whisper quantizer=gptq transform=rotation
