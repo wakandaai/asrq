@@ -1,0 +1,4 @@
+  File "<stdin>", line 32
+    calibration.num_samples=512,
+    ^^^^^^^^^^^^^^^^^^^^^^^
+SyntaxError: cannot assign to attribute here. Maybe you meant '==' instead of '='?

@@ -23,11 +23,16 @@ from asrq.transforms.rotation.utils import (
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
 from asrq.transforms.rotation.search import (
+    AlternatingSearchParams,
+    GlobalRotationSearchSite,
     RotationSearchParams,
     RotationSearchSite,
     SignHadamardCandidate,
+    ThreeSignHadamardCandidate,
     normalized_hadamard_matrix,
     random_sign_candidate,
+    random_three_sign_candidate,
+    run_alternating_rotation_search,
     run_rotation_search,
     save_rotation_search_artifacts,
 )
@@ -37,7 +42,7 @@ import torch.nn.functional as F
 import numpy as np
 import types
 from datasets import load_dataset
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from itertools import islice
 
 
@@ -568,7 +573,7 @@ def obtain_rotations_for_whisper(
         test_audio:np.ndarray, test_audio_sr:int, calib_samples: int, 
         epochs: int, lr: float, batch_size: int, save_path: str
     ) -> None:
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device) # type: ignore
     dtype = model.dtype
     audio = test_audio
@@ -695,6 +700,43 @@ def _replace_first_arg(args: Tuple[torch.Tensor, ...], hidden: torch.Tensor) -> 
     if not args:
         return (hidden,)
     return (hidden, *args[1:])
+
+
+def _average_whisper_fake_quant_loss(
+    model: WhisperForConditionalGeneration,
+    calibration_batches: List[dict[str, torch.Tensor]],
+    *,
+    activation_bits: int,
+    weight_bits: int,
+) -> float:
+    set_rotation_fake_quant_state(
+        model,
+        enabled=True,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+    )
+    try:
+        total_loss = 0.0
+        with torch.no_grad():
+            for batch in calibration_batches:
+                total_loss += float(whisper_loss_fn(model, _clone_tree(batch)).item())
+    finally:
+        set_rotation_fake_quant_state(
+            model,
+            enabled=False,
+            activation_bits=activation_bits,
+            weight_bits=weight_bits,
+        )
+    return total_loss / max(len(calibration_batches), 1)
+
+
+def _save_global_rotation_search_artifacts(
+    histories: List[dict[str, object]],
+    rotation_path: str,
+) -> str:
+    history_path = str(Path(rotation_path).with_name(f"{Path(rotation_path).stem}_global_search_history.pt"))
+    torch.save(histories, history_path)
+    return history_path
 
 
 class _WhisperRotationSearchAdapter:
@@ -883,6 +925,65 @@ class _WhisperRotationSearchAdapter:
         return cache
 
 
+class _WhisperGlobalQeSearchAdapter:
+    def __init__(
+        self,
+        model: WhisperForConditionalGeneration,
+        calibration_batches: List[dict[str, torch.Tensor]],
+        qe_param: nn.Parameter,
+        *,
+        activation_bits: int,
+        weight_bits: int,
+        global_site: Optional[GlobalRotationSearchSite] = None,
+    ) -> None:
+        self.model = model
+        self.calibration_batches = calibration_batches
+        self.qe_param = qe_param
+        self.activation_bits = activation_bits
+        self.weight_bits = weight_bits
+        self._global_site = global_site or GlobalRotationSearchSite(
+            site_id="encoder.qe",
+            dimension=qe_param.shape[0],
+            base_h=normalized_hadamard_matrix(qe_param.shape[0]),
+            current_candidate=random_three_sign_candidate(
+                qe_param.shape[0],
+                torch.Generator().manual_seed(0),
+            ),
+        )
+
+    def global_site(self) -> GlobalRotationSearchSite:
+        return self._global_site
+
+    def refresh_global_caches(self) -> None:
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+
+    def score_global_candidate(self, candidate: ThreeSignHadamardCandidate) -> float:
+        self._apply_candidate(candidate)
+        return _average_whisper_fake_quant_loss(
+            self.model,
+            self.calibration_batches,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+
+    def commit_global_candidate(self, candidate: ThreeSignHadamardCandidate) -> None:
+        self._apply_candidate(candidate)
+        self._global_site.current_candidate = candidate.clone()
+
+    def _apply_candidate(self, candidate: ThreeSignHadamardCandidate) -> None:
+        rotation = candidate.to_rotation(
+            self._global_site.base_h,
+            device=self.qe_param.device,
+            dtype=self.qe_param.dtype,
+        )
+        self.qe_param.data.copy_(rotation)
+
+
 def obtain_rotations_for_whisper_search(
         model: WhisperForConditionalGeneration,
         processor: WhisperProcessor,
@@ -895,8 +996,24 @@ def obtain_rotations_for_whisper_search(
         *,
         weight_bits: int = 4,
         activation_bits: int = 16,
+        search_mode: str = "local_q2",
+        q2_params: Optional[RotationSearchParams] = None,
+        qe_params: Optional[RotationSearchParams] = None,
+        q2_refine_params: Optional[RotationSearchParams] = None,
+        qe_search_params: Optional[RotationSearchParams] = None,
+        q2_refine_search_params: Optional[RotationSearchParams] = None,
+        outer_rounds: int = 1,
+        outer_patience: int = 1,
+        qe_min_delta: float = 0.0,
     ) -> None:
-    device = "cuda"
+    if q2_params is not None:
+        search_params = q2_params
+    if qe_params is None:
+        qe_params = qe_search_params
+    if q2_refine_params is None:
+        q2_refine_params = q2_refine_search_params
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)  # type: ignore
     dtype = model.dtype
     inputs = processor(test_audio, sampling_rate=test_audio_sr, return_tensors="pt")
@@ -910,8 +1027,13 @@ def obtain_rotations_for_whisper_search(
     seed_counter = 0
     qe = get_orthogonal_matrix(model.config.d_model, mode="hadamard", device=device, seed=seed + seed_counter); seed_counter += 1
     qd = get_orthogonal_matrix(model.config.d_model, mode="hadamard", device=device, seed=seed + seed_counter); seed_counter += 1
+    qe_base_h = normalized_hadamard_matrix(model.config.d_model)
+    qe_candidate = random_three_sign_candidate(
+        model.config.d_model,
+        torch.Generator().manual_seed(search_params.seed),
+    )
 
-    q2_params: Dict[str, nn.Parameter] = {}
+    q2_rotation_params: Dict[str, nn.Parameter] = {}
     sites: List[RotationSearchSite] = []
     generator = torch.Generator().manual_seed(search_params.seed)
     for i in range(model.config.encoder_layers):
@@ -919,7 +1041,7 @@ def obtain_rotations_for_whisper_search(
         base_h = normalized_hadamard_matrix(head_dim)
         candidate = random_sign_candidate(head_dim, generator)
         stem = f"model.encoder.layers.{i}.self_attn"
-        q2_params[stem] = nn.Parameter(
+        q2_rotation_params[stem] = nn.Parameter(
             candidate.to_rotation(base_h, device=device, dtype=torch.float32),
             requires_grad=False,
         )
@@ -939,7 +1061,7 @@ def obtain_rotations_for_whisper_search(
             base_h = normalized_hadamard_matrix(head_dim)
             candidate = random_sign_candidate(head_dim, generator)
             stem = f"model.decoder.layers.{i}.{attn_name}"
-            q2_params[stem] = nn.Parameter(
+            q2_rotation_params[stem] = nn.Parameter(
                 candidate.to_rotation(base_h, device=device, dtype=torch.float32),
                 requires_grad=False,
             )
@@ -952,10 +1074,10 @@ def obtain_rotations_for_whisper_search(
                     current_candidate=candidate,
                 )
             )
-
+    qe.data.copy_(qe_candidate.to_rotation(qe_base_h, device=device, dtype=qe.dtype))
     qe_param = nn.Parameter(qe.float(), requires_grad=False)
     qd_param = nn.Parameter(qd.float(), requires_grad=False)
-    modify_whisper_layers_with_rotation_params(model, qe_param, qd_param, q2_params)
+    modify_whisper_layers_with_rotation_params(model, qe_param, qd_param, q2_rotation_params)
     monkey_patch_whisper(model, qe_param, qd_param)
     set_rotation_fake_quant_state(
         model,
@@ -988,21 +1110,65 @@ def obtain_rotations_for_whisper_search(
     adapter = _WhisperRotationSearchAdapter(
         model,
         calibration_batches,
-        q2_params,
+        q2_rotation_params,
         sites,
         device=device,
         weight_bits=weight_bits,
         activation_bits=activation_bits,
     )
-    result = run_rotation_search(adapter, search_params)
+    if search_mode == "alternating":
+        if qe_params is None or q2_refine_params is None:
+            raise ValueError("Alternating search requires qe_params and q2_refine_params.")
+        global_adapter = _WhisperGlobalQeSearchAdapter(
+            model,
+            calibration_batches,
+            qe_param,
+            activation_bits=activation_bits,
+            weight_bits=weight_bits,
+            global_site=GlobalRotationSearchSite(
+                site_id="encoder.qe",
+                dimension=model.config.d_model,
+                base_h=qe_base_h,
+                current_candidate=qe_candidate.clone(),
+            ),
+        )
+        alternating_result = run_alternating_rotation_search(
+            adapter,
+            global_adapter,
+            AlternatingSearchParams(
+                q2_params=search_params,
+                qe_params=qe_params,
+                q2_refine_params=q2_refine_params,
+                outer_rounds=outer_rounds,
+                outer_patience=outer_patience,
+                qe_min_delta=qe_min_delta,
+            ),
+        )
+        result = alternating_result.local_result
+        global_histories = [
+            {
+                "site_id": history.site_id,
+                "generation_indices": history.generation_indices,
+                "best_scores": history.best_scores,
+                "committed_score": history.committed_score,
+            }
+            for history in alternating_result.global_history
+        ]
+    else:
+        result = run_rotation_search(adapter, search_params)
+        global_histories = []
 
     to_save = {
         "Qe": qe_param.data.detach().cpu(),
         "Qd": qd_param.data.detach().cpu(),
-        "Q2s": {k: v.data.detach().cpu() for k, v in q2_params.items()},
+        "Q2s": {k: v.data.detach().cpu() for k, v in q2_rotation_params.items()},
+        "global_histories": global_histories,
     }
     torch.save(to_save, save_path)
     artifacts = save_rotation_search_artifacts(result, save_path)
+    if global_histories:
+        global_history_path = _save_global_rotation_search_artifacts(global_histories, save_path)
+        print(f"[rotation-search] saved global history to {global_history_path}")
     print(f"[rotation-search] saved history to {artifacts['history_path']}")
     print(f"[rotation-search] saved plot to {artifacts['plot_path']}")
 

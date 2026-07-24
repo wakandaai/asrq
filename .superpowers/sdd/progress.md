@@ -1,0 +1,5 @@
+Task 1: complete (working tree reviewed, focused tests green)
+Task 2: complete (focused tests green on job 107159)
+Task 3: complete (Parakeet alternating path focused tests green on job 107159)
+Task 4: complete (Whisper alternating path focused tests green on job 107159)
+Task 5: complete (artifacts/docs updated; alternating-search pytest suite green on job 107159)

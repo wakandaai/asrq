@@ -1,0 +1,11 @@
+[NeMo I 2026-07-21 14:06:44 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 210 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.
+[rotation-search] site=encoder.layers.0.self_attn start population=8
+[rotation-search] site=encoder.layers.0.self_attn generation=1/16 best_nmse=0.109922 stagnant=0
+[rotation-search] site=encoder.layers.0.self_attn generation=2/16 best_nmse=0.110141 stagnant=1
+[rotation-search] site=encoder.layers.0.self_attn generation=3/16 best_nmse=0.109988 stagnant=2
+[rotation-search] site=encoder.layers.0.self_attn generation=4/16 best_nmse=0.110004 stagnant=3
+[rotation-search] site=encoder.layers.0.self_attn generation=5/16 best_nmse=0.110092 stagnant=4
+[rotation-search] site=encoder.layers.0.self_attn early-stop patience=4

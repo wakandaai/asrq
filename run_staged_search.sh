@@ -1,8 +1,15 @@
-srun --jobid=107159 --overlap bash -lc '
+#!/bin/bash
+#SBATCH --job-name=rotsearch-parakeet
+#SBATCH --gres=gpu:h100:1
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/rotsearch-%j.out
+#SBATCH --error=logs/rotsearch-%j.err
+
 source ~/.bashrc
 conda activate asrq
 cd /home/blessedg/asrq
-python - <<'"'"'PY'"'"'
+
+python - <<'PY'
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
@@ -26,19 +33,27 @@ def set_seed(seed=42):
 CONFIG_DIR = os.path.join(os.getcwd(), "asrq", "configs")
 with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_DIR)):
     cfg = compose(config_name="config", overrides=[
-        "model=parakeet",
+        "model=parakeet",   # change to whisper if needed
         "quantizer=gptq",
+        "quantizer.bits=4",
+        "activation_bits=8",
+        "evaluate=false",
         "transform=rotation",
         "transform.type=search",
+        "transform.search_mode=alternating",
+        "calibration.num_samples=128",
         "transform.num_samples=128",
-        "transform.batch_size=1",
+        "transform.batch_size=64",
         "transform.population_size=8",
         "transform.elite_count=2",
         "transform.generations=16",
         "transform.patience=4",
-        "transform.parent_pool_fraction=0.5",
-        "activation_bits=8",
-        "evaluate=False",
+        "transform.qe_generations=12",
+        "transform.qe_patience=4",
+        "transform.q2_refine_generations=6",
+        "transform.outer_rounds=4",
+        "transform.outer_patience=1",
+        "transform.qe_min_delta=1e-3",
     ])
 
 set_seed(cfg.seed)
@@ -61,4 +76,15 @@ transform.obtain_transform(modelQ)
 
 print("Saved rotation to:", transform.cfg.path)
 PY
-'
+
+
+
+python -m asrq.exp \
+  model=parakeet \
+  quantizer=gptq \
+  quantizer.bits=4 \
+  activation_bits=8 \
+  transform=rotation \
+  transform.type=search \
+  transform.path=/home/blessedg/asrq/outputs/rotation/nvidia-parakeet-ctc-1.1b_rotation_w4a8_search.pt \
+  evaluate=true

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import types
+from pathlib import Path
 
 from asrq.transforms.rotation.utils import (
     RMSNormFusedM,
@@ -29,11 +30,16 @@ from typing import List, Tuple, Optional, Union, Dict
 
 import matplotlib.pyplot as plt
 from asrq.transforms.rotation.search import (
+    AlternatingSearchParams,
+    GlobalRotationSearchSite,
     RotationSearchParams,
     RotationSearchSite,
     SignHadamardCandidate,
+    ThreeSignHadamardCandidate,
     normalized_hadamard_matrix,
     random_sign_candidate,
+    random_three_sign_candidate,
+    run_alternating_rotation_search,
     run_rotation_search,
     save_rotation_search_artifacts,
 )
@@ -786,6 +792,53 @@ def _extract_hidden_state(output):
     return output
 
 
+def _average_parakeet_fake_quant_ctc_loss(
+    model: nn.Module,
+    calibration_batches: List[dict[str, torch.Tensor]],
+    *,
+    activation_bits: int,
+    weight_bits: int,
+) -> float:
+    set_rotation_fake_quant_state(
+        model,
+        enabled=True,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+    )
+    try:
+        total_loss = 0.0
+        with torch.no_grad():
+            for batch in calibration_batches:
+                total_loss += float(parakeet_ctc_loss_fn(model, _clone_tree(batch)).item())
+    finally:
+        set_rotation_fake_quant_state(
+            model,
+            enabled=False,
+            activation_bits=activation_bits,
+            weight_bits=weight_bits,
+        )
+    return total_loss / max(len(calibration_batches), 1)
+
+
+def _save_global_rotation_search_artifacts(
+    histories: List,
+    rotation_path: str,
+) -> str:
+    rotation_file = Path(rotation_path)
+    history_path = rotation_file.with_name(f"{rotation_file.stem}_global_search_history.pt")
+    serializable = [
+        {
+            "site_id": history.site_id,
+            "generation_indices": history.generation_indices,
+            "best_scores": history.best_scores,
+            "committed_score": history.committed_score,
+        }
+        for history in histories
+    ]
+    torch.save(serializable, history_path)
+    return str(history_path)
+
+
 class _ParakeetRotationSearchAdapter:
     def __init__(
         self,
@@ -838,8 +891,11 @@ class _ParakeetRotationSearchAdapter:
         with torch.no_grad():
             for kwargs, fp_output in self._block_cache[site.block_id]:
                 replay_kwargs = _clone_tree(kwargs)
+                # print(f"replay_kwargs : {replay_kwargs}")
+
                 out = block(**replay_kwargs)
                 hidden = _extract_hidden_state(out)
+                # print(f"hidden.shape : {hidden.shape} fp_output.shape  {fp_output.shape}")
                 diff = hidden.float() - fp_output.float()
                 numerator += diff.pow(2).sum().item()
                 denominator += fp_output.float().pow(2).sum().item()
@@ -919,6 +975,65 @@ class _ParakeetRotationSearchAdapter:
         return block_cache
 
 
+class _ParakeetGlobalQeSearchAdapter:
+    def __init__(
+        self,
+        model: nn.Module,
+        calibration_batches: List[dict[str, torch.Tensor]],
+        qe_param: nn.Parameter,
+        *,
+        activation_bits: int,
+        weight_bits: int,
+        global_site: Optional[GlobalRotationSearchSite] = None,
+    ) -> None:
+        self.model = model
+        self.calibration_batches = calibration_batches
+        self.qe_param = qe_param
+        self._global_site = global_site or GlobalRotationSearchSite(
+            site_id="encoder.qe",
+            dimension=qe_param.shape[0],
+            base_h=normalized_hadamard_matrix(qe_param.shape[0]),
+            current_candidate=random_three_sign_candidate(
+                qe_param.shape[0],
+                torch.Generator().manual_seed(0),
+            ),
+        )
+        self.activation_bits = activation_bits
+        self.weight_bits = weight_bits
+
+    def global_site(self) -> GlobalRotationSearchSite:
+        return self._global_site
+
+    def refresh_global_caches(self) -> None:
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+
+    def score_global_candidate(self, candidate: ThreeSignHadamardCandidate) -> float:
+        self._apply_candidate(candidate)
+        return _average_parakeet_fake_quant_ctc_loss(
+            self.model,
+            self.calibration_batches,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+
+    def commit_global_candidate(self, candidate: ThreeSignHadamardCandidate) -> None:
+        self._apply_candidate(candidate)
+        self._global_site.current_candidate = candidate.clone()
+
+    def _apply_candidate(self, candidate: ThreeSignHadamardCandidate) -> None:
+        rotation = candidate.to_rotation(
+            self._global_site.base_h,
+            device=self.qe_param.device,
+            dtype=self.qe_param.dtype,
+        )
+        self.qe_param.data.copy_(rotation)
+
+
 def obtain_rotations_for_parakeet_search(
     model,
     text_audio_path: str,
@@ -930,7 +1045,23 @@ def obtain_rotations_for_parakeet_search(
     *,
     weight_bits: int = 4,
     activation_bits: int = 16,
+    search_mode: str = "local_q2",
+    q2_params: Optional[RotationSearchParams] = None,
+    qe_params: Optional[RotationSearchParams] = None,
+    q2_refine_params: Optional[RotationSearchParams] = None,
+    qe_search_params: Optional[RotationSearchParams] = None,
+    q2_refine_search_params: Optional[RotationSearchParams] = None,
+    outer_rounds: int = 1,
+    outer_patience: int = 1,
+    qe_min_delta: float = 0.0,
 ) -> None:
+    if q2_params is not None:
+        search_params = q2_params
+    if qe_params is None:
+        qe_params = qe_search_params
+    if q2_refine_params is None:
+        q2_refine_params = q2_refine_search_params
+
     model.to(device)
     with torch.no_grad():
         orig_transcription = transcribe(model, text_audio_path)
@@ -955,7 +1086,7 @@ def obtain_rotations_for_parakeet_search(
     qe = get_orthogonal_matrix(encoder_hidden_size, mode=mode, device=device, seed=seed + seed_counter)
     seed_counter += 1
 
-    q2_params: Dict[str, nn.Parameter] = {}
+    q2_rotation_params: Dict[str, nn.Parameter] = {}
     sites: List[RotationSearchSite] = []
     generator = torch.Generator().manual_seed(search_params.seed)
 
@@ -963,10 +1094,14 @@ def obtain_rotations_for_parakeet_search(
     for i in range(num_encoder_layers):
         head_dim = model.encoder.layers[i].self_attn.d_k
         base_h = normalized_hadamard_matrix(head_dim)
+
+        search_params.seed += 1
+        generator = torch.Generator().manual_seed(search_params.seed)
+
         candidate = random_sign_candidate(head_dim, generator) #returns d0,d1
         stem = f"encoder.layers.{i}.self_attn"
         q2_tensor = candidate.to_rotation(base_h, device=device, dtype=torch.float64)# do*h*d1
-        q2_params[stem] = nn.Parameter(q2_tensor, requires_grad=False)
+        q2_rotation_params[stem] = nn.Parameter(q2_tensor, requires_grad=False)
         sites.append(
             RotationSearchSite(
                 site_id=stem,
@@ -977,11 +1112,15 @@ def obtain_rotations_for_parakeet_search(
             )
         )
 
+    qe_base_h = normalized_hadamard_matrix(encoder_hidden_size)
+    qe_candidate = random_three_sign_candidate(encoder_hidden_size, generator)
+    qe.data.copy_(qe_candidate.to_rotation(qe_base_h, device=device, dtype=qe.dtype))
+
     qe_param = nn.Parameter(qe.float(), requires_grad=False)
     modify_parakeet_ctc_layers_with_rotation_params(
         model,
         qe_param,
-        q2_params,
+        q2_rotation_params,
         include_activation_quant=False,
     )
     monkey_patch_parakeet_ctc_for_train(model, qe_param)
@@ -1020,22 +1159,58 @@ def obtain_rotations_for_parakeet_search(
     adapter = _ParakeetRotationSearchAdapter(
         model,
         calibration_batches,
-        q2_params,
+        q2_rotation_params,
         sites,
         device=device,
         weight_bits=weight_bits,
         activation_bits=activation_bits,
     )
-    result = run_rotation_search(adapter, search_params)
+    if search_mode == "alternating":
+        if qe_params is None or q2_refine_params is None:
+            raise ValueError("Alternating search requires qe_params and q2_refine_params.")
+        global_adapter = _ParakeetGlobalQeSearchAdapter(
+            model,
+            calibration_batches,
+            qe_param,
+            activation_bits=activation_bits,
+            weight_bits=weight_bits,
+            global_site=GlobalRotationSearchSite(
+                site_id="encoder.qe",
+                dimension=encoder_hidden_size,
+                base_h=qe_base_h,
+                current_candidate=qe_candidate.clone(),
+            ),
+        )
+        alternating_result = run_alternating_rotation_search(
+            adapter,
+            global_adapter,
+            AlternatingSearchParams(
+                q2_params=search_params,
+                qe_params=qe_params,
+                q2_refine_params=q2_refine_params,
+                outer_rounds=outer_rounds,
+                outer_patience=outer_patience,
+                qe_min_delta=qe_min_delta,
+            ),
+        )
+        result = alternating_result.local_result
+        global_histories = alternating_result.global_history
+    else:
+        result = run_rotation_search(adapter, search_params)
+        global_histories = []
 
     to_save = {
         "Qe": qe_param.data.detach().cpu(),
-        "Q2s": {k: v.data.detach().cpu() for k, v in q2_params.items()},
+        "Q2s": {k: v.data.detach().cpu() for k, v in q2_rotation_params.items()},
+        "global_histories": global_histories,
     }
     torch.save(to_save, save_path)
     artifacts = save_rotation_search_artifacts(result, save_path)
     print(f"[rotation-search] saved history to {artifacts['history_path']}")
     print(f"[rotation-search] saved plot to {artifacts['plot_path']}")
+    if global_histories:
+        global_history_path = _save_global_rotation_search_artifacts(global_histories, save_path)
+        print(f"[rotation-search] saved global history to {global_history_path}")
 
 
 def rotate_parakeet(model, test_audio_file:str, rotation_path:str, device="cuda"):
@@ -1043,7 +1218,7 @@ def rotate_parakeet(model, test_audio_file:str, rotation_path:str, device="cuda"
         orig_transcription = transcribe(model, test_audio_file)
 
     prepare_parakeet_ctc_for_rotation(model)  # merge LoRA, fuse norms
-    rotations = torch.load(rotation_path)  # load learned rotations
+    rotations = torch.load(rotation_path, weights_only=False)  # load learned rotations
     Qe = rotations["Qe"]
     Q2s = rotations["Q2s"]
     fuse_parakeet_ctc_layers_with_rotations(model, Qe, Q2s, device=device)  # fuse rotations into weights

@@ -1,0 +1,43 @@
+[NeMo W 2026-07-21 14:17:09 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/512 [00:00<?, ?it/s]Loading calibration samples:  88%|████████▊ | 451/512 [00:00<00:00, 4509.19it/s]Loading calibration samples: 100%|██████████| 512/512 [00:00<00:00, 4545.72it/s]
+[NeMo W 2026-07-21 14:17:34 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-21 14:17:34 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+[NeMo W 2026-07-21 14:17:35 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-21 14:17:35 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+[NeMo W 2026-07-21 14:17:35 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-21 14:17:35 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+[W721 14:18:01.466068259 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 8257536, total: 85019328512).
+[W721 14:18:01.673854388 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 8257536, total: 85019328512).
+[W721 14:18:01.813857607 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 8257536, total: 85019328512).
+[W721 14:18:01.814494594 CUDACachingAllocator.cpp:508] expandable_segments: memory mapping failed with OOM on device 0 while trying to map 20971520 bytes (free: 8257536, total: 85019328512).
+Traceback (most recent call last):
+  File "<stdin>", line 63, in <module>
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 174, in obtain_transform
+    obtain_rotations_for_parakeet_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/parakeet_ctc_utils.py", line 1179, in obtain_rotations_for_parakeet_search
+    alternating_result = run_alternating_rotation_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/search.py", line 457, in run_alternating_rotation_search
+    local_result = run_rotation_search(local_adapter, params.q2_params)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/search.py", line 395, in run_rotation_search
+    adapter.refresh_caches()
+  File "/home/blessedg/asrq/asrq/transforms/rotation/parakeet_ctc_utils.py", line 873, in refresh_caches
+    self._block_cache = self._build_block_cache()
+  File "/home/blessedg/asrq/asrq/transforms/rotation/parakeet_ctc_utils.py", line 966, in _build_block_cache
+    out = block(**replay_kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/nemo/collections/asr/parts/submodules/conformer_modules.py", line 181, in forward
+    x = self.self_attn(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb, cache=cache_last_channel)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/nemo/collections/asr/parts/submodules/multi_head_attention.py", line 349, in forward
+    out = self.forward_attention(v, scores, mask)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/nemo/collections/asr/parts/submodules/multi_head_attention.py", line 143, in forward_attention
+    x = torch.matmul(p_attn, value)  # (batch, head, time1, d_k)
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 54.00 MiB. GPU 0 has a total capacity of 79.18 GiB of which 27.88 MiB is free. Including non-PyTorch memory, this process has 79.14 GiB memory in use. Of the allocated memory 77.46 GiB is allocated by PyTorch, and 1.03 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)

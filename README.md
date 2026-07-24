@@ -58,6 +58,14 @@ python asrq/exp.py model=whisper quantizer=rtn
 # Learn rotation transform
 python -m asrq.rot-exp
 
+# Learn rotation transform with local Q2 search
+python -m asrq.rot-exp transform.type=search
+
+# Learn rotation transform with alternating Q2 -> Qe -> Q2 search
+python -m asrq.rot-exp transform.type=search transform.search_mode=alternating \
+  transform.outer_rounds=3 transform.outer_patience=1 transform.qe_min_delta=1e-3 \
+  transform.qe_generations=8 transform.q2_refine_generations=6
+
 # Apply rotation transform before quantizing
 python asrq/exp.py model=whisper quantizer=gptq transform=rotation
 
@@ -145,6 +153,38 @@ Override any value from the command line:
 ```bash
 asrq/asrq-exp.py model=parakeet quantizer.bits=2 quantizer.group_size=64 transform=scaling
 ```
+
+### Alternating Rotation Search
+
+The search-based rotation path now supports two modes:
+
+- `transform.search_mode=local_q2`
+  - existing per-layer local `Q2` search using fake-quant block-output NMSE
+- `transform.search_mode=alternating`
+  - hierarchical `Q2 -> Qe -> Q2` search
+  - local `Q2` stages use block-output NMSE
+  - global `Qe` stage uses fake-quant task loss
+    - Parakeet: CTC loss
+    - Whisper: teacher-forced seq2seq cross-entropy
+
+Useful alternating knobs:
+
+```yaml
+transform.type: search
+transform.search_mode: alternating
+transform.outer_rounds: 3
+transform.outer_patience: 1
+transform.qe_min_delta: 1e-3
+transform.qe_generations: 8
+transform.q2_refine_generations: 6
+```
+
+Alternating search saves:
+
+- `*_search_history.pt`
+- `*_search_progress.png`
+- `*_global_search_history.pt`
+- `*_global_search_progress.png`
 
 ## Evaluation
 

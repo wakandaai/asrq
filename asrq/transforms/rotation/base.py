@@ -32,6 +32,7 @@ class RotationTransformConfig(TransformConfig):
     def __init__(self, cfg: DictConfig) -> None:
         super().__init__(cfg)
         self.type = cfg.type
+        self.search_mode = getattr(cfg, "search_mode", "local_q2")
         self.num_samples = cfg.num_samples
         self.epochs = cfg.epochs
         self.learning_rate = cfg.learning_rate
@@ -42,6 +43,12 @@ class RotationTransformConfig(TransformConfig):
         self.parent_pool_fraction = cfg.parent_pool_fraction
         self.generations = cfg.generations
         self.patience = cfg.patience
+        self.outer_rounds = getattr(cfg, "outer_rounds", 1)
+        self.outer_patience = getattr(cfg, "outer_patience", 1)
+        self.qe_min_delta = getattr(cfg, "qe_min_delta", 0.0)
+        self.q2_refine_generations = getattr(cfg, "q2_refine_generations", self.generations)
+        self.qe_generations = getattr(cfg, "qe_generations", self.generations)
+        self.qe_patience = getattr(cfg, "qe_patience", self.patience)
         self.mutate_both_probability = cfg.mutate_both_probability
         self.large_mutation_probability = cfg.large_mutation_probability
         self.small_mutation_min = cfg.small_mutation_min
@@ -59,6 +66,40 @@ class RotationTransformConfig(TransformConfig):
             parent_pool_fraction=self.parent_pool_fraction,
             generations=self.generations,
             patience=self.patience,
+            mutate_both_probability=self.mutate_both_probability,
+            large_mutation_probability=self.large_mutation_probability,
+            small_mutation_min=self.small_mutation_min,
+            small_mutation_max=self.small_mutation_max,
+            medium_mutation_min=self.medium_mutation_min,
+            medium_mutation_max=self.medium_mutation_max,
+            large_mutation_fraction=self.large_mutation_fraction,
+            seed=seed,
+        )
+
+    def q2_refine_search_params(self, seed: int) -> RotationSearchParams:
+        return RotationSearchParams(
+            population_size=self.population_size,
+            elite_count=self.elite_count,
+            parent_pool_fraction=self.parent_pool_fraction,
+            generations=self.q2_refine_generations,
+            patience=self.patience,
+            mutate_both_probability=self.mutate_both_probability,
+            large_mutation_probability=self.large_mutation_probability,
+            small_mutation_min=self.small_mutation_min,
+            small_mutation_max=self.small_mutation_max,
+            medium_mutation_min=self.medium_mutation_min,
+            medium_mutation_max=self.medium_mutation_max,
+            large_mutation_fraction=self.large_mutation_fraction,
+            seed=seed,
+        )
+
+    def qe_search_params(self, seed: int) -> RotationSearchParams:
+        return RotationSearchParams(
+            population_size=self.population_size,
+            elite_count=self.elite_count,
+            parent_pool_fraction=self.parent_pool_fraction,
+            generations=self.qe_generations,
+            patience=self.qe_patience,
             mutate_both_probability=self.mutate_both_probability,
             large_mutation_probability=self.large_mutation_probability,
             small_mutation_min=self.small_mutation_min,
@@ -87,18 +128,39 @@ class RotationTransform(BaseTransform):
         if self.cfg.model_name == ModelNames.OPENAI_WHISPER_LARGE_V3:
             assert isinstance(model, WhisperForConditionalGeneration)
             if self.cfg.type == "search":
-                obtain_rotations_for_whisper_search(
-                    model,
-                    processor,
-                    self.audio,
-                    self.sr,
-                    self.cfg.num_samples,
-                    self.cfg.batch_size,
-                    self.cfg.search_params(int(torch.initial_seed() & 0xFFFFFFFF)),
-                    self.cfg.path,
-                    weight_bits=self.cfg.wbits,
-                    activation_bits=self.cfg.abits,
-                )
+                seed = int(torch.initial_seed() & 0xFFFFFFFF)
+                if self.cfg.search_mode == "alternating":
+                    obtain_rotations_for_whisper_search(
+                        model,
+                        processor,
+                        self.audio,
+                        self.sr,
+                        self.cfg.num_samples,
+                        self.cfg.batch_size,
+                        self.cfg.search_params(seed),
+                        self.cfg.path,
+                        weight_bits=self.cfg.wbits,
+                        activation_bits=self.cfg.abits,
+                        search_mode=self.cfg.search_mode,
+                        qe_search_params=self.cfg.qe_search_params(seed + 1),
+                        q2_refine_search_params=self.cfg.q2_refine_search_params(seed + 2),
+                        outer_rounds=self.cfg.outer_rounds,
+                        outer_patience=self.cfg.outer_patience,
+                        qe_min_delta=self.cfg.qe_min_delta,
+                    )
+                else:
+                    obtain_rotations_for_whisper_search(
+                        model,
+                        processor,
+                        self.audio,
+                        self.sr,
+                        self.cfg.num_samples,
+                        self.cfg.batch_size,
+                        self.cfg.search_params(seed),
+                        self.cfg.path,
+                        weight_bits=self.cfg.wbits,
+                        activation_bits=self.cfg.abits,
+                    )
             else:
                 obtain_rotations_for_whisper(
                     model, processor, self.audio, self.sr, self.cfg.num_samples, 
@@ -107,17 +169,37 @@ class RotationTransform(BaseTransform):
                 )
         elif self.cfg.model_name == ModelNames.NVIDIA_PARAKEET_CTC_1_1B:
             if self.cfg.type == "search":
-                obtain_rotations_for_parakeet_search(
-                    model,
-                    "outputs/rotation_test_audio.wav",
-                    self.cfg.num_samples,
-                    self.cfg.batch_size,
-                    self.cfg.search_params(int(torch.initial_seed() & 0xFFFFFFFF)),
-                    self.cfg.path,
-                    device="cuda",
-                    weight_bits=self.cfg.wbits,
-                    activation_bits=self.cfg.abits,
-                )
+                seed = int(torch.initial_seed() & 0xFFFFFFFF)
+                if self.cfg.search_mode == "alternating":
+                    obtain_rotations_for_parakeet_search(
+                        model,
+                        "outputs/rotation_test_audio.wav",
+                        self.cfg.num_samples,
+                        self.cfg.batch_size,
+                        self.cfg.search_params(seed),
+                        self.cfg.path,
+                        device="cuda",
+                        weight_bits=self.cfg.wbits,
+                        activation_bits=self.cfg.abits,
+                        search_mode=self.cfg.search_mode,
+                        qe_search_params=self.cfg.qe_search_params(seed + 1),
+                        q2_refine_search_params=self.cfg.q2_refine_search_params(seed + 2),
+                        outer_rounds=self.cfg.outer_rounds,
+                        outer_patience=self.cfg.outer_patience,
+                        qe_min_delta=self.cfg.qe_min_delta,
+                    )
+                else:
+                    obtain_rotations_for_parakeet_search(
+                        model,
+                        "outputs/rotation_test_audio.wav",
+                        self.cfg.num_samples,
+                        self.cfg.batch_size,
+                        self.cfg.search_params(seed),
+                        self.cfg.path,
+                        device="cuda",
+                        weight_bits=self.cfg.wbits,
+                        activation_bits=self.cfg.abits,
+                    )
             else:
                 obtain_rotations_for_parakeet(
                     model, "outputs/rotation_test_audio.wav", self.cfg.num_samples,

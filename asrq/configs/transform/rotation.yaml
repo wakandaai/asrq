@@ -1,5 +1,6 @@
 name: rotation
 type: cayley
+search_mode: local_q2
 num_samples: 800
 epochs: 1
 learning_rate: 0.01
@@ -12,6 +13,12 @@ elite_count: 2
 parent_pool_fraction: 0.5
 generations: 16
 patience: 4
+outer_rounds: 1
+outer_patience: 1
+qe_min_delta: 0.0
+q2_refine_generations: 16
+qe_generations: 16
+qe_patience: 4
 mutate_both_probability: 0.1
 large_mutation_probability: 0.1
 small_mutation_min: 1
