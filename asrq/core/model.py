@@ -10,6 +10,7 @@ from asrq.core.registry import ModelQ_Registry, QuantizerNames
 from asrq.quantizers.base import QuantConfig
 from asrq.transforms.base import TransformConfig
 from asrq.calibration.base import CalibConfig
+from asrq.core.linear import ASRQLinear
 from abc import ABC, abstractmethod
 from datasets import load_dataset
 from itertools import islice
@@ -146,6 +147,50 @@ class ModelQ(ABC):
         """Quantize the text decoder."""
         raise NotImplementedError("Text decoder quantization not implemented.")
     
+    def get_asrq_linear_targets(self) -> Dict[str, Tuple[int, int]]:
+        """Map fully-qualified nn.Linear module names (dotted path from
+        self.model) to the (wbits, abits) they should be quantized to by
+        to_asrq_linear(). Subclasses (e.g. WhisperQ) override this with
+        their own model-specific layer names -- see
+        WhisperQ.for_activation_quantization() for the equivalent
+        name-building pattern (encoder/decoder blocks, variable layer
+        count from config).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_asrq_linear_targets() to use to_asrq_linear()"
+        )
+
+    def to_asrq_linear(self, group_size: int = -1, symmetric: bool = True) -> None:
+        """Replace every nn.Linear named by get_asrq_linear_targets() with
+        an ASRQLinear quantized to that layer's (wbits, abits), in place.
+
+        Unlike quantize_speech_encoder()/quantize_text_decoder() (which run
+        a calibration-driven Quantizer -- e.g. RTNQuantizer -- and need
+        module.quantize_() called separately for ASRQLinear targets to
+        become usable, see WhisperQ's block-quantization methods), this is
+        a direct, calibration-free RTN quantization path: each target
+        layer's existing float weight (and bias, if any) is copied via
+        ASRQLinear.from_linear(), which quantizes and packs it immediately
+        -- the returned module is ready for forward() with no further
+        steps. group_size/symmetric apply uniformly to every replaced
+        layer; per-layer wbits/abits come from get_asrq_linear_targets().
+        """
+        targets = self.get_asrq_linear_targets()
+        named_modules = dict(self.model.named_modules())
+        for name, (wbits, abits) in targets.items():
+            if name not in named_modules:
+                raise ValueError(f"Module '{name}' not found in model")
+            module = named_modules[name]
+            if not isinstance(module, nn.Linear):
+                raise TypeError(f"Module '{name}' is not an nn.Linear (got {type(module).__name__})")
+
+            new_module = ASRQLinear.from_linear(
+                module, wbits=wbits, abits=abits, group_size=group_size, symmetric=symmetric,
+            )
+            parent_name, _, attr = name.rpartition(".")
+            parent = named_modules[parent_name] if parent_name else self.model
+            setattr(parent, attr, new_module)
+
     def learn_rotation(self, rotation_path:str)->None:
         """Learn a rotation matrix for the model and save it to disk."""
         raise NotImplementedError("Rotation learning not implemented.")

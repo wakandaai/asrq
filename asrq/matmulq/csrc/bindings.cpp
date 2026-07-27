@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <limits>
+#include <vector>
 // #include "cutlass/cutlass.h"
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
@@ -10,16 +11,154 @@
   CHECK_CUDA(x);         \
   CHECK_CONTIGUOUS(x)
 
+// Shared by every matmul wrapper below: validates an optional (N,) f16 bias
+// tensor and returns the raw pointer the kernel epilogues expect (nullptr
+// when no bias was passed), so bias gets added inside the kernel's own
+// output write instead of a separate elementwise CUDA kernel afterward.
+static const __half* get_bias_ptr(const c10::optional<torch::Tensor>& bias_opt, int64_t N) {
+    if (!bias_opt.has_value()) return nullptr;
+    const auto& bias = bias_opt.value();
+    CHECK_INPUT(bias);
+    TORCH_CHECK(bias.dtype() == torch::kFloat16, "bias must be float16");
+    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == N, "bias must have shape (N,); got ", bias.sizes());
+    return reinterpret_cast<const __half*>(bias.data_ptr<at::Half>());
+}
+
 // Forward declarations from .cu files
 // matmul_sm89: tuned for sm_89 (Ada). Used as the default fp16 matmul.
 // void matmul_sm89_launcher (const __half* A, const __half* B, __half* C, int M, int N, int K);
-void mymatmul_launcher(const __half* A, const __half* B, __half* C, float* workspace, int* locks, int M, int N, int K, cudaStream_t stream);
-// Required element counts for the workspace (float) / locks (int) buffers
-// mymatmul_launcher will index into for this (M, N, K). NUM_SMS is picked
-// internally via a runtime occupancy query, not just derived from M/N/K, so
-// callers must get these sizes from here rather than recomputing them --
-// see the comment on compute_matmul_launch_params() in asrq.cu.
-void mymatmul_workspace_sizes(int M, int N, int K, int* workspace_size, int* locks_size);
+// Data-parallel fp16 GEMM: no stream-K, no workspace/locks -- each output
+// tile's full K reduction is owned start-to-finish by a single threadblock
+// via a grid-stride loop. Tile shape is chosen internally per (M,N,K); see
+// compute_matmul_launch_params() in asrq.cu.
+// Every launcher below now takes an optional bias pointer (nullptr = no
+// bias), added to each output element in the kernel's own epilogue -- see
+// each matmul_kernel_*'s bias0/bias1 computation in its .cu file. This
+// matches cuBLAS/cuBLASLt's fused bias epilogue instead of requiring a
+// separate elementwise add kernel afterward (which would cost a full extra
+// memory-bound pass over the (M,N) output, and loses to cuBLAS's own fused
+// path in a head-to-head nn.Linear comparison).
+void mymatmul_launcher(const __half* A, const __half* B, const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A16: f16 activations x per-channel-symmetric packed-int4 weights.
+// A (M,K) f16; Bq (N,K/2) uint8 packed excess-8 (offset-binary) nibbles --
+// nibble = signed_value + 8, range 0..15, NOT two's complement -- (low
+// nibble = even k, high nibble = odd k); scales (N,) f16 per-output-channel
+// scale. Returns (M,N) f16 = A @ dequant(Bq).T (+ bias).
+void w4a16_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* bias,
+                           __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W2A16: f16 activations x per-channel-symmetric packed-int2 weights.
+// A (M,K) f16; Bq (N,K/4) uint8 packed excess-2 (offset-binary) 2-bit codes,
+// 4 per byte -- code = signed_value + 2, range 0..3, NOT two's complement --
+// (code j, j=0..3, at bits[2j:2j+2), covering element 4*byte_index+j);
+// scales (N,) f16 per-output-channel scale. Returns (M,N) f16 =
+// A @ dequant(Bq).T (+ bias).
+void w2a16_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* bias,
+                           __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A16 groupwise: same excess-8 packed-int4 weights as w4a16_matmul, but
+// scales (N, K/128) f16 -- one scale per (channel, 128-wide K group) instead
+// of one per channel. Returns (M,N) f16 = A @ dequant_group(Bq).T (+ bias).
+// Requires K % 128 == 0 (in addition to w4a16_matmul's own K % 32 == 0).
+void w4a16_group_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* bias,
+                                  __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W2A16 groupwise: same excess-2 packed-int2 weights as w2a16_matmul, but
+// scales (N, K/128) f16 -- one scale per (channel, 128-wide K group).
+// Returns (M,N) f16 = A @ dequant_group(Bq).T (+ bias). Requires
+// K % 128 == 0 (in addition to w2a16_matmul's own K % 64 == 0).
+void w2a16_group_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* bias,
+                                  __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A16 groupwise asymmetric (zero-point): same PLAIN UNSIGNED packed-int4
+// weights as w4a16_asym_matmul, but scales, zeros (N, K/128) f16 -- one
+// scale/zero per (channel, 128-wide K group) instead of one per channel.
+// Returns (M,N) f16 = A @ (scales*code + zeros).T (grouped) (+ bias).
+// Requires K % 128 == 0 (in addition to w4a16_asym_matmul's own K % 32 == 0).
+void w4a16_group_asym_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* zeros,
+                                       const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W2A16 groupwise asymmetric (zero-point): same PLAIN UNSIGNED packed-int2
+// weights as w2a16_asym_matmul, but scales, zeros (N, K/128) f16 -- one
+// scale/zero per (channel, 128-wide K group). Returns (M,N) f16 =
+// A @ (scales*code + zeros).T (grouped) (+ bias). Requires K % 128 == 0 (in
+// addition to w2a16_asym_matmul's own K % 64 == 0).
+void w2a16_group_asym_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* zeros,
+                                       const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A16 asymmetric (zero-point): A (M,K) f16; Bq (N,K/2) uint8 packed PLAIN
+// UNSIGNED nibbles (0..15, no excess-8 encoding -- zeros[n] absorbs the
+// centering); scales, zeros (N,) f16 per-output-channel. Returns (M,N) f16 =
+// A @ (scales[:,None]*dequant_code(Bq) + zeros[:,None]).T (+ bias).
+void w4a16_asym_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* zeros,
+                                const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W2A16 asymmetric (zero-point): same convention as w4a16_asym above, but
+// Bq (N,K/4) uint8 packed plain unsigned 2-bit codes (0..3), 4 per byte.
+void w2a16_asym_matmul_launcher(const __half* A, const uint8_t* Bq, const __half* scales, const __half* zeros,
+                                const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A4: BOTH A and B packed int4, symmetric, run through the hardware
+// int4xint4 tensor core directly (int32 accumulate) -- no fp16
+// dequantization anywhere in the K-loop, unlike the WxA16 kernels above.
+// Nibbles are plain two's-complement signed values (range [-8,7]), packed
+// 2/byte (low nibble = even k, high nibble = odd k) -- NOT excess-8 encoded,
+// since there's no LOP3 fp16-dequant trick to serve here. Aq (M,K/2) uint8;
+// Bq (N,K/2) uint8; scales_A (M,) f16 per-row (per-token) scale for A;
+// scales_B (N,) f16 per-channel scale for B. Returns (M,N) f16 =
+// (scales_A[:,None] * scales_B[None,:]) * (dequant_code(Aq) @ dequant_code(Bq).T) (+ bias).
+void w4a4_matmul_launcher(const uint8_t* Aq, const uint8_t* Bq, const __half* scales_A, const __half* scales_B,
+                          const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A8: int8 activations x packed-int4 weights, run through the hardware
+// int8 tensor core (B is unpacked register-resident straight out of the
+// packed cp.async staging buffer, since there's no int4xint8 MMA
+// instruction). Aq (M,K) int8, plain two's-complement bytes; Bq (N,K/2)
+// uint8 packed two's-complement int4 nibbles (NOT excess-8 encoded), 2/byte
+// (low nibble = even k, high nibble = odd k); scales_A (M,) f16 per-row
+// scale for A; scales_B (N,) f16 per-channel scale for B. Returns (M,N)
+// f16 = (scales_A[:,None] * scales_B[None,:]) * (Aq @ dequant_code(Bq).T) (+ bias).
+void w4a8_matmul_launcher(const int8_t* Aq, const uint8_t* Bq, const __half* scales_A, const __half* scales_B,
+                          const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// W4A4/W4A8 with GROUPWISE weight quantization: same operand layout as
+// w4a4_matmul/w4a8_matmul above, except scales_B is (N, K/128) instead of
+// (N,) -- one scale per (output channel, 128-wide K-group) instead of one
+// per channel, matching the WxA16 kernels' *_group_matmul convention. A's
+// quantization (per-row/per-token scales_A) is unchanged.
+void w4a4_group_matmul_launcher(const uint8_t* Aq, const uint8_t* Bq, const __half* scales_A, const __half* scales_B,
+                                 const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+void w4a8_group_matmul_launcher(const int8_t* Aq, const uint8_t* Bq, const __half* scales_A, const __half* scales_B,
+                                 const __half* bias, __half* C, int M, int N, int K, cudaStream_t stream);
+
+// Per-row (per-token) symmetric activation quantization, fp16 -> int4/int8,
+// plain two's-complement codes (matching W4A4/W4A8's A convention -- no
+// excess-K encoding, since neither consumer kernel dequantizes A through an
+// LOP3 trick). A (M,K) f16; Aq_int8 (M,K) int8 or Aq_int4 (M,K/2) uint8
+// packed 2/byte; scales (M,) f16, dequant(A[m,k]) = scales[m] * code.
+void quantize_sym_int8_launcher(const __half* A, int8_t* Aq, __half* scales, int M, int K, cudaStream_t stream);
+void quantize_sym_int4_launcher(const __half* A, uint8_t* Aq, __half* scales, int M, int K, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// CPU (AVX2/FMA) quantized matmuls -- asrq/matmulq/csrc/x86/qmatmul.{h,cpp}.
+// All tensors here are plain fp32 (no fp16 storage on the CPU side -- see
+// qmatmul.h's top comment for why), packed weight codes are TWO'S COMPLEMENT
+// for symmetric / PLAIN UNSIGNED for asymmetric (not the GPU kernels'
+// excess-K encoding, which exists only to serve their LOP3 trick). One
+// dispatcher each for the WxA16 (A stays fp32) and WxA8 (A quantized to
+// int8 first) cases; every wbits/symmetric/groupwise combination funnels
+// through whichever of these two matches its activation width.
+// void wxa16_cpu_matmul_launcher(int wbits, bool symmetric, bool groupwise,
+//                                 const float* A, const uint8_t* Bq, const float* scales, const float* zeros,
+//                                 const float* bias, float* C, int M, int N, int K);
+// void wxa8_cpu_matmul_launcher(int wbits, bool symmetric, bool groupwise,
+//                                const int8_t* Aq, const float* scales_A,
+//                                const uint8_t* Bq, const float* scales_B, const float* zeros_B,
+//                                const float* bias, float* C, int M, int N, int K);
+// void quantize_sym_int8_cpu_launcher(const float* A, int8_t* Aq, float* scales, int M, int K);
+
+
 
 // // matmul_int4_sm89: hand-written int4 x int4 -> int32 tensor-core GEMM.
 // // A, B are packed int4 (2/byte) reinterpreted as uint16 words; K is the
@@ -160,7 +299,8 @@ py::dict get_gpu_metrics(int64_t device = -1) {
 //     return C;
 // }
 
-torch::Tensor mymatmul(torch::Tensor A, torch::Tensor B, torch::Tensor workspace, torch::Tensor locks) {
+torch::Tensor mymatmul(const torch::Tensor& A, const torch::Tensor& B,
+                        const c10::optional<torch::Tensor>& bias = c10::nullopt) {
     CHECK_INPUT(A);
     CHECK_INPUT(B);
     TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
@@ -173,28 +313,543 @@ torch::Tensor mymatmul(torch::Tensor A, torch::Tensor B, torch::Tensor workspace
 
     int M = A.size(0), K = A.size(1), N = B.size(0);
     TORCH_CHECK((K % 8) == 0,
-                "matmul_16x16 requires K to be a multiple of 8 (cp.async 16-byte vectors); got K=", K);
+                "mymatmul requires K to be a multiple of 8 (cp.async 16-byte vectors); got K=", K);
     auto C = torch::empty({M, N}, A.options());
 
-    // matmul_16x16 is now an alias for the sm_89-tuned kernel; the legacy
-    // Hopper launcher (matmul_16x16_launcher) was removed.
     mymatmul_launcher(
         reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(B.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
         reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
-        reinterpret_cast<float*>(workspace.data_ptr<float>()),
-        reinterpret_cast<int*>(locks.data_ptr<int>()),
         M, N, K,
         at::cuda::getCurrentCUDAStream()
     );
     return C;
 }
 
-py::tuple mymatmul_workspace_sizes_py(int64_t M, int64_t N, int64_t K) {
-    int workspace_size = 0, locks_size = 0;
-    mymatmul_workspace_sizes(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
-                              &workspace_size, &locks_size);
-    return py::make_tuple(static_cast<int64_t>(workspace_size), static_cast<int64_t>(locks_size));
+torch::Tensor w4a16_matmul(const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+                            const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed excess-8 int4 nibbles, 2 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 1, "scales must be 1D (N,)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    // Bq's packed rows are cp.async'd 16 bytes at a time with a row stride
+    // of K/2 bytes; that stride must itself be a multiple of 16 bytes for
+    // every row's start to stay 16-byte aligned, i.e. K % 32 == 0 -- a
+    // stricter requirement than the fp16 kernel's K % 8.
+    TORCH_CHECK((K % 32) == 0,
+                "w4a16_matmul requires K to be a multiple of 32 (cp.async "
+                "16-byte-aligned rows over packed int4 weights); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N,
+                "scales must have shape (N,); got (", scales.size(0), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w4a16_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w2a16_matmul(const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+                            const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed excess-2 int2 codes, 4 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 1, "scales must be 1D (N,)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    // Bq's packed rows are cp.async'd 16 bytes at a time with a row stride
+    // of K/4 bytes; that stride must itself be a multiple of 16 bytes for
+    // every row's start to stay 16-byte aligned, i.e. K % 64 == 0 -- a
+    // stricter requirement than w4a16_matmul's K % 32 (int2 packs 4 codes
+    // per byte instead of int4's 2, so the row is 4x narrower for the same K).
+    TORCH_CHECK((K % 64) == 0,
+                "w2a16_matmul requires K to be a multiple of 64 (cp.async "
+                "16-byte-aligned rows over packed int2 weights); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 4,
+                "Bq must have shape (N, K/4); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N,
+                "scales must have shape (N,); got (", scales.size(0), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w2a16_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a16_group_matmul(const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+                                  const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed excess-8 int4 nibbles, 2 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 2, "scales must be 2D (N, K/128)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    TORCH_CHECK((K % 32) == 0,
+                "w4a16_group_matmul requires K to be a multiple of 32 (cp.async "
+                "16-byte-aligned rows over packed int4 weights); got K=", K);
+    // The kernel hoists one scale per (n, group) across an entire BLOCK_K=64
+    // tile, which only makes sense if every such tile falls inside exactly
+    // one group -- true as long as K % 128 == 0 (GROUP_SIZE=128 is a
+    // multiple of every BLOCK_K this kernel dispatches, 64).
+    TORCH_CHECK((K % 128) == 0,
+                "w4a16_group_matmul requires K to be a multiple of 128 (the "
+                "fixed group size); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N && scales.size(1) == K / 128,
+                "scales must have shape (N, K/128); got (", scales.size(0), ",", scales.size(1), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w4a16_group_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w2a16_group_matmul(const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+                                  const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed excess-2 int2 codes, 4 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 2, "scales must be 2D (N, K/128)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    TORCH_CHECK((K % 64) == 0,
+                "w2a16_group_matmul requires K to be a multiple of 64 (cp.async "
+                "16-byte-aligned rows over packed int2 weights); got K=", K);
+    TORCH_CHECK((K % 128) == 0,
+                "w2a16_group_matmul requires K to be a multiple of 128 (the "
+                "fixed group size); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 4,
+                "Bq must have shape (N, K/4); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N && scales.size(1) == K / 128,
+                "scales must have shape (N, K/128); got (", scales.size(0), ",", scales.size(1), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w2a16_group_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a16_asym_matmul(const torch::Tensor& A, const torch::Tensor& Bq,
+                                 const torch::Tensor& scales, const torch::Tensor& zeros,
+                                 const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    CHECK_INPUT(zeros);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed unsigned int4 codes, 2 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(zeros.dtype() == torch::kFloat16, "zeros must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 1 && zeros.dim() == 1, "scales and zeros must be 1D (N,)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    TORCH_CHECK((K % 32) == 0,
+                "w4a16_asym_matmul requires K to be a multiple of 32 (cp.async "
+                "16-byte-aligned rows over packed int4 weights); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N, "scales must have shape (N,); got (", scales.size(0), ")");
+    TORCH_CHECK(zeros.size(0) == N, "zeros must have shape (N,); got (", zeros.size(0), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w4a16_asym_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(zeros.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w2a16_asym_matmul(const torch::Tensor& A, const torch::Tensor& Bq,
+                                 const torch::Tensor& scales, const torch::Tensor& zeros,
+                                 const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    CHECK_INPUT(zeros);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed unsigned int2 codes, 4 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(zeros.dtype() == torch::kFloat16, "zeros must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 1 && zeros.dim() == 1, "scales and zeros must be 1D (N,)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    TORCH_CHECK((K % 64) == 0,
+                "w2a16_asym_matmul requires K to be a multiple of 64 (cp.async "
+                "16-byte-aligned rows over packed int2 weights); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 4,
+                "Bq must have shape (N, K/4); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N, "scales must have shape (N,); got (", scales.size(0), ")");
+    TORCH_CHECK(zeros.size(0) == N, "zeros must have shape (N,); got (", zeros.size(0), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w2a16_asym_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(zeros.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a16_group_asym_matmul(const torch::Tensor& A, const torch::Tensor& Bq,
+                                       const torch::Tensor& scales, const torch::Tensor& zeros,
+                                       const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    CHECK_INPUT(zeros);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed unsigned int4 codes, 2 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(zeros.dtype() == torch::kFloat16, "zeros must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 2 && zeros.dim() == 2, "scales and zeros must be 2D (N, K/128)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    TORCH_CHECK((K % 32) == 0,
+                "w4a16_group_asym_matmul requires K to be a multiple of 32 (cp.async "
+                "16-byte-aligned rows over packed int4 weights); got K=", K);
+    TORCH_CHECK((K % 128) == 0,
+                "w4a16_group_asym_matmul requires K to be a multiple of 128 (the "
+                "fixed group size); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N && scales.size(1) == K / 128,
+                "scales must have shape (N, K/128); got (", scales.size(0), ",", scales.size(1), ")");
+    TORCH_CHECK(zeros.size(0) == N && zeros.size(1) == K / 128,
+                "zeros must have shape (N, K/128); got (", zeros.size(0), ",", zeros.size(1), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w4a16_group_asym_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(zeros.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w2a16_group_asym_matmul(const torch::Tensor& A, const torch::Tensor& Bq,
+                                       const torch::Tensor& scales, const torch::Tensor& zeros,
+                                       const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(A);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales);
+    CHECK_INPUT(zeros);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed unsigned int2 codes, 4 per byte)");
+    TORCH_CHECK(scales.dtype() == torch::kFloat16, "scales must be float16");
+    TORCH_CHECK(zeros.dtype() == torch::kFloat16, "zeros must be float16");
+    TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+    TORCH_CHECK(scales.dim() == 2 && zeros.dim() == 2, "scales and zeros must be 2D (N, K/128)");
+
+    int M = A.size(0), K = A.size(1), N = Bq.size(0);
+    TORCH_CHECK((K % 64) == 0,
+                "w2a16_group_asym_matmul requires K to be a multiple of 64 (cp.async "
+                "16-byte-aligned rows over packed int2 weights); got K=", K);
+    TORCH_CHECK((K % 128) == 0,
+                "w2a16_group_asym_matmul requires K to be a multiple of 128 (the "
+                "fixed group size); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 4,
+                "Bq must have shape (N, K/4); got Bq=(", Bq.size(0), ",", Bq.size(1),
+                ") with K=", K);
+    TORCH_CHECK(scales.size(0) == N && scales.size(1) == K / 128,
+                "scales must have shape (N, K/128); got (", scales.size(0), ",", scales.size(1), ")");
+    TORCH_CHECK(zeros.size(0) == N && zeros.size(1) == K / 128,
+                "zeros must have shape (N, K/128); got (", zeros.size(0), ",", zeros.size(1), ")");
+
+    auto C = torch::empty({M, N}, A.options());
+    w2a16_group_asym_matmul_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(zeros.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a4_matmul(const torch::Tensor& Aq, const torch::Tensor& Bq,
+                           const torch::Tensor& scales_A, const torch::Tensor& scales_B,
+                           const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(Aq);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales_A);
+    CHECK_INPUT(scales_B);
+    TORCH_CHECK(Aq.dtype() == torch::kUInt8, "Aq must be uint8 (packed signed int4 codes, 2 per byte)");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed signed int4 codes, 2 per byte)");
+    TORCH_CHECK(scales_A.dtype() == torch::kFloat16, "scales_A must be float16");
+    TORCH_CHECK(scales_B.dtype() == torch::kFloat16, "scales_B must be float16");
+    TORCH_CHECK(Aq.dim() == 2 && Bq.dim() == 2, "Aq and Bq must be 2D");
+    TORCH_CHECK(scales_A.dim() == 1, "scales_A must be 1D (M,)");
+    TORCH_CHECK(scales_B.dim() == 1, "scales_B must be 1D (N,)");
+
+    int M = Aq.size(0), K = Aq.size(1) * 2, N = Bq.size(0);
+    // Both Aq and Bq's packed rows are cp.async'd 16 bytes at a time with a
+    // row stride of K/2 bytes; that stride must be a multiple of 16 bytes
+    // for every row's start to stay 16-byte aligned, i.e. K % 32 == 0 --
+    // same requirement as w4a16_matmul.
+    TORCH_CHECK((K % 32) == 0,
+                "w4a4_matmul requires K to be a multiple of 32 (cp.async "
+                "16-byte-aligned rows over packed int4 weights); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Aq K=", K, " Bq=(", Bq.size(0), ",", Bq.size(1), ")");
+    TORCH_CHECK(scales_A.size(0) == M, "scales_A must have shape (M,); got (", scales_A.size(0), ")");
+    TORCH_CHECK(scales_B.size(0) == N, "scales_B must have shape (N,); got (", scales_B.size(0), ")");
+
+    auto C = torch::empty({M, N}, scales_A.options());
+    w4a4_matmul_launcher(
+        Aq.data_ptr<uint8_t>(),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales_A.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(scales_B.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a8_matmul(const torch::Tensor& Aq, const torch::Tensor& Bq,
+                           const torch::Tensor& scales_A, const torch::Tensor& scales_B,
+                           const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(Aq);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales_A);
+    CHECK_INPUT(scales_B);
+    TORCH_CHECK(Aq.dtype() == torch::kInt8, "Aq must be int8 (plain two's-complement bytes, unpacked)");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed signed int4 codes, 2 per byte)");
+    TORCH_CHECK(scales_A.dtype() == torch::kFloat16, "scales_A must be float16");
+    TORCH_CHECK(scales_B.dtype() == torch::kFloat16, "scales_B must be float16");
+    TORCH_CHECK(Aq.dim() == 2 && Bq.dim() == 2, "Aq and Bq must be 2D");
+    TORCH_CHECK(scales_A.dim() == 1, "scales_A must be 1D (M,)");
+    TORCH_CHECK(scales_B.dim() == 1, "scales_B must be 1D (N,)");
+
+    int M = Aq.size(0), K = Aq.size(1), N = Bq.size(0);
+    // Aq (int8, 1B/elem) needs row stride K % 16 == 0 for 16-byte-aligned
+    // cp.async rows; Bq (packed int4, K/2 B/elem) needs K % 32 == 0, the
+    // stricter of the two -- same requirement as w4a16_matmul/w4a4_matmul.
+    TORCH_CHECK((K % 32) == 0,
+                "w4a8_matmul requires K to be a multiple of 32 (cp.async "
+                "16-byte-aligned rows over both int8 activations and packed "
+                "int4 weights); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Aq K=", K, " Bq=(", Bq.size(0), ",", Bq.size(1), ")");
+    TORCH_CHECK(scales_A.size(0) == M, "scales_A must have shape (M,); got (", scales_A.size(0), ")");
+    TORCH_CHECK(scales_B.size(0) == N, "scales_B must have shape (N,); got (", scales_B.size(0), ")");
+
+    auto C = torch::empty({M, N}, scales_A.options());
+    w4a8_matmul_launcher(
+        Aq.data_ptr<int8_t>(),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales_A.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(scales_B.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a4_group_matmul(const torch::Tensor& Aq, const torch::Tensor& Bq,
+                                 const torch::Tensor& scales_A, const torch::Tensor& scales_B,
+                                 const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(Aq);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales_A);
+    CHECK_INPUT(scales_B);
+    TORCH_CHECK(Aq.dtype() == torch::kUInt8, "Aq must be uint8 (packed signed int4 codes, 2 per byte)");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed signed int4 codes, 2 per byte)");
+    TORCH_CHECK(scales_A.dtype() == torch::kFloat16, "scales_A must be float16");
+    TORCH_CHECK(scales_B.dtype() == torch::kFloat16, "scales_B must be float16");
+    TORCH_CHECK(Aq.dim() == 2 && Bq.dim() == 2, "Aq and Bq must be 2D");
+    TORCH_CHECK(scales_A.dim() == 1, "scales_A must be 1D (M,)");
+    TORCH_CHECK(scales_B.dim() == 2, "scales_B must be 2D (N, K/128)");
+
+    int M = Aq.size(0), K = Aq.size(1) * 2, N = Bq.size(0);
+    // The groupwise kernel hoists one scale per (n, group) across an entire
+    // BLOCK_K=128 tile, which only makes sense if every such tile falls
+    // inside exactly one group -- true as long as K % 128 == 0 (the fixed
+    // group size). cp.async alignment (K % 32 == 0) is subsumed by this.
+    TORCH_CHECK((K % 128) == 0,
+                "w4a4_group_matmul requires K to be a multiple of 128 (the "
+                "fixed group size); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Aq K=", K, " Bq=(", Bq.size(0), ",", Bq.size(1), ")");
+    TORCH_CHECK(scales_A.size(0) == M, "scales_A must have shape (M,); got (", scales_A.size(0), ")");
+    TORCH_CHECK(scales_B.size(0) == N && scales_B.size(1) == K / 128,
+                "scales_B must have shape (N, K/128); got (", scales_B.size(0), ",", scales_B.size(1), ")");
+
+    auto C = torch::empty({M, N}, scales_A.options());
+    w4a4_group_matmul_launcher(
+        Aq.data_ptr<uint8_t>(),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales_A.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(scales_B.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+torch::Tensor w4a8_group_matmul(const torch::Tensor& Aq, const torch::Tensor& Bq,
+                                 const torch::Tensor& scales_A, const torch::Tensor& scales_B,
+                                 const c10::optional<torch::Tensor>& bias = c10::nullopt) {
+    CHECK_INPUT(Aq);
+    CHECK_INPUT(Bq);
+    CHECK_INPUT(scales_A);
+    CHECK_INPUT(scales_B);
+    TORCH_CHECK(Aq.dtype() == torch::kInt8, "Aq must be int8 (plain two's-complement bytes, unpacked)");
+    TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8 (packed signed int4 codes, 2 per byte)");
+    TORCH_CHECK(scales_A.dtype() == torch::kFloat16, "scales_A must be float16");
+    TORCH_CHECK(scales_B.dtype() == torch::kFloat16, "scales_B must be float16");
+    TORCH_CHECK(Aq.dim() == 2 && Bq.dim() == 2, "Aq and Bq must be 2D");
+    TORCH_CHECK(scales_A.dim() == 1, "scales_A must be 1D (M,)");
+    TORCH_CHECK(scales_B.dim() == 2, "scales_B must be 2D (N, K/128)");
+
+    int M = Aq.size(0), K = Aq.size(1), N = Bq.size(0);
+    // Same BLOCK_K==GROUP_SIZE==128 requirement as w4a4_group_matmul (see
+    // matmul_kernel_w4a8_group's top comment).
+    TORCH_CHECK((K % 128) == 0,
+                "w4a8_group_matmul requires K to be a multiple of 128 (the "
+                "fixed group size); got K=", K);
+    TORCH_CHECK(Bq.size(1) == K / 2,
+                "Bq must have shape (N, K/2); got Aq K=", K, " Bq=(", Bq.size(0), ",", Bq.size(1), ")");
+    TORCH_CHECK(scales_A.size(0) == M, "scales_A must have shape (M,); got (", scales_A.size(0), ")");
+    TORCH_CHECK(scales_B.size(0) == N && scales_B.size(1) == K / 128,
+                "scales_B must have shape (N, K/128); got (", scales_B.size(0), ",", scales_B.size(1), ")");
+
+    auto C = torch::empty({M, N}, scales_A.options());
+    w4a8_group_matmul_launcher(
+        Aq.data_ptr<int8_t>(),
+        Bq.data_ptr<uint8_t>(),
+        reinterpret_cast<const __half*>(scales_A.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(scales_B.data_ptr<at::Half>()),
+        get_bias_ptr(bias, N),
+        reinterpret_cast<__half*>(C.data_ptr<at::Half>()),
+        M, N, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return C;
+}
+
+std::vector<torch::Tensor> quantize_sym_int8(const torch::Tensor& A) {
+    CHECK_INPUT(A);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D");
+    const int M = A.size(0), K = A.size(1);
+    // The reduction/quantize pass vectorizes over 8 halfs (128 bits) at a
+    // time; K % 8 == 0 keeps every row's vector chunks aligned.
+    TORCH_CHECK((K % 8) == 0, "quantize_sym_int8 requires K to be a multiple of 8; got K=", K);
+
+    auto Aq = torch::empty({M, K}, A.options().dtype(torch::kInt8));
+    auto scales = torch::empty({M}, A.options());
+    quantize_sym_int8_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Aq.data_ptr<int8_t>(),
+        reinterpret_cast<__half*>(scales.data_ptr<at::Half>()),
+        M, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return {Aq, scales};
+}
+
+std::vector<torch::Tensor> quantize_sym_int4(const torch::Tensor& A) {
+    CHECK_INPUT(A);
+    TORCH_CHECK(A.dtype() == torch::kFloat16, "A must be float16");
+    TORCH_CHECK(A.dim() == 2, "A must be 2D");
+    const int M = A.size(0), K = A.size(1);
+    TORCH_CHECK((K % 8) == 0, "quantize_sym_int4 requires K to be a multiple of 8; got K=", K);
+
+    auto Aq = torch::empty({M, K / 2}, A.options().dtype(torch::kUInt8));
+    auto scales = torch::empty({M}, A.options());
+    quantize_sym_int4_launcher(
+        reinterpret_cast<const __half*>(A.data_ptr<at::Half>()),
+        Aq.data_ptr<uint8_t>(),
+        reinterpret_cast<__half*>(scales.data_ptr<at::Half>()),
+        M, K,
+        at::cuda::getCurrentCUDAStream()
+    );
+    return {Aq, scales};
 }
 
 // // FP16 matmul targeting compute capability 8.9 (Ada Lovelace).
@@ -802,6 +1457,123 @@ py::tuple mymatmul_workspace_sizes_py(int64_t M, int64_t N, int64_t K) {
 //     return Y;
 // }
 
+// // ---------------------------------------------------------------------------
+// // CPU (AVX2/FMA) quantized matmuls: shared validation + dispatch, reused by
+// // all 16 w{4,2}a{16,8}_cpu[_asym][_group[_asym]]_matmul Python entry points
+// // below (each is a thin pybind lambda that fixes wbits/symmetric/groupwise
+// // and calls straight into one of these two).
+// #define CHECK_CPU(x) TORCH_CHECK(x.device().is_cpu(), #x " must be a CPU tensor")
+// #define CHECK_INPUT_CPU(x) CHECK_CPU(x); CHECK_CONTIGUOUS(x)
+
+// static const float* get_bias_ptr_cpu(const c10::optional<torch::Tensor>& bias_opt, int64_t N) {
+//     if (!bias_opt.has_value()) return nullptr;
+//     const auto& bias = bias_opt.value();
+//     CHECK_INPUT_CPU(bias);
+//     TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+//     TORCH_CHECK(bias.dim() == 1 && bias.size(0) == N, "bias must have shape (N,); got ", bias.sizes());
+//     return bias.data_ptr<float>();
+// }
+
+// // Validates scales (and, for asymmetric, zeros) against (wbits, groupwise)
+// // and returns the raw zeros pointer (nullptr if symmetric).
+// static const float* validate_weight_scales_cpu(bool symmetric, bool groupwise, int64_t N, int64_t K,
+//                                                 const torch::Tensor& scales,
+//                                                 const c10::optional<torch::Tensor>& zeros_opt) {
+//     CHECK_INPUT_CPU(scales);
+//     TORCH_CHECK(scales.dtype() == torch::kFloat32, "scales must be float32");
+//     TORCH_CHECK(symmetric == !zeros_opt.has_value(),
+//                 symmetric ? "zeros must not be passed for symmetric quantization"
+//                           : "zeros is required for asymmetric quantization");
+//     if (groupwise) {
+//         TORCH_CHECK(K % 128 == 0, "K must be a multiple of 128 (the fixed group size); got K=", K);
+//         TORCH_CHECK(scales.dim() == 2 && scales.size(0) == N && scales.size(1) == K / 128,
+//                     "scales must have shape (N, K/128); got ", scales.sizes());
+//     } else {
+//         TORCH_CHECK(scales.dim() == 1 && scales.size(0) == N,
+//                     "scales must have shape (N,); got ", scales.sizes());
+//     }
+//     if (!zeros_opt.has_value()) return nullptr;
+//     const auto& zeros = zeros_opt.value();
+//     CHECK_INPUT_CPU(zeros);
+//     TORCH_CHECK(zeros.dtype() == torch::kFloat32, "zeros must be float32");
+//     TORCH_CHECK(zeros.sizes() == scales.sizes(), "zeros must have the same shape as scales");
+//     return zeros.data_ptr<float>();
+// }
+
+// static torch::Tensor cpu_wxa16_matmul_impl(int wbits, bool symmetric, bool groupwise,
+//                                             const torch::Tensor& A, const torch::Tensor& Bq,
+//                                             const torch::Tensor& scales,
+//                                             const c10::optional<torch::Tensor>& zeros,
+//                                             const c10::optional<torch::Tensor>& bias) {
+//     CHECK_INPUT_CPU(A);
+//     CHECK_INPUT_CPU(Bq);
+//     TORCH_CHECK(A.dtype() == torch::kFloat32, "A must be float32");
+//     TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8");
+//     TORCH_CHECK(A.dim() == 2 && Bq.dim() == 2, "A and Bq must be 2D");
+
+//     const int64_t M = A.size(0), K = A.size(1), N = Bq.size(0);
+//     const int64_t codes_per_byte = 8 / wbits;
+//     TORCH_CHECK(K % codes_per_byte == 0, "K must be a multiple of ", codes_per_byte,
+//                 " for ", wbits, "-bit packing; got K=", K);
+//     TORCH_CHECK(Bq.size(1) == K / codes_per_byte,
+//                 "Bq must have shape (N, K*", wbits, "/8); got Bq=(", Bq.size(0), ",", Bq.size(1), ")");
+//     const float* zeros_ptr = validate_weight_scales_cpu(symmetric, groupwise, N, K, scales, zeros);
+//     const float* bias_ptr = get_bias_ptr_cpu(bias, N);
+
+//     auto C = torch::empty({M, N}, A.options());
+//     wxa16_cpu_matmul_launcher(wbits, symmetric, groupwise,
+//         A.data_ptr<float>(), Bq.data_ptr<uint8_t>(), scales.data_ptr<float>(), zeros_ptr,
+//         bias_ptr, C.data_ptr<float>(),
+//         static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+//     return C;
+// }
+
+// static torch::Tensor cpu_wxa8_matmul_impl(int wbits, bool symmetric, bool groupwise,
+//                                            const torch::Tensor& Aq, const torch::Tensor& scales_A,
+//                                            const torch::Tensor& Bq, const torch::Tensor& scales_B,
+//                                            const c10::optional<torch::Tensor>& zeros,
+//                                            const c10::optional<torch::Tensor>& bias) {
+//     CHECK_INPUT_CPU(Aq);
+//     CHECK_INPUT_CPU(scales_A);
+//     CHECK_INPUT_CPU(Bq);
+//     TORCH_CHECK(Aq.dtype() == torch::kInt8, "Aq must be int8");
+//     TORCH_CHECK(scales_A.dtype() == torch::kFloat32, "scales_A must be float32");
+//     TORCH_CHECK(Bq.dtype() == torch::kUInt8, "Bq must be uint8");
+//     TORCH_CHECK(Aq.dim() == 2 && Bq.dim() == 2, "Aq and Bq must be 2D");
+//     TORCH_CHECK(scales_A.dim() == 1 && scales_A.size(0) == Aq.size(0),
+//                 "scales_A must have shape (M,); got ", scales_A.sizes());
+
+//     const int64_t M = Aq.size(0), K = Aq.size(1), N = Bq.size(0);
+//     const int64_t codes_per_byte = 8 / wbits;
+//     TORCH_CHECK(K % codes_per_byte == 0, "K must be a multiple of ", codes_per_byte,
+//                 " for ", wbits, "-bit packing; got K=", K);
+//     TORCH_CHECK(Bq.size(1) == K / codes_per_byte,
+//                 "Bq must have shape (N, K*", wbits, "/8); got Bq=(", Bq.size(0), ",", Bq.size(1), ")");
+//     const float* zeros_ptr = validate_weight_scales_cpu(symmetric, groupwise, N, K, scales_B, zeros);
+//     const float* bias_ptr = get_bias_ptr_cpu(bias, N);
+
+//     auto C = torch::empty({M, N}, scales_A.options());
+//     wxa8_cpu_matmul_launcher(wbits, symmetric, groupwise,
+//         Aq.data_ptr<int8_t>(), scales_A.data_ptr<float>(),
+//         Bq.data_ptr<uint8_t>(), scales_B.data_ptr<float>(), zeros_ptr,
+//         bias_ptr, C.data_ptr<float>(),
+//         static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
+//     return C;
+// }
+
+// std::vector<torch::Tensor> quantize_sym_int8_cpu(const torch::Tensor& A) {
+//     CHECK_INPUT_CPU(A);
+//     TORCH_CHECK(A.dtype() == torch::kFloat32, "A must be float32");
+//     TORCH_CHECK(A.dim() == 2, "A must be 2D");
+//     const int64_t M = A.size(0), K = A.size(1);
+
+//     auto Aq = torch::empty({M, K}, A.options().dtype(torch::kInt8));
+//     auto scales = torch::empty({M}, A.options());
+//     quantize_sym_int8_cpu_launcher(A.data_ptr<float>(), Aq.data_ptr<int8_t>(), scales.data_ptr<float>(),
+//                                     static_cast<int>(M), static_cast<int>(K));
+//     return {Aq, scales};
+// }
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("matmul_16x16", &matmul_16x16, "FP16 matmul (CUDA)");
     // m.def("matmul_sm89", &matmul_sm89,
@@ -873,24 +1645,227 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     //       "Requires N % 128 == 0, K % 128 == 0 (K % 256 == 0 for bits=4).",
     //       py::arg("A"), py::arg("Wp"), py::arg("sW"), py::arg("bits"));
     m.def("mymatmul", &mymatmul,
-          "Stream-K fp16 GEMM: A (M,K) f16, B (N,K) f16 -> C (M,N) f16 = A @ B.T. "
-          "workspace/locks are scratch buffers for the stream-K partial-tile "
-          "reduction; size them with mymatmul_workspace_sizes(M, N, K) -- an "
-          "undersized buffer causes an out-of-bounds write that can silently "
-          "corrupt the locks buffer and hang the kernel. Requires K % 8 == 0.",
-          py::arg("A"), py::arg("B"), py::arg("workspace"), py::arg("locks"));
-    m.def("mymatmul_workspace_sizes", &mymatmul_workspace_sizes_py,
-          "Required sizes for the workspace (float) / locks (int) buffers "
-          "mymatmul() needs for this (M, N, K). The launcher picks its grid "
-          "size from a runtime occupancy query, not just M/N/K, so callers "
-          "must get these sizes from here rather than recomputing them -- "
-          "an undersized buffer causes an out-of-bounds write that can "
-          "silently corrupt the locks buffer and hang the kernel. Returns "
-          "(workspace_size, locks_size) as element counts, not bytes.",
-          py::arg("M"), py::arg("N"), py::arg("K"));
+          "Data-parallel fp16 GEMM: A (M,K) f16, B (N,K) f16 -> C (M,N) f16 = "
+          "A @ B.T. No stream-K, no workspace/locks -- each output tile's full K "
+          "reduction is owned start-to-finish by a single threadblock via a "
+          "grid-stride loop. Tile shape (BLOCK_M, BLOCK_N) is chosen internally "
+          "per call based on (M, N, K) to keep all SMs busy and avoid wasted "
+          "padding compute for small M. Requires K % 8 == 0. Optional bias "
+          "(N,) f16 is added inside the kernel's own epilogue.",
+          py::arg("A"), py::arg("B"), py::arg("bias") = py::none());
+    m.def("w4a16_matmul", &w4a16_matmul,
+          "W4A16 GEMM: A (M,K) f16 activations, Bq (N,K/2) uint8 packed "
+          "excess-8 (offset-binary) int4 nibbles -- nibble = signed_value + "
+          "8, range 0..15, NOT two's complement -- (low nibble = even k, "
+          "high nibble = odd k), scales (N,) f16 per-output-channel "
+          "symmetric scale. Returns C (M,N) f16 = A @ dequant(Bq).T "
+          "(+ bias). Requires K % 32 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    m.def("w2a16_matmul", &w2a16_matmul,
+          "W2A16 GEMM: A (M,K) f16 activations, Bq (N,K/4) uint8 packed "
+          "excess-2 (offset-binary) int2 codes, 4 per byte -- code = "
+          "signed_value + 2, range 0..3, NOT two's complement -- (code j at "
+          "bits[2j:2j+2), covering element 4*byte_index+j), scales (N,) f16 "
+          "per-output-channel symmetric scale. Returns C (M,N) f16 = "
+          "A @ dequant(Bq).T (+ bias). Requires K % 64 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    m.def("w4a16_group_matmul", &w4a16_group_matmul,
+          "Groupwise W4A16 GEMM: same excess-8 packed-int4 Bq as "
+          "w4a16_matmul, but scales (N, K/128) f16 -- one scale per "
+          "(channel, 128-wide K group) instead of one per channel. Returns "
+          "C (M,N) f16 = A @ dequant_group(Bq).T (+ bias). Requires "
+          "K % 128 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    m.def("w2a16_group_matmul", &w2a16_group_matmul,
+          "Groupwise W2A16 GEMM: same excess-2 packed-int2 Bq as "
+          "w2a16_matmul, but scales (N, K/128) f16 -- one scale per "
+          "(channel, 128-wide K group). Returns C (M,N) f16 = "
+          "A @ dequant_group(Bq).T (+ bias). Requires K % 128 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    m.def("w4a16_asym_matmul", &w4a16_asym_matmul,
+          "Asymmetric (zero-point) W4A16 GEMM: A (M,K) f16 activations, Bq "
+          "(N,K/2) uint8 packed PLAIN UNSIGNED int4 codes (0..15, no "
+          "excess-8 encoding), scales/zeros (N,) f16 per-output-channel. "
+          "Returns C (M,N) f16 = A @ (scales*code + zeros).T (+ bias). "
+          "Requires K % 32 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+    m.def("w2a16_asym_matmul", &w2a16_asym_matmul,
+          "Asymmetric (zero-point) W2A16 GEMM: A (M,K) f16 activations, Bq "
+          "(N,K/4) uint8 packed PLAIN UNSIGNED int2 codes (0..3, no "
+          "excess-2 encoding), 4 per byte, scales/zeros (N,) f16 "
+          "per-output-channel. Returns C (M,N) f16 = A @ (scales*code + "
+          "zeros).T (+ bias). Requires K % 64 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+    m.def("w4a16_group_asym_matmul", &w4a16_group_asym_matmul,
+          "Groupwise asymmetric (zero-point) W4A16 GEMM: same PLAIN "
+          "UNSIGNED packed-int4 Bq as w4a16_asym_matmul, but scales, zeros "
+          "(N, K/128) f16 -- one scale/zero per (channel, 128-wide K "
+          "group) instead of one per channel. Returns C (M,N) f16 = "
+          "A @ (scales*code + zeros).T (grouped) (+ bias). Requires "
+          "K % 128 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+    m.def("w2a16_group_asym_matmul", &w2a16_group_asym_matmul,
+          "Groupwise asymmetric (zero-point) W2A16 GEMM: same PLAIN "
+          "UNSIGNED packed-int2 Bq as w2a16_asym_matmul, but scales, zeros "
+          "(N, K/128) f16 -- one scale/zero per (channel, 128-wide K "
+          "group). Returns C (M,N) f16 = A @ (scales*code + zeros).T "
+          "(grouped) (+ bias). Requires K % 128 == 0.",
+          py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+    m.def("w4a4_matmul", &w4a4_matmul,
+          "W4A4 GEMM: BOTH operands packed int4, symmetric, run through the "
+          "hardware int4xint4 tensor core directly (int32 accumulate, no "
+          "fp16 dequant in the K-loop). Aq (M,K/2) uint8, Bq (N,K/2) uint8, "
+          "both plain two's-complement signed nibbles (range [-8,7]), 2 per "
+          "byte (low nibble = even k, high nibble = odd k) -- NOT excess-8 "
+          "encoded. scales_A (M,) f16 per-row scale for A, scales_B (N,) "
+          "f16 per-channel scale for B. Returns C (M,N) f16 = "
+          "(scales_A[:,None]*scales_B[None,:]) * (dequant(Aq) @ dequant(Bq).T) "
+          "(+ bias). Requires K % 32 == 0.",
+          py::arg("Aq"), py::arg("Bq"), py::arg("scales_A"), py::arg("scales_B"), py::arg("bias") = py::none());
+    m.def("w4a8_matmul", &w4a8_matmul,
+          "W4A8 GEMM: int8 activations x packed-int4 weights, run through "
+          "the hardware int8 tensor core (B is unpacked register-resident "
+          "straight out of the packed cp.async staging buffer, since "
+          "there's no int4xint8 MMA instruction). Aq (M,K) int8, plain "
+          "two's-complement bytes; Bq (N,K/2) uint8 packed two's-complement "
+          "int4 nibbles (NOT excess-8 encoded), 2 per byte (low nibble = "
+          "even k, high nibble = odd k). scales_A (M,) f16 per-row scale "
+          "for A, scales_B (N,) f16 per-channel scale for B. Returns C "
+          "(M,N) f16 = (scales_A[:,None]*scales_B[None,:]) * "
+          "(Aq @ dequant(Bq).T) (+ bias). Requires K % 32 == 0.",
+          py::arg("Aq"), py::arg("Bq"), py::arg("scales_A"), py::arg("scales_B"), py::arg("bias") = py::none());
+    m.def("w4a4_group_matmul", &w4a4_group_matmul,
+          "Groupwise W4A4 GEMM: same packed-int4 operand layout as "
+          "w4a4_matmul, but scales_B (N, K/128) f16 -- one scale per "
+          "(output channel, 128-wide K group) instead of one per channel; "
+          "scales_A (M,) f16 per-row (per-token) is unchanged. Returns C "
+          "(M,N) f16 (+ bias). Requires K % 128 == 0.",
+          py::arg("Aq"), py::arg("Bq"), py::arg("scales_A"), py::arg("scales_B"), py::arg("bias") = py::none());
+    m.def("w4a8_group_matmul", &w4a8_group_matmul,
+          "Groupwise W4A8 GEMM: same operand layout as w4a8_matmul (Aq "
+          "(M,K) int8, Bq (N,K/2) packed int4), but scales_B (N, K/128) f16 "
+          "-- one scale per (output channel, 128-wide K group) instead of "
+          "one per channel; scales_A (M,) f16 per-row (per-token) is "
+          "unchanged. Returns C (M,N) f16 (+ bias). Requires K % 128 == 0.",
+          py::arg("Aq"), py::arg("Bq"), py::arg("scales_A"), py::arg("scales_B"), py::arg("bias") = py::none());
+    m.def("quantize_sym_int8", &quantize_sym_int8,
+          "Per-row (per-token) symmetric fp16 -> int8 activation "
+          "quantization: one block per row, a single vectorized pass over "
+          "the row cached in shared memory (max-abs reduction via warp "
+          "shuffles), then a second pass quantizing from the cache -- one "
+          "global read + one global write per row. A (M,K) f16. Returns "
+          "(Aq, scales): Aq (M,K) int8 plain two's-complement bytes; "
+          "scales (M,) f16. Requires K % 8 == 0.",
+          py::arg("A"));
+    m.def("quantize_sym_int4", &quantize_sym_int4,
+          "Per-row (per-token) symmetric fp16 -> int4 activation "
+          "quantization, same single-read/single-write design as "
+          "quantize_sym_int8. A (M,K) f16. Returns (Aq, scales): Aq "
+          "(M,K/2) uint8 packed two's-complement nibbles (2/byte, low "
+          "nibble = even k, high nibble = odd k), NOT excess-8 encoded; "
+          "scales (M,) f16. Requires K % 8 == 0.",
+          py::arg("A"));
     m.def("get_gpu_metrics", &get_gpu_metrics,
           "Query CUDA device properties and return a dict of GPU metrics "
           "(SM count, tensor cores, smem, L2, registers, etc.). "
           "Pass device=-1 (default) to use the current device.",
           py::arg("device") = -1);
+
+    // ---- CPU (AVX2/FMA) quantized matmuls (asrq/matmulq/csrc/x86/) ----
+    // All fp32 tensors (see qmatmul.h's top comment for why); packed codes
+    // are two's complement (symmetric) or plain unsigned (asymmetric) --
+    // NOT the CUDA kernels' excess-K encoding. groupwise variants use a
+    // fixed group size of 128 along K, one scale/zero per (channel, group)
+    // instead of one per channel.
+    // const char* wxa16_doc =
+    //     "CPU (AVX2/FMA) WxA16 GEMM: A (M,K) f32 activations (NOT "
+    //     "quantized), Bq packed weight codes, scales [zeros] per-channel or "
+    //     "(groupwise) per-(channel,128-wide-K-group) f32. Returns C (M,N) "
+    //     "f32 = A @ dequant(Bq).T (+ bias). Requires K a multiple of "
+    //     "8/wbits (128 too, for groupwise variants).";
+    // const char* wxa8_doc =
+    //     "CPU (AVX2/FMA) WxA8 GEMM: Aq (M,K) int8 activations (see "
+    //     "quantize_sym_int8_cpu) + scales_A (M,) f32, Bq packed weight "
+    //     "codes, scales_B [zeros_B] per-channel or (groupwise) f32. Returns "
+    //     "C (M,N) f32 = (scales_A[:,None]*...) * (Aq @ dequant(Bq).T) "
+    //     "(+ bias). Requires K a multiple of 8/wbits (128 too, for "
+    //     "groupwise variants).";
+
+    // m.def("w4a16_cpu_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                               const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(4, true, false, A, Bq, scales, c10::nullopt, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    // m.def("w4a16_cpu_asym_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                                    const torch::Tensor& zeros, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(4, false, false, A, Bq, scales, zeros, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+    // m.def("w4a16_cpu_group_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                                     const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(4, true, true, A, Bq, scales, c10::nullopt, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    // m.def("w4a16_cpu_group_asym_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                                          const torch::Tensor& zeros, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(4, false, true, A, Bq, scales, zeros, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+
+    // m.def("w2a16_cpu_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                               const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(2, true, false, A, Bq, scales, c10::nullopt, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    // m.def("w2a16_cpu_asym_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                                    const torch::Tensor& zeros, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(2, false, false, A, Bq, scales, zeros, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+    // m.def("w2a16_cpu_group_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                                     const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(2, true, true, A, Bq, scales, c10::nullopt, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("bias") = py::none());
+    // m.def("w2a16_cpu_group_asym_matmul", [](const torch::Tensor& A, const torch::Tensor& Bq, const torch::Tensor& scales,
+    //                                          const torch::Tensor& zeros, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa16_matmul_impl(2, false, true, A, Bq, scales, zeros, bias);
+    // }, wxa16_doc, py::arg("A"), py::arg("Bq"), py::arg("scales"), py::arg("zeros"), py::arg("bias") = py::none());
+
+    // m.def("w4a8_cpu_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                              const torch::Tensor& scales_B, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(4, true, false, Aq, scales_A, Bq, scales_B, c10::nullopt, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("bias") = py::none());
+    // m.def("w4a8_cpu_asym_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                                   const torch::Tensor& scales_B, const torch::Tensor& zeros_B,
+    //                                   const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(4, false, false, Aq, scales_A, Bq, scales_B, zeros_B, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("zeros_B"), py::arg("bias") = py::none());
+    // m.def("w4a8_cpu_group_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                                    const torch::Tensor& scales_B, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(4, true, true, Aq, scales_A, Bq, scales_B, c10::nullopt, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("bias") = py::none());
+    // m.def("w4a8_cpu_group_asym_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                                         const torch::Tensor& scales_B, const torch::Tensor& zeros_B,
+    //                                         const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(4, false, true, Aq, scales_A, Bq, scales_B, zeros_B, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("zeros_B"), py::arg("bias") = py::none());
+
+    // m.def("w2a8_cpu_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                              const torch::Tensor& scales_B, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(2, true, false, Aq, scales_A, Bq, scales_B, c10::nullopt, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("bias") = py::none());
+    // m.def("w2a8_cpu_asym_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                                   const torch::Tensor& scales_B, const torch::Tensor& zeros_B,
+    //                                   const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(2, false, false, Aq, scales_A, Bq, scales_B, zeros_B, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("zeros_B"), py::arg("bias") = py::none());
+    // m.def("w2a8_cpu_group_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                                    const torch::Tensor& scales_B, const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(2, true, true, Aq, scales_A, Bq, scales_B, c10::nullopt, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("bias") = py::none());
+    // m.def("w2a8_cpu_group_asym_matmul", [](const torch::Tensor& Aq, const torch::Tensor& scales_A, const torch::Tensor& Bq,
+    //                                         const torch::Tensor& scales_B, const torch::Tensor& zeros_B,
+    //                                         const c10::optional<torch::Tensor>& bias) {
+    //     return cpu_wxa8_matmul_impl(2, false, true, Aq, scales_A, Bq, scales_B, zeros_B, bias);
+    // }, wxa8_doc, py::arg("Aq"), py::arg("scales_A"), py::arg("Bq"), py::arg("scales_B"), py::arg("zeros_B"), py::arg("bias") = py::none());
+
+    // m.def("quantize_sym_int8_cpu", &quantize_sym_int8_cpu,
+    //       "Per-row (per-token) symmetric fp32 -> int8 activation "
+    //       "quantization on CPU (AVX2), for the W*A8_cpu kernels above. "
+    //       "A (M,K) f32. Returns (Aq, scales): Aq (M,K) int8; scales (M,) f32.",
+    //       py::arg("A"));
 }

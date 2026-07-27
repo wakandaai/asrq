@@ -23,6 +23,13 @@ __device__ inline
 uint32_t cvta_shared(const void *ptr) { return static_cast<uint32_t>(__cvta_generic_to_shared(ptr)); }
 
 __device__ inline
+void ldmatrix_x1(uint32_t reg[1], uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
+              : "=r"(reg[0])
+              : "r"(addr));
+}
+
+__device__ inline
 void ldmatrix_x2(uint32_t reg[2], uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
               : "=r"(reg[0]), "=r"(reg[1])
@@ -47,6 +54,17 @@ void mma_m16n8k16(const uint32_t A[4], const uint32_t B[2], float D[4]) {
               : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
                 "r"(B[0]), "r"(B[1]));
 }
+
+// Tried an f16-accumulate variant of this MMA (mma.sync...f16.f16.f16.f16,
+// C/D packed as 2 f16x2 registers instead of 4 scalar f32) to see if
+// narrower accumulator registers would speed up the fp16/W4A16/W2A16
+// kernels. Measured on this GPU: no throughput gain from the MMA
+// instruction itself (same or slightly *slower* at large compute-bound
+// shapes, e.g. 8194 vs 8983 GFLOP/s at M=8192,N=K=4096 -- accumulate width
+// doesn't change tensor-core issue rate on this architecture), while
+// per-K-step rounding to fp16 measurably hurt accuracy at larger K (several
+// existing correctness-sweep shapes failed that passed with f32 accumulate).
+// Reverted; not worth the precision loss for zero speed benefit.
 
 // Signed int8 tensor-core MMA (sm_80+): 16x8x32 with int32 accumulate.
 // A is 16x32 row-major s8, B is 32x8 col-major s8, C/D are 16x8 s32.
@@ -105,6 +123,25 @@ void cp_async_pred(uint32_t dst, const void *src, bool pred) {
                ::"r"(dst), "l"(src), "r"(src_size));
 }
 
+// Same as cp_async_pred, but tags the L2 line with an evict_first eviction
+// priority instead of the default (evict_normal): the line becomes the
+// first candidate L2 picks when it needs to make room, so it doesn't
+// meaningfully persist there. Use this for data that's read exactly once
+// and never reused across blocks/SMs, to avoid it displacing data that IS
+// being reused (e.g. B in the marlin-style kernel, which streams through
+// once per (block_n,k) while A gets re-read by every block_m iteration on
+// every SM). Note: L2::no_allocate is not accepted as a primary eviction
+// priority by ptxas on this toolchain/arch, so evict_first is the closest
+// available approximation of "don't cache this."
+__device__ inline
+void cp_async_pred_evict_first(uint32_t dst, const void *src, bool pred) {
+  uint64_t policy;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(policy));
+  int src_size = pred ? 16 : 0;
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;"
+               ::"r"(dst), "l"(src), "r"(src_size), "l"(policy));
+}
+
 __device__ inline
 void cp_async_commit_group() { asm volatile("cp.async.commit_group;"); };
 
@@ -144,4 +181,120 @@ void launch_kernel(T *kernel, int num_blocks, int block_size, int shm_size, Args
 
   kernel<<<num_blocks, block_size, shm_size>>>(args...);
   CUDA_CHECK(cudaGetLastError());
+}
+
+// ---------------------------------------------------------------------------
+// Shared across every matmul_kernel_* (asrq_16x16.cu, asrq_4x16.cu,
+// asrq_2x16.cu, asrq_4x4.cu): tile scheduling, cp.async tile loaders, and the
+// host-side SM count query. Each kernel's own file has the design comments
+// specific to how it uses these; this header just holds the one copy shared
+// by all of them.
+
+constexpr int MMA_M = 16;
+constexpr int MMA_N = 8;
+
+// L2-aware serpentine/boustrophedon tile scheduler: groups GROUP_M
+// consecutive block_m values together and sweeps all block_n within a group
+// before advancing (alternating sweep direction each group), so that tiles
+// processed close together in time/across concurrently-running blocks share
+// A/B rows and stay resident in L2 instead of thrashing it.
+__device__ __forceinline__
+void tile_scheduler_l2(int tile_idx, int num_block_m, int num_block_n, int GROUP_M, int& block_m, int& block_n) {
+    const int num_pid_in_group = GROUP_M * num_block_n;
+    const int group_id = tile_idx / num_pid_in_group;
+    const int first_pid_m = group_id * GROUP_M;
+    int group_size_m = num_block_m - first_pid_m;
+    if (group_size_m > GROUP_M) group_size_m = GROUP_M;
+    const int tile_in_group = tile_idx % num_pid_in_group;
+    block_m = first_pid_m + (tile_in_group % group_size_m);
+    const int n_in_group = tile_in_group / group_size_m;
+    block_n = (group_id % 2 == 0) ? n_in_group : (num_block_n - 1 - n_in_group);
+}
+
+// Async-copies a HEIGHT x WIDTH tile of __half elements from global to
+// shared memory, cp.async-style, using swizzle_better<> addressing so a
+// later ldmatrix fetch from the same tile is bank-conflict-free.
+template<int TB_SIZE, int HEIGHT, int WIDTH, bool EVICT_FIRST = false>
+__device__ static
+void global_to_shared_async(const __half* in, int in_stride, uint32_t out, int tid, int valid_height=HEIGHT, int valid_width=WIDTH){
+    constexpr int num_elems = 16 / sizeof(__half);
+    constexpr int total_vecs = (HEIGHT * WIDTH) / num_elems;
+    constexpr int num_iters = cdiv(total_vecs, TB_SIZE);
+
+    for(int iter=0; iter<num_iters; iter++){
+        const int vec_idx = iter * TB_SIZE + tid;
+        if (vec_idx >= total_vecs) continue;
+        const int idx = vec_idx * num_elems;
+        const int row = idx / WIDTH;
+        const int col = idx % WIDTH;
+        uint32_t dst_addr = out + swizzle_better<WIDTH * sizeof(__half)>(row, col / num_elems);
+        const bool valid = row < valid_height && (col + num_elems) <= valid_width;
+        const __half *src_ptr = valid ? (in + row * in_stride + col) : in;
+        if constexpr (EVICT_FIRST) {
+            cp_async_pred_evict_first(dst_addr, src_ptr, valid);
+        } else {
+            cp_async_pred(dst_addr, src_ptr, valid);
+        }
+    }
+}
+
+// Async-copies a HEIGHT x WIDTH_BYTES tile of raw bytes from global to
+// shared memory, row-major, WITHOUT swizzling. Used by the WxA16 kernels'
+// packed-weight B tile, which is read back out with plain per-thread
+// addressed loads (see each kernel's compute() for the mma.sync B-fragment
+// mapping), never through ldmatrix -- so there's no ldmatrix-specific
+// bank-conflict pattern to arrange for here.
+template<int TB_SIZE, int HEIGHT, int WIDTH_BYTES>
+__device__ static
+void global_to_shared_async_bytes(const uint8_t* in, int in_stride_bytes, uint32_t out, int tid, int valid_height=HEIGHT, int valid_width_bytes=WIDTH_BYTES){
+    constexpr int vec_bytes = 16;
+    constexpr int total_vecs = (HEIGHT * WIDTH_BYTES) / vec_bytes;
+    constexpr int num_iters = cdiv(total_vecs, TB_SIZE);
+
+    for(int iter=0; iter<num_iters; iter++){
+        const int vec_idx = iter * TB_SIZE + tid;
+        if (vec_idx >= total_vecs) continue;
+        const int idx = vec_idx * vec_bytes;
+        const int row = idx / WIDTH_BYTES;
+        const int col = idx % WIDTH_BYTES;
+        uint32_t dst_addr = out + row * WIDTH_BYTES + col;
+        const bool valid = row < valid_height && (col + vec_bytes) <= valid_width_bytes;
+        const uint8_t *src_ptr = valid ? (in + row * in_stride_bytes + col) : in;
+        cp_async_pred(dst_addr, src_ptr, valid);
+    }
+}
+
+// Same swizzled-tile geometry as global_to_shared_async above (16-byte
+// cp.async vectors, swizzle_better<WIDTH_BYTES> addressing), but for raw
+// packed bytes instead of __half elements. Used by matmul_kernel_w4a4 to
+// stage BOTH A and B tiles through ldmatrix -- unlike
+// global_to_shared_async_bytes above (unswizzled, since those never go
+// through ldmatrix), this one must match the swizzle pattern ldmatrix's
+// addressing expects, exactly like the __half loader does for fp16 tiles.
+template<int TB_SIZE, int HEIGHT, int WIDTH_BYTES>
+__device__ static
+void global_to_shared_async_bytes_swizzled(const uint8_t* in, int in_stride_bytes, uint32_t out, int tid, int valid_height=HEIGHT, int valid_width_bytes=WIDTH_BYTES){
+    constexpr int vec_bytes = 16;
+    constexpr int total_vecs = (HEIGHT * WIDTH_BYTES) / vec_bytes;
+    constexpr int num_iters = cdiv(total_vecs, TB_SIZE);
+
+    for(int iter=0; iter<num_iters; iter++){
+        const int vec_idx = iter * TB_SIZE + tid;
+        if (vec_idx >= total_vecs) continue;
+        const int idx = vec_idx * vec_bytes;
+        const int row = idx / WIDTH_BYTES;
+        const int col = idx % WIDTH_BYTES;
+        uint32_t dst_addr = out + swizzle_better<WIDTH_BYTES>(row, col / vec_bytes);
+        const bool valid = row < valid_height && (col + vec_bytes) <= valid_width_bytes;
+        const uint8_t *src_ptr = valid ? (in + row * in_stride_bytes + col) : in;
+        cp_async_pred(dst_addr, src_ptr, valid);
+    }
+}
+
+inline int num_sms() {
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    return prop.multiProcessorCount;
 }
