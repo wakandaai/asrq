@@ -9,7 +9,7 @@ from asrq.core.types import InpArgs, InpKwargs, Processor
 
 from asrq.core.registry import ModelNames, register_model
 from asrq.core.model import ModelQ
-from asrq.core.linear import LinearQ
+from asrq.core.linear import ASRQLinear
 import transformers
 from transformers.models.whisper.modeling_whisper import (
     WhisperForConditionalGeneration, 
@@ -36,10 +36,10 @@ import math
 
 
 class WhisperAttentionQ(WhisperAttention):
-    """Quantized multi-headed attention replacing linear projections with :class:`LinearQ`.
+    """Quantized multi-headed attention replacing linear projections with :class:`ASRQLinear`.
 
     Mirrors :class:`WhisperAttention` but uses quantization-aware
-    ``LinearQ`` layers for the Q/K/V and output projections.
+    ``ASRQLinear`` layers for the Q/K/V and output projections.
     """
 
     def __init__(
@@ -91,14 +91,14 @@ class WhisperAttentionQ(WhisperAttention):
             )
         self.layer_idx = layer_idx
 
-        self.k_proj = LinearQ(embed_dim, embed_dim, bits=bits, bias=False)
-        self.v_proj = LinearQ(embed_dim, embed_dim, bits=bits, bias=bias)
-        self.q_proj = LinearQ(embed_dim, embed_dim, bits=bits, bias=bias)
-        self.out_proj = LinearQ(embed_dim, embed_dim, bits=bits, bias=bias)
+        self.k_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=False)
+        self.v_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=bias)
+        self.q_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=bias)
+        self.out_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=bias)
 
 
 class WhisperEncoderLayerQ(WhisperEncoderLayer):
-    """Quantized Whisper encoder layer with :class:`LinearQ` feed-forward layers."""
+    """Quantized Whisper encoder layer with :class:`ASRQLinear` feed-forward layers."""
 
     def __init__(self, config: WhisperConfig, bits: int = 4) -> None:
         """Initialise the quantized encoder layer.
@@ -121,8 +121,8 @@ class WhisperEncoderLayerQ(WhisperEncoderLayer):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        self.fc1 = LinearQ(self.embed_dim, config.encoder_ffn_dim, bits=bits)
-        self.fc2 = LinearQ(config.encoder_ffn_dim, self.embed_dim, bits=bits)
+        self.fc1 = ASRQLinear(self.embed_dim, config.encoder_ffn_dim, wbits=bits, abits=16)
+        self.fc2 = ASRQLinear(config.encoder_ffn_dim, self.embed_dim, wbits=bits, abits=16)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
 
@@ -161,7 +161,7 @@ class WhisperEncoderQ(WhisperEncoder):
 
 
 class WhisperDecoderLayerQ(WhisperDecoderLayer):
-    """Quantized Whisper decoder layer with :class:`LinearQ` projections."""
+    """Quantized Whisper decoder layer with :class:`ASRQLinear` projections."""
 
     def __init__(self, config: WhisperConfig, layer_idx: int | None = None, bits: int = 4) -> None:
         """Initialise the quantized decoder layer.
@@ -199,8 +199,8 @@ class WhisperDecoderLayerQ(WhisperDecoderLayer):
             bits=bits,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.fc1 = LinearQ(self.embed_dim, config.decoder_ffn_dim, bits=bits)
-        self.fc2 = LinearQ(config.decoder_ffn_dim, self.embed_dim, bits=bits)
+        self.fc1 = ASRQLinear(self.embed_dim, config.decoder_ffn_dim, wbits=bits, abits=16)
+        self.fc2 = ASRQLinear(config.decoder_ffn_dim, self.embed_dim, wbits=bits, abits=16)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
 
@@ -552,6 +552,16 @@ class WhisperQ(ModelQ):
         for name in quant_methods.keys():
             qresult = quant_methods[name]()
             self.qparams[name] = qresult
+            # quant_methods[name]() (e.g. RTNQuantizer) only fake-quantizes:
+            # it writes a rounded-then-dequantized fp16 weight back into
+            # submodules[name].weight.data for calibration/qparams
+            # reporting. ASRQLinear needs an explicit .quantize_() call on
+            # top of that to actually pack the (now RTN-quantized) weight
+            # into the buffers its CUDA kernels expect and flip
+            # self.quantized -- without it, forward() would raise.
+            module = submodules[name]
+            if isinstance(module, ASRQLinear):
+                module.quantize_()
             tqdm.write(f"Quantized layer {name}")
 
         # get input into the next block
@@ -710,6 +720,16 @@ class WhisperQ(ModelQ):
         for name in quant_methods.keys():
             qresult = quant_methods[name]()
             self.qparams[name] = qresult
+            # quant_methods[name]() (e.g. RTNQuantizer) only fake-quantizes:
+            # it writes a rounded-then-dequantized fp16 weight back into
+            # submodules[name].weight.data for calibration/qparams
+            # reporting. ASRQLinear needs an explicit .quantize_() call on
+            # top of that to actually pack the (now RTN-quantized) weight
+            # into the buffers its CUDA kernels expect and flip
+            # self.quantized -- without it, forward() would raise.
+            module = submodules[name]
+            if isinstance(module, ASRQLinear):
+                module.quantize_()
             tqdm.write(f"Quantized layer {name}")
 
         # get input into the next block
@@ -748,3 +768,44 @@ class WhisperQ(ModelQ):
             ]
 
         return linears
+
+    # (wbits, abits) applied to every attention-projection / feed-forward
+    # linear named by get_asrq_linear_targets() below. Weight-only by
+    # default (abits=16, matching WhisperAttentionQ/WhisperEncoderLayerQ/
+    # WhisperDecoderLayerQ's own ASRQLinear construction) -- override on a
+    # subclass or reassign on an instance before calling to_asrq_linear()
+    # to quantize activations too (e.g. (4, 8) for W4A8).
+    asrq_attn_bits: Tuple[int, int] = (4, 16)
+    asrq_ffn_bits: Tuple[int, int] = (4, 16)
+
+    def get_asrq_linear_targets(self) -> Dict[str, Tuple[int, int]]:
+        """Map every attention-projection / feed-forward nn.Linear in the
+        encoder and decoder to (wbits, abits), for ModelQ.to_asrq_linear().
+        Same name-building pattern as for_activation_quantization() above,
+        but covers every linear in a block (including fc2 and the decoder's
+        cross-attention projections, which for_activation_quantization()
+        omits) since to_asrq_linear() is a full weight-replacement pass,
+        not a "which layers also get activation quantization" selection.
+        """
+        targets: Dict[str, Tuple[int, int]] = {}
+        num_encoder_blocks: int = self.model.config.encoder_layers # type: ignore
+        num_decoder_blocks: int = self.model.config.decoder_layers # type: ignore
+
+        for i in range(num_encoder_blocks):
+            stem = f"model.encoder.layers.{i}"
+            for suffix in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"):
+                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
+            for suffix in ("fc1", "fc2"):
+                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
+
+        for i in range(num_decoder_blocks):
+            stem = f"model.decoder.layers.{i}"
+            for suffix in (
+                "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj",
+                "encoder_attn.q_proj", "encoder_attn.k_proj", "encoder_attn.v_proj", "encoder_attn.out_proj",
+            ):
+                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
+            for suffix in ("fc1", "fc2"):
+                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
+
+        return targets
