@@ -23,6 +23,11 @@ from transformers import GenerationConfig
 # metric - WER
 wer_metric = evaluate.load("wer")
 
+# The leaderboard's short-form English benchmark. This replaced
+# hf-audio/esb-datasets-test-only-sorted, which held the same data under the same config
+# names; see the run scripts under third_party/open_asr_leaderboard.
+DATASET_PATH = "hf-audio/open-asr-leaderboard"
+
 
 
 def write_manifest(
@@ -241,8 +246,8 @@ def transcribe(model: SALM, dloader: torch.utils.data.DataLoader) -> list[str]:
 
 # batch_size = 192
 # device = 0
-# dataset_path = "hf-audio/esb-datasets-test-only-sorted"
-# dataset = "ami"
+# dataset_path = "hf-audio/open-asr-leaderboard"
+# dataset = "ami_cleaned"
 # split = "test"
 # cache_dir = ""
 
@@ -366,12 +371,12 @@ def generate_granite(model, processor, all_data, batch_size):
     return output_text
 
 def evaluate_model(
-    model, batch_size=192, dataset_path="hf-audio/esb-datasets-test-only-sorted", dataset="ami",
+    model, batch_size=192, dataset_path=DATASET_PATH, dataset="ami_cleaned",
      split="test", cache_dir="", eval_id="", save_results_manifest=False, save_results_metrics=True, processor=None, generate_fn=None,
      batches_to_eval=None, create_audio_files=False
 ):
     eval_start_time = time.time()
-    cache_dir = "../"#cache_dir or os.getcwd()
+    cache_dir = "/ephemeral"#cache_dir or os.getcwd()
     DATA_CACHE_DIR = os.path.join(cache_dir, "audio_cache")
     DATASET_NAME = dataset
     SPLIT_NAME = split
@@ -390,7 +395,9 @@ def evaluate_model(
         # token=True
     )
     if batches_to_eval is not None:
-        ds = ds.take(batches_to_eval * batch_size) # type: ignore
+        # Dataset.take is select(range(n)) and raises if n exceeds the split size, so
+        # clamp it - some configs are small (voxpopuli_cleaned_aa has 628 examples).
+        ds = ds.take(min(batches_to_eval * batch_size, len(ds))) # type: ignore
     ds = ds.cast_column("audio", Audio(sampling_rate=16_000))
     ds = ds.map(normalize)
     ds = ds.filter(is_target_text_in_range, input_columns=["norm_text"])

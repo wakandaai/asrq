@@ -44,6 +44,7 @@ def main(cfg: DictConfig) -> None:
         cfg.transform.model_name = cfg.model.name
         cfg.transform.wbits = cfg.quantizer.bits
         cfg.transform.abits = cfg.activation_bits
+        cfg.transform.wgroup = cfg.quantizer.get("group_size", None)
 
     if cfg.transform.name == "rotation":
         with open_dict(cfg.transform):

@@ -32,6 +32,16 @@ Transforms improve weight and activation distributions before quantization:
 
 ## Installation
 
+The English text normalizer used for WER is pulled from the
+[Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) as a pinned
+submodule, so fetch it after cloning:
+
+```bash
+git submodule update --init third_party/open_asr_leaderboard
+```
+
+To pick up upstream normalizer changes, check out a newer commit in that submodule and
+commit the new pin. This changes what counts as a match, so re-run baselines after bumping.
 
 For NeMo models (Parakeet, Canary):
 
@@ -41,6 +51,15 @@ pip install "nemo-toolkit[asr]"
 
 ```bash
 pip install "transformers==4.57.6" "datasets==3.6.0" evaluate lhotse soundfile scikit-learn
+```
+
+The rotation transforms can apply their Hadamard rotation online with
+[HadaCore](https://pytorch.org/blog/hadacore/), a tensor-core FWHT kernel. It is optional
+— without it the rotation falls back to the pure-torch butterfly — and needs a CUDA
+toolkit plus `--no-build-isolation` so the build sees your installed torch:
+
+```bash
+pip install --no-build-isolation ".[hadacore]"
 ```
 
 
@@ -148,7 +167,9 @@ asrq/asrq-exp.py model=parakeet quantizer.bits=2 quantizer.group_size=64 transfo
 
 ## Evaluation
 
-Evaluation runs on the [ESB benchmark](https://huggingface.co/datasets/hf-audio/esb-datasets-test-only-sorted) datasets and reports:
+Evaluation runs on the [Open ASR Leaderboard](https://huggingface.co/datasets/hf-audio/open-asr-leaderboard)
+short-form English datasets — `ami_cleaned`, `gigaspeech_cleaned`, `voxpopuli_cleaned_aa`,
+`earnings22`, `librispeech` (test.clean / test.other) and `spgispeech` — and reports:
 
 - **WER** — Word Error Rate (%)
 - **RTFx** — Real-Time Factor (audio duration / inference time)

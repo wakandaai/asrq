@@ -5,7 +5,7 @@ from typing import Optional, Union, List, Tuple
 import torch.nn as nn
 import torch.nn.functional as F
 import types
-from asrq.transforms.rotation.hadamard_utils import random_hadamard_matrix
+from asrq.transforms.rotation.hadamard_utils import matmul_hadU, matmul_hadU_auto, random_hadamard_matrix
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 
@@ -72,12 +72,18 @@ class RMSNormFusedM(nn.Module):
 
 
 class STEQuantize(torch.autograd.Function):
+    """Symmetric fake-quantization with a straight-through gradient.
+
+    Matches the quantizer the model is deployed with
+    (``asrq.quantizers.activation.activation_quantization_forward_patch``): abs-max scale,
+    no zero point, so the rotation is trained against the scheme it will be evaluated on.
+    """
     @staticmethod
     def forward(ctx, x, bit, row_wise=True):
         dim = 1 if row_wise else 0
-        zero_point = x.min(dim=dim, keepdim=True).values
-        scale = (x.max(dim=dim, keepdim=True).values - zero_point) / (2 ** bit - 1)
-        q = torch.round((x - zero_point) / scale) * scale + zero_point
+        scale = x.abs().max(dim=dim, keepdim=True).values / (2 ** (bit - 1) - 1)
+        scale = scale.where(scale != 0, 1e-3)  # avoid division by 0
+        q = torch.round(x / scale) * scale
         return q
         
     @staticmethod
@@ -85,6 +91,25 @@ class STEQuantize(torch.autograd.Function):
         # Straight-through estimator: just pass the gradient through
         return grad_output, None, None
     
+
+def ste_quantize_weight(w: torch.Tensor, bit: int, group_size: Optional[int] = None) -> torch.Tensor:
+    """Symmetric fake-quantization of a weight, per output channel or per group.
+
+    ``group_size=None`` quantizes each output channel as a unit (STEQuantize's own dim-1
+    reduction on an ``(out, in)`` weight). A group size instead quantizes each contiguous
+    run of that many input channels separately, matching the deployed quantizers'
+    groupwise scales - and matching a block-diagonal rotation of the same width, whose
+    whole point is to keep the mixing inside one group.
+
+    Done in float32: at high bit widths ``(x - zero_point) / scale`` overflows fp16.
+    """
+    if bit >= 16:
+        return w
+    org_shape = w.shape
+    flat = w.float() if group_size is None else w.float().reshape(-1, group_size)
+    q = STEQuantize.apply(flat, bit, True)  # type: ignore
+    return q.reshape(org_shape).to(w.dtype)
+
 
 def random_orthogonal_matrix(
     n: int,
@@ -326,57 +351,276 @@ def fuse_normalization_weights_and_bias_into_adjacent_linears(
 
 
 def modify_linear_with_rotation_param(
-        linear: nn.Linear,
-        Q: nn.Parameter,
+        linear: Union[nn.Linear, nn.Conv1d, RMSNormFusedM],
+        Q: Optional[nn.Parameter],
         Q2: Optional[nn.Parameter] = None,
         for_rotated_input: bool = True,
+        for_norm_out: bool = False,
         quantize_row_wise: bool = True,
         bit: int = 4,
+        activation_bits: int = 16,
+        quantize_weights: bool = False,
+        weight_group_size: Optional[int] = None,
+        online_hadamard: bool = False,
+        hadamard_block_size: Optional[int] = None,
+        rotation_dtype: Optional[torch.dtype] = None,
 ) -> None:
-    """Modify the given linear layer to include the rotation parameter Q in its forward pass."""
+    """Rotate this layer's weight on the fly, inside its forward pass.
+
+    This is the training-time form of the rotation: nothing is written to the weight, so
+    the same layer can be re-evaluated under a different Q just by changing Q's contents.
+    :func:`fuse_rotation_param_into_linear` is the inference-time counterpart, which bakes
+    the rotation in once.
+
+    Three weights layouts are handled, differing only in which axis is contracted:
+    ``nn.Linear`` (F.linear transposes, so `in` is the last dim), pointwise ``nn.Conv1d``
+    ((out, in, k) activations (B, C, T)), and ``RMSNormFusedM`` (``rms_norm(x) @ w``, no
+    transpose, so `in` is dim 0).
+
+    Args:
+        Q: residual-stream rotation, or None to skip it (canary's LoRA B matrices).
+        Q2: head-wise rotation applied within ``Q2.shape[0]``-sized blocks.
+        for_rotated_input: the input already arrives rotated, so the weight is
+            right-multiplied by Q. False means the output feeds the rotated residual, so
+            the weight is left-multiplied by Q^T instead.
+        for_norm_out: this is a norm whose weight becomes ``Q^T diag(w) Q``.
+        activation_bits: width of the STE activation quantizer, applied every forward so
+            the rotation is learned against quantized activations. >= 16 disables it.
+        quantize_weights / bit / weight_group_size: STE weight quantizer, for the
+            weight-only setting where activations stay in fp16.
+        online_hadamard: additionally rotate x by a Hadamard H at run time and apply the
+            same H to the weight's contracted axis. Because the layer transposes or
+            contracts that axis, the pair cancels - ``(x H)(W H)^T == x W^T`` - so the
+            output is unchanged while both operands quantize in the Hadamard basis.
+        hadamard_block_size: rotate independent blocks of this width rather than the whole
+            contracted axis, e.g. the head dim to match a head-wise Q2.
+        rotation_dtype: precision for the rotation matmuls. None uses Q's dtype; whisper
+            passes float64.
+    """
+    is_conv = isinstance(linear, nn.Conv1d)
+    is_norm_fused = isinstance(linear, RMSNormFusedM)
+
+    def rot_dtype(default: torch.Tensor) -> torch.dtype:
+        return rotation_dtype if rotation_dtype is not None else default.dtype
+
+    def hadamard_rotate_last(t: torch.Tensor) -> torch.Tensor:
+        """Right-multiply the last dim of ``t`` by H (blockwise if requested)."""
+        if hadamard_block_size is None:
+            return matmul_hadU_auto(t)
+        org_shape = t.shape
+        t = t.reshape(*org_shape[:-1], org_shape[-1] // hadamard_block_size, hadamard_block_size)
+        return matmul_hadU_auto(t).reshape(org_shape)
+
+    def hadamard_rotate_input(x: torch.Tensor) -> torch.Tensor:
+        if is_conv:
+            # Conv1d activations are (B, C, T): the contraction is over C, not the last dim.
+            return hadamard_rotate_last(x.transpose(1, 2).contiguous()).transpose(1, 2)
+        return hadamard_rotate_last(x)
+
+    def hadamard_rotate_weight(w: torch.Tensor) -> torch.Tensor:
+        if w.dim() < 2:
+            raise ValueError(
+                "online_hadamard needs a 2-D weight to rotate; got a 1-D weight, which is "
+                "an elementwise scale. Fuse the norm weight first, or pass online_hadamard=False."
+            )
+        if is_conv:
+            return hadamard_rotate_last(w.transpose(1, 2).contiguous()).transpose(1, 2)
+        if is_norm_fused:
+            return hadamard_rotate_last(w.t().contiguous()).t()
+        return hadamard_rotate_last(w)
+
+    def rotate_head_blocks(t: torch.Tensor, hdim: int) -> torch.Tensor:
+        """Apply Q2 within each ``hdim``-wide block of the last dim."""
+        org_shape = t.shape
+        blocks = t.reshape(-1, org_shape[-1] // hdim, hdim)
+        return (blocks.to(rot_dtype(Q2)) @ Q2).reshape(org_shape)  # type: ignore[arg-type]
 
     def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
-        # quantize the input activations with STE quantization
-        # x = STEQuantize.apply(x, 8, True)
-        # Apply the rotation to the weight
-        rotated_bias = self.bias
-        dtype = self.weight.dtype
-        double_type = torch.float64
-        if for_rotated_input:
-            rotated_weight = (self.weight.to(double_type) @ Q.to(double_type)).to(dtype)
-            if Q2 is not None:
-                hdim = Q2.shape[0]
-                w_ = rotated_weight.t()
-                org_shape = w_.shape
-                temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
-                temp = (temp.to(double_type) @ Q2.to(double_type)).to(dtype)
-                rotated_weight = temp.reshape(org_shape).t()
-                if self.bias is not None:
-                    org_shape = self.bias.shape
-                    temp = self.bias.reshape(-1, org_shape[-1]//hdim, hdim)
-                    temp = (temp.to(double_type) @ Q2.to(double_type)).to(dtype)
-                    rotated_bias = temp.reshape(org_shape).to(self.bias.dtype)
+        # ---- input side: rotate, then quantize, so x is quantized in the rotated basis
+        if online_hadamard:
+            if is_conv and self.groups != 1:
+                raise ValueError(
+                    f"online_hadamard mixes channels, which is invalid for a grouped conv "
+                    f"(groups={self.groups}). Pass online_hadamard=False for this layer."
+                )
+            x = hadamard_rotate_input(x)
+        if activation_bits < 16:
+            # Flattened to 2-D first: STEQuantize reduces over dim 1, which is per-token
+            # only for (tokens, channels) - on a raw (B, T, C) it would reduce over time.
+            x = STEQuantize.apply(  # type: ignore[misc]
+                x.reshape(-1, x.shape[-1]).float(), activation_bits, quantize_row_wise
+            ).reshape(x.shape).to(x.dtype)
 
-        else:
-            rotated_weight = (Q.T.to(double_type) @ self.weight.data.to(double_type)).to(dtype)
-            if self.bias is not None:
-                rotated_bias = (self.bias.data.to(double_type) @ Q.to(double_type)).to(x.dtype)
+        # ---- weight side: apply Q (and Q2) for this layer's role
+        rotated_weight = self.weight
+        rotated_bias = self.bias
+        orig_shape = self.weight.shape
+
+        if for_norm_out:
+            # W_rotated = Q^T diag(w) Q -- a full DxD matrix when the norm weight is 1-D.
+            w = self.weight.double()
+            if w.dim() == 1:
+                w = torch.diag(w)
+            rotated_weight = (Q.t().double() @ w) @ Q.double()  # type: ignore[union-attr]
+            if rotated_bias is not None:
+                rotated_bias = rotated_bias.unsqueeze(0).double() @ Q.double()  # type: ignore[union-attr]
+        elif for_rotated_input:
+            if Q is not None:
+                rotated_weight = self.weight.to(rot_dtype(Q)).flatten(1) @ Q.to(rot_dtype(Q))
             if Q2 is not None:
-                hdim = Q2.shape[0]
-                org_shape = rotated_weight.shape
-                temp = rotated_weight.reshape(-1, org_shape[-1]//hdim, hdim)
-                temp = (temp.to(double_type) @ Q2.to(double_type)).to(dtype)
-                rotated_weight = temp.reshape(org_shape)
-        
-        
-        # Perform RTN quantization of weights           
-        # w = STEQuantize.apply(rotated_weight, bit, quantize_row_wise)
-        w = rotated_weight
-        # w = rotated_weight.to(dtype)
-        # continue with the normal linear forward using the rotated weight
+                # Q2 rotates within heads of the OUTPUT dim here, hence the transpose.
+                rotated_weight = rotate_head_blocks(rotated_weight.t(), Q2.shape[0]).t()
+                if self.bias is not None:
+                    rotated_bias = rotate_head_blocks(self.bias, Q2.shape[0]).to(self.bias.dtype)
+        else:
+            if Q is not None:
+                rotated_weight = Q.to(rot_dtype(Q)).T @ self.weight.to(rot_dtype(Q)).flatten(1)
+                if self.bias is not None:
+                    rotated_bias = (self.bias.data.to(rot_dtype(Q)) @ Q.to(rot_dtype(Q))).to(x.dtype)
+            if Q2 is not None:
+                # No transpose: Q2 rotates within heads of the INPUT dim (the last one).
+                rotated_weight = rotate_head_blocks(rotated_weight, Q2.shape[0])
+
+        if for_norm_out and rotated_weight.shape != orig_shape:
+            w = rotated_weight
+            if rotated_bias is not None:
+                rotated_bias = rotated_bias.squeeze(0).to(x.dtype)
+        else:
+            w = rotated_weight.reshape(orig_shape)
+            if rotated_bias is not None:
+                rotated_bias = rotated_bias.reshape(self.bias.shape).to(x.dtype)
+
+        if quantize_weights:
+            # Weight-only setting: with 16-bit activations this is the only thing in the
+            # forward for the rotation to be scored against.
+            w = ste_quantize_weight(w, bit, weight_group_size)
+        if online_hadamard:
+            w = hadamard_rotate_weight(w.to(x.dtype))
+
+        # ---- the layer's own forward, with the rotated weight
+        if is_norm_fused:
+            out = F.rms_norm(x, normalized_shape=self.normalized_shape, eps=self.eps) @ w.to(x.dtype)
+            return out + (rotated_bias if self.bias is not None else 0.0)
+        if is_conv:
+            return F.conv1d(x, w.to(x.dtype), rotated_bias,
+                            self.stride, self.padding, self.dilation, self.groups)
         return F.linear(x, w.to(x.dtype), rotated_bias)
 
     linear.forward = types.MethodType(modified_forward, linear)
+
+
+def apply_to_rotated_layers(model, layers_to_rotate, resolve, apply) -> None:
+    """Walk a model's rotation plan and hand each layer to ``apply``.
+
+    Every model's modify/fuse pass is the same loop - look the layer up, work out which
+    rotations it needs, call the per-layer function - differing only in that middle step.
+    That policy lives in the model's own ``resolve``; this driver owns the walk.
+
+    Args:
+        layers_to_rotate: ``(layer_name, for_rotated_input)`` pairs from the model's
+            ``get_*_layers_to_rotate``.
+        resolve: ``(layer_name) -> (Q, Q2, extra_kwargs)``. ``Q`` may be None (canary's
+            LoRA B matrices rotate on the Q2 side only); ``extra_kwargs`` carries per-layer
+            decisions such as ``for_norm_out`` and ``online_hadamard``.
+        apply: ``modify_linear_with_rotation_param`` or
+            ``fuse_rotation_param_into_linear``, plus any keyword arguments already bound.
+    """
+    named_modules = dict(model.named_modules())
+    for layer_name, for_rotated_input in layers_to_rotate:
+        layer = named_modules.get(layer_name)
+        if layer is None:
+            raise ValueError(f"Layer '{layer_name}' not found in model.")
+        Q, Q2, extra = resolve(layer_name)
+        apply(layer, Q, Q2=Q2, for_rotated_input=for_rotated_input, **extra)
+
+
+def matches_layer_suffix(layer_name: str, suffixes: Tuple[str, ...]) -> bool:
+    """Whether ``layer_name`` ends in one of ``suffixes`` on a module boundary.
+
+    Used to pick out the down-projections, which are the only layers that get an online
+    Hadamard: their input is the MLP intermediate rather than the Q-rotated residual
+    stream, so nothing else has spread the outliers in that activation.
+    """
+    return any(layer_name == s or layer_name.endswith("." + s) for s in suffixes)
+
+
+def fuse_hadamard_into_linear(
+        linear: nn.Linear | RMSNormFusedM | nn.Conv1d,
+        hadamard_block_size: Optional[int] = None,
+):
+    """Bake the Hadamard rotation H into ``linear``'s weight and rotate its input at run time.
+
+    Where :func:`modify_linear_with_rotation_param` recomputes ``W H`` on every forward,
+    this folds H into the weight once, and registers a forward pre-hook that applies H to
+    the activations. Inference then costs one fast Hadamard transform on the input plus
+    the ordinary linear/conv - no per-forward weight math at all.
+
+    Call this *after* Q has been fused, since the two rotations compose on the same axis.
+    The weight side is fused in float64 with the exact pure-torch butterfly (it happens
+    once), while the run-time input transform goes through HadaCore.
+
+    Returns the pre-hook handle, so the rotation can be removed with ``handle.remove()``
+    (the weight stays fused - undoing that needs a second call with the same H).
+    """
+    if getattr(linear, "_hadamard_fused", False):
+        raise RuntimeError(
+            "The Hadamard rotation is already fused into this layer; fusing twice would "
+            "rotate the weight a second time while the input is only rotated once."
+        )
+
+    is_conv = isinstance(linear, nn.Conv1d)
+    is_norm_fused = isinstance(linear, RMSNormFusedM)
+
+    def blockwise(t, transform):
+        """Apply ``transform`` to the last dim of ``t``, in blocks if requested."""
+        if hadamard_block_size is None:
+            return transform(t)
+        org_shape = t.shape
+        t = t.reshape(*org_shape[:-1], org_shape[-1] // hadamard_block_size, hadamard_block_size)
+        return transform(t).reshape(org_shape)
+
+    w = linear.weight.data
+    if w.dim() < 2:
+        raise ValueError(
+            "fuse_hadamard_into_linear needs a 2-D weight; got a 1-D weight, which is an "
+            "elementwise scale. Fuse the norm weight into the adjacent linears first."
+        )
+    dtype, device = w.dtype, w.device
+
+    if is_conv:
+        # The Q fusion above flattens (out, in, k) to (out, in*k), which only lines up
+        # with an `in`-sized rotation for pointwise convs; keep the same restriction.
+        if linear.kernel_size[0] != 1:
+            raise ValueError(f"Only pointwise Conv1d is supported, got kernel_size={linear.kernel_size}")
+        if linear.groups != 1:
+            raise ValueError(
+                f"A Hadamard mixes channels, which is invalid for a grouped conv (groups={linear.groups})."
+            )
+        fused = blockwise(w.double().flatten(1), matmul_hadU).reshape(w.shape)
+    elif is_norm_fused:
+        # RMSNormFusedM does `rms_norm(x) @ w` with no transpose, so `in` is dim 0 and
+        # the weight needs H^T on the left: (w^T H)^T.
+        fused = blockwise(w.double().t().contiguous(), matmul_hadU).t()
+    else:
+        # F.linear transposes the weight, so `in` is already the last dim.
+        fused = blockwise(w.double(), matmul_hadU)
+    linear.weight.data = fused.to(dtype=dtype, device=device).contiguous()
+
+    def hadamard_pre_hook(module, args):
+        x = args[0]
+        if is_conv:
+            # Conv1d activations are (B, C, T); the contraction is over C.
+            x = blockwise(x.transpose(1, 2).contiguous(), matmul_hadU_auto).transpose(1, 2)
+        else:
+            x = blockwise(x, matmul_hadU_auto)
+        return (x,) + tuple(args[1:])
+
+    # Recorded so a later swap can recover the transform - ASRQLinear.from_linear reads
+    # these to rebuild the rotation as its own input transform, since the pre-hook below
+    # does not survive being replaced by a different module.
+    linear._hadamard_fused = True
+    linear._hadamard_block_size = hadamard_block_size
+    return linear.register_forward_pre_hook(hadamard_pre_hook)
 
 
 def fuse_rotation_param_into_linear(
@@ -384,8 +628,15 @@ def fuse_rotation_param_into_linear(
         Q: torch.Tensor,
         Q2: Optional[torch.Tensor] = None,
         for_rotated_input: bool = True,
+        online_hadamard: bool = False,
+        hadamard_block_size: Optional[int] = None,
 ) -> None:
-    """Fuse the rotation parameter Q into the given linear layer's weights (and bias if for_rotated_input=False)."""
+    """Fuse the rotation parameter Q into the given linear layer's weights (and bias if for_rotated_input=False).
+
+    With ``online_hadamard=True`` a Hadamard rotation is fused in on top of Q once Q is
+    folded in, leaving only a fast Hadamard transform on the input at inference time - see
+    :func:`fuse_hadamard_into_linear`.
+    """
     dtype = linear.weight.data.dtype
     device = linear.weight.data.device
     if isinstance(linear, RMSNormFusedM):
@@ -427,3 +678,8 @@ def fuse_rotation_param_into_linear(
             temp = (temp.double() @ Q2.double())
             linear.weight.data = temp.reshape(org_shape).to(dtype=dtype, device=device)
 
+    if online_hadamard:
+        fuse_hadamard_into_linear(linear, hadamard_block_size=hadamard_block_size)
+
+
+# class

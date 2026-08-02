@@ -31,7 +31,8 @@ class RTNQuantizer(LinearQuantizer):
 
     def __call__(self)-> Tuple[Any, Any]:
         """Quantize the module using RTN."""
-        W = self.module.weight.data.clone() # type: ignore
+        # weight_2d/set_weight_2d keep this identical for nn.Linear and pointwise Conv1d.
+        W = self.weight_2d().clone()
         scales, zeros = self.find_quant_params(W)
         group_size = self.quant_config.group_size
         if group_size == -1:
@@ -41,6 +42,5 @@ class RTNQuantizer(LinearQuantizer):
             q = torch.round(W / scales).clamp(self.minq, self.maxq) * scales
         else:
             q = torch.round((W - zeros) / scales).clamp(self.minq, self.maxq) * scales + zeros
-        q = q.reshape(self.module.weight.data.shape) # type: ignore
-        self.module.weight.data.copy_(q) # type: ignore
+        self.set_weight_2d(q)
         return scales, zeros

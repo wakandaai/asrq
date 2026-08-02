@@ -61,7 +61,8 @@ class GPTQQuantizer(HessianAddBatchMixin, LinearQuantizer):
         Quantizes weights using a block-wise Hessian-aware approach with
         optimal rounding based on second-order information.
         """
-        W = self.module.weight.data.clone() # type: ignore
+        # weight_2d/set_weight_2d keep this identical for nn.Linear and pointwise Conv1d.
+        W = self.weight_2d().clone()
         columns = W.shape[1]
         # initial scales and zeros
         scales, zeros = self.find_quant_params(W)
@@ -116,7 +117,7 @@ class GPTQQuantizer(HessianAddBatchMixin, LinearQuantizer):
 
         cuda_synchronize()
         Q = Q[:, inv_perm]
-        self.module.weight.data =  Q.reshape(self.module.weight.shape).to(self.module.weight.data.dtype) # type: ignore
+        self.set_weight_2d(Q)
 
         cuda_empty_cache()
         return (scales, zeros)

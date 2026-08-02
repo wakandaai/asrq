@@ -42,6 +42,11 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
         cfg.quantizer.exclude_modules = cfg.model.exclude_modules
     with open_dict(cfg.transform):
         cfg.transform.model_name = cfg.model.name
+        # The rotation is learned against the STE quantizers, so it needs the same
+        # quantization settings the model will be deployed with (as exp.py does).
+        cfg.transform.wbits = cfg.quantizer.bits
+        cfg.transform.abits = cfg.activation_bits
+        cfg.transform.wgroup = cfg.quantizer.get("group_size", None)
         cfg.transform.learn_rotation = True
     print(OmegaConf.to_yaml(cfg))
 

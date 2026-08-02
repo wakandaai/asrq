@@ -33,6 +33,32 @@ def get_parakeet_ctc_layers_to_scale(model):
                 f"encoder.layers.{i}.norm_feed_forward2"
             )
         )
-        
+        # The two feed-forward down-projections are fed by their activation, which has no
+        # weight to absorb the reciprocal scale, so prev is None and each linear2 divides
+        # its own input (see ScaledInputLinear).
+        for ff in ("feed_forward1", "feed_forward2"):
+            layers_to_scale.append(
+                (
+                    [f"encoder.layers.{i}.{ff}.linear2"],
+                    None
+                )
+            )
+
+        # Conv module. pointwise_conv1 is fed by the norm before the block; pointwise_conv2
+        # is fed by an activation (conv1 -> GLU -> depthwise -> norm -> activation ->
+        # conv2), so it is a down-projection in all but name and scales its own input.
+        layers_to_scale.append(
+            (
+                [f"encoder.layers.{i}.conv.pointwise_conv1"],
+                f"encoder.layers.{i}.norm_conv"
+            )
+        )
+        layers_to_scale.append(
+            (
+                [f"encoder.layers.{i}.conv.pointwise_conv2"],
+                None
+            )
+        )
+
 
     return layers_to_scale

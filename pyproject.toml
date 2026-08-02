@@ -12,6 +12,14 @@ dependencies = [
     "omegaconf>=2.3",
 ]
 
+[project.optional-dependencies]
+# HadaCore: tensor-core fast Hadamard transform used by the online rotations.
+# Needs a CUDA toolkit and must be installed with --no-build-isolation so the build
+# can see the already-installed torch.
+hadacore = [
+    "faster_hadamard_transform @ git+https://github.com/pytorch-labs/applied-ai.git#subdirectory=kernels/cuda/inference/hadamard_transform",
+]
+
 [project.scripts]
 asrq-exp = "asrq.exp:main"
 

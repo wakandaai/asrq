@@ -1,6 +1,6 @@
 defaults:
   - quantizer: gptq
-  - model: parakeet
+  - model: whisper
   - transform: rotation
   - _self_
 

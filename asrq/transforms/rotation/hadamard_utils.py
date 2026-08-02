@@ -1,7 +1,7 @@
 # pyright: reportMissingImports=false
 
+import functools
 import torch, math
-# import fast_hadamard_transform
 # Adapted from https://github.com/Cornell-RelaxML/quip-sharp/blob/main/lib/utils/matmul_had.py
 
 def get_hadK(n, transpose=False):
@@ -96,21 +96,141 @@ def random_hadamard_matrix(size, device, seed=None):
     Q = torch.diag(Q)
     return matmul_hadU(Q).to(device)
 
-# def matmul_hadU_cuda(X, hadK, K):
-#     n = X.shape[-1]
-#     if K == 1:
-#         return fast_hadamard_transform.hadamard_transform(X.contiguous(), 1.0/torch.tensor(n).sqrt()) 
-#     # if transpose:
-#     #     hadK = hadK.T.contiguous()
-#     input = X.view(*X.shape[:-1], K, n // K)
-#     input = fast_hadamard_transform.hadamard_transform(input.contiguous(), 1.0/torch.tensor(n).sqrt())
-#     input = hadK.to(input.device).to(input.dtype) @ input
-#     return input.reshape(X.shape)
+# ---------------------------------------------------------------------------
+# HadaCore-backed fast Hadamard transform
+# ---------------------------------------------------------------------------
+# HadaCore (https://arxiv.org/abs/2412.08832, https://pytorch.org/blog/hadacore/)
+# is Meta's tensor-core FWHT kernel, 1.1-1.4x faster than Dao AI Lab's
+# fast_hadamard_transform on A100/H100 with a peak of ~3.5x. Install with:
+#
+#   pip install --no-build-isolation \
+#     "git+https://github.com/pytorch-labs/applied-ai.git#subdirectory=kernels/cuda/inference/hadamard_transform"
+#
+# The extension exposes hadamard_transform(x, inplace=False), which applies an
+# *orthonormal* transform along the last dimension - the 1/sqrt(had_size) scale is
+# already folded in, unlike Dao's kernel which takes an explicit scale argument.
+# Constraints: CUDA only, fp16/bf16 only, last dim a power of two <= 2**15.
+
+try:
+    import faster_hadamard_transform as _hadacore
+except ImportError:  # pragma: no cover - optional dependency
+    _hadacore = None
+
+HADACORE_MAX_SIZE = 1 << 15
+_HADACORE_DTYPES = (torch.float16, torch.bfloat16)
 
 
+def hadacore_available(n=None) -> bool:
+    """Whether the HadaCore kernel can handle a transform of size ``n``."""
+    if _hadacore is None or not torch.cuda.is_available():
+        return False
+    if n is None:
+        return True
+    return is_pow2(n) and n <= HADACORE_MAX_SIZE
 
-# def matmul_hadUt_cuda(X, hadK, K):
-#     return matmul_hadU_cuda(X, hadK, K, transpose=True)
+
+def hadamard_transform_hadacore(X):
+    """Orthonormal FWHT along the last dim of ``X`` (must be a power of two).
+
+    Equivalent to ``X @ H`` where ``H`` is the normalized Sylvester Hadamard matrix
+    of size ``X.shape[-1]``.
+    """
+    if _hadacore is None:
+        raise ImportError(
+            "HadaCore is not installed. Install it with:\n"
+            '  pip install --no-build-isolation "git+https://github.com/pytorch-labs/'
+            'applied-ai.git#subdirectory=kernels/cuda/inference/hadamard_transform"'
+        )
+    n = X.shape[-1]
+    if not is_pow2(n) or n > HADACORE_MAX_SIZE:
+        raise ValueError(f"HadaCore needs a power-of-two size <= {HADACORE_MAX_SIZE}, got {n}")
+    dtype = X.dtype
+    if dtype in _HADACORE_DTYPES:
+        return _hadacore.hadamard_transform(X.contiguous(), False)
+    # The kernel is fp16/bf16 only; round-trip anything else through fp16.
+    return _hadacore.hadamard_transform(X.to(torch.float16).contiguous(), False).to(dtype)
+
+
+@functools.lru_cache(maxsize=64)
+def _hadK_K(n, transpose=False):
+    """Just the K factor from :func:`get_hadK`, cached."""
+    return get_hadK(n, transpose)[1]
+
+
+@functools.lru_cache(maxsize=64)
+def _prepared_hadK(n, transpose, device, dtype):
+    """``hadK`` ready to multiply: on the right device/dtype and pre-scaled by 1/sqrt(K).
+
+    get_hadK rebuilds the K x K matrix from a Python literal on every call, which
+    dominates the run time of the decomposed path, so the result is cached here.
+    """
+    hadK, K = get_hadK(n, transpose)
+    if K == 1:
+        return None, 1
+    return (hadK.view(1, K, K) / math.sqrt(K)).to(device=device, dtype=dtype), K
+
+
+def matmul_hadU_cuda(X, transpose=False):
+    """HadaCore-accelerated drop-in for :func:`matmul_hadU`.
+
+    Returns ``X @ H`` for the same ``H`` the pure-torch version applies, i.e.
+    ``H = kron(hadK.T, H_pow2) / sqrt(n)``. Sizes that are not a power of two are
+    split as ``n = K * m`` exactly as :func:`get_hadK` does: the kernel handles the
+    power-of-two factor ``m`` and the small ``K x K`` matrix stays a matmul.
+    """
+    n = X.shape[-1]
+    hadK, K = _prepared_hadK(n, transpose, X.device, X.dtype)
+    if K == 1:
+        return hadamard_transform_hadacore(X)
+
+    # Each of the K blocks gets the orthonormal m-point transform (1/sqrt(m) folded in
+    # by the kernel); the residual 1/sqrt(K) rides along in the cached hadK.
+    input = hadamard_transform_hadacore(X.reshape(-1, K, n // K))
+    return (hadK @ input).reshape(X.shape)
+
+
+def matmul_hadUt_cuda(X):
+    return matmul_hadU_cuda(X, transpose=True)
+
+
+def _matmul_hadU_dispatch(X, transpose=False):
+    """Pick the HadaCore kernel or the pure-torch butterfly; both compute ``X @ H``.
+
+    The kernel is fp16/bf16 only, so anything wider stays on the exact butterfly rather
+    than round-tripping through fp16 - that matters when this runs inside rotation
+    training, where the activations may still be fp32.
+    """
+    n = X.shape[-1]
+    K = _hadK_K(n, transpose)
+    if X.is_cuda and X.dtype in _HADACORE_DTYPES and hadacore_available(n // K):
+        return matmul_hadU_cuda(X, transpose)
+    return matmul_hadU(X, transpose)
+
+
+class _HadamardTransform(torch.autograd.Function):
+    """``X @ H`` with a gradient.
+
+    The HadaCore extension is a plain pybind op with no registered backward, and the
+    pure-torch butterfly mutates its buffers in place, so neither is safe to autograd
+    through. H is orthogonal, so the gradient is exactly the inverse rotation:
+    ``d/dX (X H) = grad @ H^T``, which is the same routine with ``transpose`` flipped.
+    """
+    @staticmethod
+    def forward(ctx, X, transpose):
+        ctx.transpose = transpose
+        return _matmul_hadU_dispatch(X, transpose)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _matmul_hadU_dispatch(grad_output.contiguous(), not ctx.transpose), None
+
+
+def matmul_hadU_auto(X, transpose=False):
+    """Differentiable ``X @ H``, on the HadaCore kernel where it can run.
+
+    Safe to use inside rotation training: gradients flow back to Q through the rotation.
+    """
+    return _HadamardTransform.apply(X, transpose)
 
 
 # def apply_exact_had_to_linear(module, had_dim=-1, output=False):

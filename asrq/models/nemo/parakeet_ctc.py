@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 import torch.nn as nn
 from asrq.core.types import Processor
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 from asrq.core.model import ModelQ
 from asrq.core.registry import ModelNames, register_model
@@ -205,6 +205,12 @@ class ParakeetCTCQ(ModelQ):
     (``quantize_text_decoder`` is a no-op).
     """
     model: EncDecCTCModelQ
+
+    # (wbits, abits) applied to every attention-projection / feed-forward
+    # linear named by get_asrq_linear_targets() below -- same role as
+    # WhisperQ.asrq_attn_bits/asrq_ffn_bits (asrq/models/transformers/whisper.py).
+    asrq_attn_bits: Tuple[int, int] = (4, 16)
+    asrq_ffn_bits: Tuple[int, int] = (4, 16)
 
     @classmethod
     def load_model(cls) -> Tuple[nn.Module, Processor]:
@@ -421,4 +427,27 @@ class ParakeetCTCQ(ModelQ):
             ]
 
         return linears
+
+    def get_asrq_linear_targets(self) -> Dict[str, Tuple[int, int]]:
+        """Map every attention-projection / feed-forward nn.Linear in the
+        conformer encoder to (wbits, abits), for ModelQ.to_asrq_linear().
+        Same name-building pattern as for_activation_quantization() above,
+        but covers every linear in a block (including linear_pos and the
+        feed_forward*.linear2s, which for_activation_quantization() omits)
+        since to_asrq_linear() is a full weight-replacement pass, not a
+        "which layers also get activation quantization" selection. There is
+        no text-decoder counterpart (CTC has no decoder to quantize, see
+        quantize_text_decoder()'s no-op)."""
+        targets: Dict[str, Tuple[int, int]] = {}
+        num_encoder_blocks = len(self.model.encoder.layers)
+        for i in range(num_encoder_blocks):
+            stem = f"encoder.layers.{i}"
+            for suffix in ("self_attn.linear_q", "self_attn.linear_k", "self_attn.linear_v",
+                           "self_attn.linear_out", "self_attn.linear_pos"):
+                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
+            for suffix in ("feed_forward1.linear1", "feed_forward1.linear2",
+                           "feed_forward2.linear1", "feed_forward2.linear2"):
+                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
+
+        return targets
 

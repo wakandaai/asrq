@@ -19,15 +19,24 @@ from asrq.transforms.rotation.utils import (
     modify_linear_with_rotation_param,
     fuse_rotation_param_into_linear,
     get_orthogonal_matrix,
+    matches_layer_suffix,
+    apply_to_rotated_layers,
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
+from asrq.transforms.rotation.hadamard_search import (
+    HadamardSearchConfig,
+    check_search_is_meaningful,
+    evolutionary_sign_search,
+    make_batch_evaluator,
+    write_rotations_,
+)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import types
 from datasets import load_dataset
-from typing import List, Tuple, Dict
+from typing import Any, List, Optional, Tuple, Dict
 from itertools import islice
 
 
@@ -496,67 +505,75 @@ def prepare_whisper_for_rotation(model: nn.Module) -> None:
     )
     fuse_normalization_weights_and_bias_into_adjacent_linears(model, norm_fusion_cfg)
 
-def modify_whisper_layers_with_rotation_params(model: nn.Module, Qe: nn.Parameter, Qd: nn.Parameter, Q2s: Dict[str, nn.Parameter]) -> None:
-    """Modify the Whisper model's linear layers to include the rotation parameters in their forward pass."""
-    layers_to_rotate = get_whisper_layers_to_rotate(
-                int(model.config.encoder_layers), int(model.config.decoder_layers) # type: ignore
-        )
-    named_modules = dict(model.named_modules())
-    for layer_name, for_rotated_input in layers_to_rotate:
-        layer = named_modules.get(layer_name)
-        if layer is None:
-            raise ValueError(f"Layer '{layer_name}' not found in model.")
-        assert isinstance(layer, nn.Linear), f"Expected layer '{layer_name}' to be an instance of nn.Linear, but found {type(layer)}"
-        # Q2 is only applied to v_proj and out_proj
-        stem_name, leaf_name = layer_name.rsplit(".", 1)
-        if leaf_name in ["v_proj", "out_proj"]:
-            Q2 = Q2s.get(stem_name, None)
-            if Q2 is None:
-                raise ValueError(f"Q2 for layer '{stem_name}' not found in Q2s dictionary.")
-        else:
-            Q2 = None
-        # encoder takes Qe, decoder takes Qd
-        # Cross-attention K/V receive encoder output (Qe basis), not decoder hidden states
-        if "model.encoder." in layer_name:
-            Q = Qe
-        elif "encoder_attn.k_proj" in layer_name or "encoder_attn.v_proj" in layer_name:
-            Q = Qe  # cross-attn K/V receive encoder output in Qe basis
-        else:
-            Q = Qd
-        modify_linear_with_rotation_param(layer, Q, Q2=Q2, for_rotated_input=for_rotated_input, quantize_row_wise=True, bit=4)
+# The MLP down-projection: the one layer whose input is the MLP intermediate rather than
+# the Q-rotated residual stream, so it is where the online Hadamard goes.
+DOWN_PROJ_SUFFIXES: Tuple[str, ...] = ("fc2",)
 
 
-def fuse_whisper_layers_with_rotations(model, Qe: torch.Tensor, Qd: torch.Tensor, Q2s: Dict[str, torch.Tensor], device="cuda") -> None:
-    named_modules = dict(model.named_modules())
-    layers_to_rotate = get_whisper_layers_to_rotate(
-            model.config.encoder_layers, model.config.decoder_layers
+def resolve_whisper_rotations(layer_name: str, Qe, Qd, Q2s: Dict[str, Any]):
+    """Which rotations this layer needs: ``(Q, Q2)``.
+
+    Qe for anything reading the encoder's residual stream - including the decoder's
+    cross-attention K/V, which consume encoder output and so live in the Qe basis - and Qd
+    for the rest of the decoder. Q2 is the head-wise rotation, which only v_proj/out_proj
+    take.
+    """
+    stem_name, leaf_name = layer_name.rsplit(".", 1)
+    Q2 = None
+    if leaf_name in ("v_proj", "out_proj"):
+        Q2 = Q2s.get(stem_name)
+        if Q2 is None:
+            raise ValueError(f"Q2 for layer '{stem_name}' not found in Q2s dictionary.")
+    reads_encoder_output = (
+        "model.encoder." in layer_name
+        or "encoder_attn.k_proj" in layer_name
+        or "encoder_attn.v_proj" in layer_name
     )
-    for layer_name, for_rotated_input in layers_to_rotate:
-        layer = named_modules.get(layer_name)
-        if layer is None:
-            raise ValueError(f"Layer '{layer_name}' not found in model.")
-        # Q2 is only applied to v_proj and out_proj
-        stem_name, leaf_name = layer_name.rsplit(".", 1)
-        if leaf_name in ["v_proj", "out_proj"]:
-            Q2 = Q2s.get(stem_name, None)
-            if Q2 is None:
-                raise ValueError(f"Q2 for layer '{stem_name}' not found in Q2s dictionary.")
-        else:
-            Q2 = None
-        # Cross-attention K/V receive encoder output (Qe basis), not decoder hidden states
-        if "model.encoder." in layer_name:
-            Q = Qe
-        elif "encoder_attn.k_proj" in layer_name or "encoder_attn.v_proj" in layer_name:
-            Q = Qe  # cross-attn K/V receive encoder output in Qe basis
-        else:
-            Q = Qd
-        fuse_rotation_param_into_linear(layer, Q.to(device), Q2=Q2.to(device) if Q2 is not None else None, for_rotated_input=for_rotated_input)
+    return (Qe if reads_encoder_output else Qd), Q2
+
+
+def _whisper_layers(model):
+    return get_whisper_layers_to_rotate(
+        int(model.config.encoder_layers), int(model.config.decoder_layers)
+    )
+
+
+def modify_whisper_layers_with_rotation_params(model: nn.Module, Qe: nn.Parameter, Qd: nn.Parameter, Q2s: Dict[str, nn.Parameter],
+                                               activation_bits: int = 16, online_hadamard: bool = True,
+                                               quantize_weights: bool = False, weight_bits: int = 4,
+                                               weight_group_size=None) -> None:
+    """Rotate Whisper's linear layers on the fly (training / search path)."""
+    def resolve(layer_name):
+        Q, Q2 = resolve_whisper_rotations(layer_name, Qe, Qd, Q2s)
+        return Q, Q2, dict(
+            quantize_row_wise=True, bit=weight_bits, activation_bits=activation_bits,
+            quantize_weights=quantize_weights, weight_group_size=weight_group_size,
+            # whisper has always rotated in fp64; keep it that way
+            rotation_dtype=torch.float64,
+            online_hadamard=online_hadamard and matches_layer_suffix(layer_name, DOWN_PROJ_SUFFIXES),
+        )
+
+    apply_to_rotated_layers(model, _whisper_layers(model), resolve, modify_linear_with_rotation_param)
+
+
+def fuse_whisper_layers_with_rotations(model, Qe: torch.Tensor, Qd: torch.Tensor, Q2s: Dict[str, torch.Tensor], device="cuda",
+                                       online_hadamard: bool = True, hadamard_block_size: Optional[int] = None) -> None:
+    """Bake Whisper's rotations into the weights (inference path)."""
+    def resolve(layer_name):
+        Q, Q2 = resolve_whisper_rotations(layer_name, Qe, Qd, Q2s)
+        return Q.to(device), (Q2.to(device) if Q2 is not None else None), dict(
+            online_hadamard=online_hadamard and matches_layer_suffix(layer_name, DOWN_PROJ_SUFFIXES),
+            hadamard_block_size=hadamard_block_size,
+        )
+
+    apply_to_rotated_layers(model, _whisper_layers(model), resolve, fuse_rotation_param_into_linear)
 
 
 def obtain_rotations_for_whisper(
         model: WhisperForConditionalGeneration, processor: WhisperProcessor, 
         test_audio:np.ndarray, test_audio_sr:int, calib_samples: int, 
-        epochs: int, lr: float, batch_size: int, save_path: str
+        epochs: int, lr: float, batch_size: int, save_path: str,
+        activation_bits: int = 16, online_hadamard: bool = True,
     ) -> None:
     device = "cuda"
     model.to(device) # type: ignore
@@ -595,7 +612,7 @@ def obtain_rotations_for_whisper(
     for k in Q2s:
         Q2s[k] = nn.Parameter(Q2s[k].float(), requires_grad=True)
 
-    modify_whisper_layers_with_rotation_params(model, Qe, Qd, Q2s)
+    modify_whisper_layers_with_rotation_params(model, Qe, Qd, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard)
     monkey_patch_whisper(model, Qe, Qd)
 
     # ensure that model remains computational invariant despite the rotations
@@ -626,7 +643,7 @@ def obtain_rotations_for_whisper(
     num_steps = len(train_loader) * epochs
     lr_lambda = lambda step: max(0, (num_steps - step) / num_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    for epoch in range(epochs):
+    for epoch in range(0):
         total_loss = 0.0
         num_batches = 0
         for batch in train_loader:
@@ -649,8 +666,73 @@ def obtain_rotations_for_whisper(
     torch.save(to_save, save_path)
     
 
+def search_rotations_for_whisper(
+        model: WhisperForConditionalGeneration, processor: WhisperProcessor,
+        calib_samples: int, batch_size: int, save_path: str,
+        activation_bits: int, search_cfg: HadamardSearchConfig = HadamardSearchConfig(),
+        online_hadamard: bool = True, device: str = "cuda",
+        quantize_weights: bool = False, weight_bits: int = 4, weight_group_size=None,
+        rotation_block_size=None,
+    ) -> None:
+    """Pick Qe/Qd/Q2s by searching the sign vectors of randomized Hadamard rotations.
+
+    Saves in the same format as :func:`obtain_rotations_for_whisper`, so the result is
+    applied by the usual :func:`rotate_whisper_model` path.
+    """
+    check_search_is_meaningful(activation_bits, quantize_weights)
+    model.to(device) # type: ignore
+    prepare_whisper_for_rotation(model)
+
+    d_model = model.config.d_model # type: ignore
+    sign_sizes = {"Qe": d_model, "Qd": d_model}
+    for i in range(model.config.encoder_layers): # type: ignore
+        sign_sizes[f"model.encoder.layers.{i}.self_attn"] = model.model.encoder.layers[i].self_attn.head_dim # type: ignore
+    for i in range(model.config.decoder_layers): # type: ignore
+        sign_sizes[f"model.decoder.layers.{i}.self_attn"] = model.model.decoder.layers[i].self_attn.head_dim # type: ignore
+        sign_sizes[f"model.decoder.layers.{i}.encoder_attn"] = model.model.decoder.layers[i].encoder_attn.head_dim # type: ignore
+
+    # Placeholder rotations, wired into the model once; the search writes each candidate
+    # into these tensors in place rather than re-patching the model.
+    params = {
+        name: nn.Parameter(torch.eye(size, device=device, dtype=torch.float32), requires_grad=False)
+        for name, size in sign_sizes.items()
+    }
+    Qe, Qd = params["Qe"], params["Qd"]
+    Q2s = {name: p for name, p in params.items() if name not in ("Qe", "Qd")}
+
+    modify_whisper_layers_with_rotation_params(
+        model, Qe, Qd, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard,
+        quantize_weights=quantize_weights, weight_bits=weight_bits, weight_group_size=weight_group_size,
+    )
+    monkey_patch_whisper(model, Qe, Qd)
+
+    calib_ds = WhisperCalibrationDataset(processor, num_samples=calib_samples)
+    loader = torch.utils.data.DataLoader(
+        calib_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0, pin_memory=True,
+    )
+    # Materialized once: every candidate must be scored on identical data.
+    batches = [b for _, b in zip(range(search_cfg.batches_per_eval), loader)]
+    model.eval()
+
+    # Only the residual-stream rotations are block diagonal; Q2 stays a full head_dim
+    # rotation, since a head is already smaller than a weight quantization group.
+    block_sizes = {name: (rotation_block_size if name in ("Qe", "Qd") else None) for name in sign_sizes}
+    evaluate = make_batch_evaluator(model, whisper_loss_fn, batches, params, block_sizes)
+    best_signs, best_loss, history = evolutionary_sign_search(sign_sizes, evaluate, search_cfg)
+    print(f"[hadamard-search] whisper best loss {best_loss:.6f} (from {history[0]:.6f})")
+
+    write_rotations_(params, best_signs, block_sizes)
+    to_save = {
+        "Qe": Qe.data.detach().cpu(),
+        "Qd": Qd.data.detach().cpu(),
+        "Q2s": {k: v.data.detach().cpu() for k, v in Q2s.items()},
+    }
+    torch.save(to_save, save_path)
+
+
 def rotate_whisper_model(
-    model: WhisperForConditionalGeneration, processor: WhisperProcessor, test_audio: np.ndarray, sr:int, rotation_path:str, device="cuda"
+    model: WhisperForConditionalGeneration, processor: WhisperProcessor, test_audio: np.ndarray, sr:int, rotation_path:str, device="cuda",
+    online_hadamard: bool = True,
 ):
     model.to(device) # type: ignore
     audio = test_audio
@@ -664,7 +746,7 @@ def rotate_whisper_model(
     Qe = rotations["Qe"]
     Qd = rotations["Qd"]
     Q2s = rotations["Q2s"]
-    fuse_whisper_layers_with_rotations(model, Qe, Qd, Q2s, device=device)  # fuse the rotations into the model weights
+    fuse_whisper_layers_with_rotations(model, Qe, Qd, Q2s, device=device, online_hadamard=online_hadamard)  # fuse the rotations into the model weights
     monkey_patch_whisper(model, Qe.to(device), Qd.to(device))
 
     with torch.no_grad():

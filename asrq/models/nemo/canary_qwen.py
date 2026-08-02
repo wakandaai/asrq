@@ -257,6 +257,12 @@ class CanaryQwenQ(ModelQ):
     Calibration data is drawn from LibriSpeech.
     """
 
+    # (wbits, abits) applied to every attention-projection / feed-forward
+    # linear named by get_asrq_linear_targets() below -- same role as
+    # WhisperQ.asrq_attn_bits/asrq_ffn_bits (asrq/models/transformers/whisper.py).
+    asrq_attn_bits: Tuple[int, int] = (4, 16)
+    asrq_ffn_bits: Tuple[int, int] = (4, 16)
+
     @classmethod
     def load_model(cls) -> Tuple[nn.Module, None]:  # type: ignore[override]
         """Load the Canary-Qwen 2.5B model from NeMo.
@@ -774,3 +780,42 @@ class CanaryQwenQ(ModelQ):
             ]
 
         return linears
+
+    def get_asrq_linear_targets(self) -> Dict[str, Tuple[int, int]]:
+        """Map every attention-projection / feed-forward nn.Linear in the
+        conformer encoder and the Qwen3 decoder to (wbits, abits), for
+        ModelQ.to_asrq_linear(). Same name-building pattern as
+        for_activation_quantization() above, but covers every linear in a
+        block (including mlp.down_proj, which for_activation_quantization()
+        omits) since to_asrq_linear() is a full weight-replacement pass, not
+        a "which layers also get activation quantization" selection.
+
+        q_proj/v_proj are targeted via their .base_layer (not merged) --
+        the real checkpoint wraps them in a peft LoRA adapter (confirmed by
+        for_activation_quantization()'s own .base_layer targeting above);
+        .base_layer is the underlying plain nn.Linear, so the LoRA delta
+        stays fp16/unquantized while everything else gets replaced.
+        lm_head is excluded, matching quantize()'s own exclusion below.
+        """
+        targets: Dict[str, Tuple[int, int]] = {}
+        num_encoder_blocks: int = len(self.model.perception.encoder.layers)  # type: ignore
+        num_decoder_blocks: int = len(self.model.llm.base_model.model.model.layers)  # type: ignore
+
+        for i in range(num_encoder_blocks):
+            stem = f"perception.encoder.layers.{i}"
+            for suffix in ("self_attn.linear_q", "self_attn.linear_k", "self_attn.linear_v",
+                           "self_attn.linear_out", "self_attn.linear_pos"):
+                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
+            for suffix in ("feed_forward1.linear1", "feed_forward1.linear2",
+                           "feed_forward2.linear1", "feed_forward2.linear2"):
+                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
+
+        for i in range(num_decoder_blocks):
+            stem = f"llm.base_model.model.model.layers.{i}"
+            for suffix in ("self_attn.q_proj.base_layer", "self_attn.k_proj",
+                           "self_attn.v_proj.base_layer", "self_attn.o_proj"):
+                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
+            for suffix in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"):
+                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
+
+        return targets
