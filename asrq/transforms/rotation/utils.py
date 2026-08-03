@@ -80,6 +80,8 @@ class STEQuantize(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, x, bit, row_wise=True):
+        if bit >= 16:
+            return x
         dim = 1 if row_wise else 0
         scale = x.abs().max(dim=dim, keepdim=True).values / (2 ** (bit - 1) - 1)
         scale = scale.where(scale != 0, 1e-3)  # avoid division by 0
@@ -433,7 +435,7 @@ def modify_linear_with_rotation_param(
         """Apply Q2 within each ``hdim``-wide block of the last dim."""
         org_shape = t.shape
         blocks = t.reshape(-1, org_shape[-1] // hdim, hdim)
-        return (blocks.to(rot_dtype(Q2)) @ Q2).reshape(org_shape)  # type: ignore[arg-type]
+        return (blocks.to(rot_dtype(Q2)) @ Q2.to(rot_dtype(Q2))).reshape(org_shape)  # type: ignore[arg-type]
 
     def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
         # ---- input side: rotate, then quantize, so x is quantized in the rotated basis

@@ -9,13 +9,16 @@ from asrq.quantizers.activation import modify_linears_with_activation_quantizati
 # third_party/open_asr_leaderboard/transformers/run_whisper.sh. The leaderboard now
 # scores the cleaned variants of ami/gigaspeech/voxpopuli, and tedlium was dropped.
 DATASET_SPLITS = [
-    ("ami_cleaned", "test"),
-    ("gigaspeech_cleaned", "test"),
-    ("voxpopuli_cleaned_aa", "test"),
+    # ("ami_cleaned", "test"),
+    ("ami", "test"),
+    # ("gigaspeech_cleaned", "test"),
     ("earnings22", "test"),
+    ("gigaspeech", "test"),
+    # ("voxpopuli_cleaned_aa", "test"),
     ("librispeech", "test.clean"),
     ("librispeech", "test.other"),
     ("spgispeech", "test"),
+    ("voxpopuli", "test"),
 ]
 
 

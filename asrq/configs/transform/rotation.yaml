@@ -2,8 +2,8 @@ name: rotation
 num_samples: 800
 epochs: 1
 learning_rate: 0.01
-batch_size: 1
+batch_size: 4
 path: ""
 learn_rotation: False
-hadamard_search: True
+hadamard_search: False
 use: True

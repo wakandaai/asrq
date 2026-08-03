@@ -3,8 +3,6 @@
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
-from hydra import compose, initialize_config_dir
-
 import random
 
 import hydra
@@ -31,11 +29,12 @@ def set_seed(seed=42):
     torch.use_deterministic_algorithms(True, warn_only=False)
     transformers.set_seed(seed)
 
-# Load configs from tests/configs using Hydra
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 
-with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_DIR)):
-    cfg = compose(config_name="config", overrides=["transform=rotation"])
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg: DictConfig) -> None:
+    assert cfg.transform.name == "rotation", (
+        f"rot-exp.py only supports the rotation transform, got '{cfg.transform.name}'"
+    )
     set_seed(cfg.seed)
 
     with open_dict(cfg.quantizer):
@@ -47,7 +46,11 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
         cfg.transform.wbits = cfg.quantizer.bits
         cfg.transform.abits = cfg.activation_bits
         cfg.transform.wgroup = cfg.quantizer.get("group_size", None)
-        cfg.transform.learn_rotation = True
+        # Default to gradient-based learning unless a Hadamard search was explicitly
+        # requested (transform.hadamard_search=true); base.py's RotationTransform lets
+        # learn_rotation win over hadamard_search, so it must stay off for search runs.
+        if not cfg.transform.hadamard_search:
+            cfg.transform.learn_rotation = True
     print(OmegaConf.to_yaml(cfg))
 
     quant_cfg = QuantConfig.from_dictconfig(cfg.quantizer)
@@ -62,6 +65,9 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
     modelQ.model.to("cuda")
     set_seed(cfg.seed)  # re-seed after model loading to ensure deterministic Q init + DataLoader shuffle
     transform.obtain_transform(modelQ)
-    
 
     print("Done with obtaining rotations")
+
+
+if __name__ == "__main__":
+    main()

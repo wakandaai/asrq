@@ -45,7 +45,7 @@ from typing import Any, List, Tuple, Optional, Union, Dict
 
 
 class ParakeetCalibrationDataset(torch.utils.data.Dataset):
-    """LibriSpeech train-clean-100 samples formatted for CanaryQwen rotation training."""
+    """LibriSpeech train-clean-100 samples formatted for Parakeet CTC rotation training."""
 
     def __init__(self, model, num_samples=128, seed=42):
         super().__init__()
@@ -63,10 +63,10 @@ class ParakeetCalibrationDataset(torch.utils.data.Dataset):
         audio_len = torch.tensor(audio.shape[0], dtype=torch.long)
         text = sample["text"]
 
-        # Append transcription tokens and EOS
+        # CTC targets are just the label sequence - no EOS/BOS (unlike the autoregressive
+        # Canary-Qwen decoder). parakeet's tokenizer.eos is -1 (NeMo's "unset" sentinel for
+        # CTC tokenizers), so appending it would feed CTCLoss an out-of-range target id.
         tokens = torch.tensor(self.model.tokenizer.text_to_ids(text), dtype=torch.long)
-        eos = torch.tensor([self.model.tokenizer.eos], dtype=torch.long)
-        tokens = torch.cat([tokens, eos])
         tokens_len = torch.tensor(tokens.shape[0], dtype=torch.long)
 
         return audio, audio_len, tokens, tokens_len
@@ -562,7 +562,6 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
     # Modify linear layers to include rotation in their forward pass
     modify_parakeet_ctc_layers_with_rotation_params(
         model, Qe, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard,
-        quantize_weights=quantize_weights, weight_bits=weight_bits, weight_group_size=weight_group_size,
     )
     # Monkey-patch the Qwen3Model forward to rotate residual stream
     monkey_patch_parakeet_ctc_for_train(model, Qe)

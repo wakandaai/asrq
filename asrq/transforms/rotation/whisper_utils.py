@@ -612,16 +612,23 @@ def obtain_rotations_for_whisper(
     for k in Q2s:
         Q2s[k] = nn.Parameter(Q2s[k].float(), requires_grad=True)
 
-    modify_whisper_layers_with_rotation_params(model, Qe, Qd, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard)
+    modify_whisper_layers_with_rotation_params(model, Qe, Qd, Q2s, activation_bits=16, online_hadamard=online_hadamard)
     monkey_patch_whisper(model, Qe, Qd)
 
-    # ensure that model remains computational invariant despite the rotations
+    # ensure that model remains computational invariant despite the rotations.
+    # The rotations cancel exactly, so this is checked with activation quantization
+    # disabled (activation_bits=16); the lossy STE activation quantizer used for training
+    # would change the output and is intentionally not part of this invariance test.
     with torch.no_grad():
         # transcribe an audio sample and compare with the original transcription
         out_a = model.generate(inputs.input_features.to(device).to(dtype), max_new_tokens=128)
         rot_transcription = processor.batch_decode(out_a, skip_special_tokens=True)[0].strip()
         assert orig_transcription == rot_transcription, f"Transcriptions do not match after applying rotations! \nOriginal: '{orig_transcription}', \nAfter Rotation: '{rot_transcription}'"
     # -----------------------------------------------------------------------
+
+    # Re-wrap the layers with the real activation width so the rotation is trained
+    # against the STE-quantized activations it will be deployed with.
+    modify_whisper_layers_with_rotation_params(model, Qe, Qd, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard)
 
 
     calib_ds = WhisperCalibrationDataset(processor, num_samples=calib_samples, seed=_seed)
@@ -643,7 +650,7 @@ def obtain_rotations_for_whisper(
     num_steps = len(train_loader) * epochs
     lr_lambda = lambda step: max(0, (num_steps - step) / num_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-    for epoch in range(0):
+    for epoch in range(epochs):
         total_loss = 0.0
         num_batches = 0
         for batch in train_loader:
