@@ -4,7 +4,7 @@ from unittest.mock import patch
 from datasets import DownloadMode
 from datasets.exceptions import NonMatchingSplitsSizesError
 
-from asrq.evaluation.openasr import load_openasr_dataset
+from asrq.evaluation.openasr import TEDLIUM_PUBLIC_FALLBACK_PATH, load_openasr_dataset
 
 
 class LoadOpenASRDatasetTests(unittest.TestCase):
@@ -53,6 +53,32 @@ class LoadOpenASRDatasetTests(unittest.TestCase):
         self.assertEqual(calls[1][1]["download_mode"], DownloadMode.FORCE_REDOWNLOAD)
         self.assertEqual(calls[2][1]["download_mode"], DownloadMode.FORCE_REDOWNLOAD)
         self.assertEqual(calls[2][1]["cache_dir"], "/tmp/asrq-tedlium-fresh-cache")
+
+    def test_uses_public_tedlium_fallback_when_esb_split_remains_broken(self) -> None:
+        expected_dataset = object()
+        calls = []
+
+        def fake_load_dataset(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[0] == TEDLIUM_PUBLIC_FALLBACK_PATH:
+                return expected_dataset
+            if len(calls) < 3:
+                raise NonMatchingSplitsSizesError("split mismatch")
+            raise ValueError("Instruction \"test\" corresponds to no data!")
+
+        with patch("asrq.evaluation.openasr.load_dataset", side_effect=fake_load_dataset):
+            with patch("asrq.evaluation.openasr.tempfile.mkdtemp", return_value="/tmp/asrq-tedlium-fresh-cache"):
+                dataset = load_openasr_dataset(
+                    dataset_path="hf-audio/esb-datasets-test-only-sorted",
+                    dataset_name="tedlium",
+                    split="test",
+                )
+
+        self.assertIs(dataset, expected_dataset)
+        self.assertEqual(calls[0][0][0], "hf-audio/esb-datasets-test-only-sorted")
+        self.assertEqual(calls[1][1]["download_mode"], DownloadMode.FORCE_REDOWNLOAD)
+        self.assertEqual(calls[2][1]["cache_dir"], "/tmp/asrq-tedlium-fresh-cache")
+        self.assertEqual(calls[3][0][0], TEDLIUM_PUBLIC_FALLBACK_PATH)
 
 
 if __name__ == "__main__":

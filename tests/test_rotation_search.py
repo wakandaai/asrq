@@ -115,6 +115,34 @@ class RotationSearchTests(unittest.TestCase):
             len(result.histories["history.site"].best_scores),
             len(result.histories["history.site"].generation_indices),
         )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].generation_durations_sec),
+        )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].running_best_scores),
+        )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].population_scores),
+        )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].elite_scores),
+        )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].improved_flags),
+        )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].stagnant_generation_counts),
+        )
+        self.assertEqual(
+            len(result.histories["history.site"].best_scores),
+            len(result.histories["history.site"].generation_mutation_summaries),
+        )
 
 
 if __name__ == "__main__":

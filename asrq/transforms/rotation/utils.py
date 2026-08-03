@@ -339,7 +339,7 @@ def modify_linear_with_rotation_param(
         # quantize the input activations with STE quantization
         if getattr(self, "_rotation_quantize_activation", False):
             x = STEQuantize.apply(x, getattr(self, "_rotation_activation_bits", 8), True)
-        # Apply the rotation to the weight
+        # Apply the   to the weight
         rotated_bias = self.bias
         dtype = self.weight.dtype
         double_type = torch.float64

@@ -1,0 +1,14 @@
+[NeMo I 2026-07-25 23:10:11 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 162 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.
+total calilbration samples 512 batch_size 64
+starting global_qe
+global_generation 0
+global_generation 1
+global_generation 2
+global_generation 3
+global_generation 4
+global_generation 5
+global_generation 6
+global_generation 7

@@ -1,0 +1,7 @@
+parakeet alternating search
+[NeMo I 2026-07-28 18:41:03 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+====================
+search_mode : alternating
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 210 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.

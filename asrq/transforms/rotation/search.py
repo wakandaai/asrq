@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import matplotlib.pyplot as plt
 import torch
-
+import os
+import time
 from asrq.transforms.rotation.hadamard_utils import matmul_hadU
-
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from tqdm import tqdm
 
 def normalized_hadamard_matrix(size: int) -> torch.Tensor:
     """Return a deterministic normalized Hadamard-like orthogonal matrix."""
@@ -62,13 +64,23 @@ class ThreeSignHadamardCandidate:
         dtype: torch.dtype,
     ) -> torch.Tensor:
         h = base_h.to(device=device)
-        left = self.s0.to(device=device, dtype=base_h.dtype).unsqueeze(1)
-        mid = self.s1.to(device=device, dtype=base_h.dtype)
+        left = self.s0.to(device=device, dtype=base_h.dtype).unsqueeze(1) * h
+        middle = self.s1.to(device=device, dtype=base_h.dtype).unsqueeze(1) * h
         right = self.s2.to(device=device, dtype=base_h.dtype).unsqueeze(0)
-        middle = h * mid.unsqueeze(0)
-        rotation = (left * h) @ middle
+        rotation = left @ middle
         rotation = rotation * right
         return rotation.to(dtype=dtype)
+
+
+@dataclass
+class PairedThreeSignHadamardCandidate:
+    """Joint search candidate for paired global rotations, e.g. (Qe, Qd)."""
+
+    qe: ThreeSignHadamardCandidate
+    qd: ThreeSignHadamardCandidate
+
+    def clone(self) -> "PairedThreeSignHadamardCandidate":
+        return PairedThreeSignHadamardCandidate(self.qe.clone(), self.qd.clone())
 
 
 @dataclass
@@ -90,7 +102,7 @@ class GlobalRotationSearchSite:
     site_id: str
     dimension: int
     base_h: torch.Tensor
-    current_candidate: ThreeSignHadamardCandidate
+    current_candidate: Any
     metadata: dict[str, str] = field(default_factory=dict)
 
 
@@ -108,6 +120,7 @@ class RotationSearchParams:
     medium_mutation_min: int = 4
     medium_mutation_max: int = 8
     large_mutation_fraction: float = 0.25
+    global_score_metric: str = "task_loss"
     seed: int = 42
     verbose: bool = True
 
@@ -117,6 +130,13 @@ class RotationSearchHistory:
     site_id: str
     generation_indices: list[int] = field(default_factory=list)
     best_scores: list[float] = field(default_factory=list)
+    generation_durations_sec: list[float] = field(default_factory=list)
+    running_best_scores: list[float] = field(default_factory=list)
+    population_scores: list[list[float]] = field(default_factory=list)
+    elite_scores: list[list[float]] = field(default_factory=list)
+    improved_flags: list[bool] = field(default_factory=list)
+    stagnant_generation_counts: list[int] = field(default_factory=list)
+    generation_mutation_summaries: list[dict[str, Any]] = field(default_factory=list)
     committed_score: float | None = None
 
 
@@ -140,9 +160,10 @@ class AlternatingSearchParams:
 class AlternatingRotationSearchResult:
     local_result: RotationSearchResult
     global_history: list[RotationSearchHistory]
-    best_global_candidate: ThreeSignHadamardCandidate
+    best_global_candidate: Any
     best_global_score: float
     outer_rounds_completed: int
+    local_history_rounds: list[dict[str, Any]] = field(default_factory=list)
 
 
 class RotationSearchAdapter(Protocol):
@@ -176,15 +197,64 @@ class GlobalRotationSearchAdapter(Protocol):
 
     def score_global_candidate(
         self,
-        candidate: ThreeSignHadamardCandidate,
+        candidate: Any,
     ) -> float:
         ...
 
     def commit_global_candidate(
         self,
-        candidate: ThreeSignHadamardCandidate,
+        candidate: Any,
     ) -> None:
         ...
+
+    def initialize_global_population(
+        self,
+        params: "RotationSearchParams",
+        generator: torch.Generator,
+    ) -> list[Any]:
+        ...
+
+    def mutate_global_candidate(
+        self,
+        candidate: Any,
+        params: "RotationSearchParams",
+        generator: torch.Generator,
+    ) -> Any:
+        ...
+
+    def rotation_state(self) -> dict[str, torch.Tensor]:
+        ...
+
+
+def _serialize_history(history: RotationSearchHistory) -> dict[str, Any]:
+    return {
+        "site_id": history.site_id,
+        "generation_indices": history.generation_indices,
+        "best_scores": history.best_scores,
+        "generation_durations_sec": history.generation_durations_sec,
+        "running_best_scores": history.running_best_scores,
+        "population_scores": history.population_scores,
+        "elite_scores": history.elite_scores,
+        "improved_flags": history.improved_flags,
+        "stagnant_generation_counts": history.stagnant_generation_counts,
+        "generation_mutation_summaries": history.generation_mutation_summaries,
+        "committed_score": history.committed_score,
+    }
+
+
+def _serialize_round_histories(round_histories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    serialized_rounds: list[dict[str, Any]] = []
+    for round_history in round_histories:
+        serialized_rounds.append(
+            {
+                "round_index": round_history["round_index"],
+                "histories": {
+                    site_id: _serialize_history(history)
+                    for site_id, history in round_history["histories"].items()
+                },
+            }
+        )
+    return serialized_rounds
 
 
 def random_sign_candidate(
@@ -205,6 +275,16 @@ def random_three_sign_candidate(
         _random_sign_vector(dimension, generator),
         _random_sign_vector(dimension, generator),
         _random_sign_vector(dimension, generator),
+    )
+
+
+def random_paired_three_sign_candidate(
+    dimension: int,
+    generator: torch.Generator,
+) -> PairedThreeSignHadamardCandidate:
+    return PairedThreeSignHadamardCandidate(
+        qe=random_three_sign_candidate(dimension, generator),
+        qd=random_three_sign_candidate(dimension, generator),
     )
 
 
@@ -235,22 +315,46 @@ def _mutation_flip_count(
     return int(torch.randint(low, high + 1, (1,), generator=generator).item())
 
 
+def _flip_vector_entries(
+    vector: torch.Tensor,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> int:
+    flips = _mutation_flip_count(vector.numel(), params, generator)
+    indices = torch.randperm(vector.numel(), generator=generator)[:flips]
+    vector[indices] = -vector[indices]
+    return flips
+
+
 def mutate_candidate(
     candidate: SignHadamardCandidate,
     params: RotationSearchParams,
     generator: torch.Generator,
 ) -> SignHadamardCandidate:
+    mutated, _ = _mutate_candidate_with_metadata(candidate, params, generator)
+    return mutated
+
+
+def _mutate_candidate_with_metadata(
+    candidate: SignHadamardCandidate,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> tuple[SignHadamardCandidate, dict[str, Any]]:
     mutated = candidate.clone()
     mutate_both = torch.rand(1, generator=generator).item() < params.mutate_both_probability
     targets = ("s0", "s1") if mutate_both else (("s0",) if torch.rand(1, generator=generator).item() < 0.5 else ("s1",))
+    flip_counts: dict[str, int] = {}
 
     for attr in targets:
         vector = getattr(mutated, attr)
-        flips = _mutation_flip_count(vector.numel(), params, generator)
-        indices = torch.randperm(vector.numel(), generator=generator)[:flips]
-        vector[indices] = -vector[indices]
+        flip_counts[attr] = _flip_vector_entries(vector, params, generator)
 
-    return mutated
+    return mutated, {
+        "origin": "mutation",
+        "mutated_attrs": list(targets),
+        "flip_counts": flip_counts,
+        "total_flips": sum(flip_counts.values()),
+    }
 
 
 def mutate_three_sign_candidate(
@@ -258,6 +362,15 @@ def mutate_three_sign_candidate(
     params: RotationSearchParams,
     generator: torch.Generator,
 ) -> ThreeSignHadamardCandidate:
+    mutated, _ = _mutate_three_sign_candidate_with_metadata(candidate, params, generator)
+    return mutated
+
+
+def _mutate_three_sign_candidate_with_metadata(
+    candidate: ThreeSignHadamardCandidate,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> tuple[ThreeSignHadamardCandidate, dict[str, Any]]:
     mutated = candidate.clone()
     rolls = torch.rand(2, generator=generator)
     if rolls[0].item() < params.mutate_both_probability:
@@ -270,14 +383,89 @@ def mutate_three_sign_candidate(
             targets = ("s1",)
         else:
             targets = ("s2",)
+    flip_counts: dict[str, int] = {}
 
     for attr in targets:
         vector = getattr(mutated, attr)
-        flips = _mutation_flip_count(vector.numel(), params, generator)
-        indices = torch.randperm(vector.numel(), generator=generator)[:flips]
-        vector[indices] = -vector[indices]
+        flip_counts[attr] = _flip_vector_entries(vector, params, generator)
 
+    return mutated, {
+        "origin": "mutation",
+        "mutated_attrs": list(targets),
+        "flip_counts": flip_counts,
+        "total_flips": sum(flip_counts.values()),
+    }
+
+
+def mutate_paired_three_sign_candidate(
+    candidate: PairedThreeSignHadamardCandidate,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> PairedThreeSignHadamardCandidate:
+    mutated, _ = _mutate_paired_three_sign_candidate_with_metadata(candidate, params, generator)
     return mutated
+
+
+def _mutate_paired_three_sign_candidate_with_metadata(
+    candidate: PairedThreeSignHadamardCandidate,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> tuple[PairedThreeSignHadamardCandidate, dict[str, Any]]:
+    mutated = candidate.clone()
+    mutate_both = torch.rand(1, generator=generator).item() < params.mutate_both_probability
+    component_summaries: dict[str, Any] = {}
+    if mutate_both:
+        mutated.qe, component_summaries["qe"] = _mutate_three_sign_candidate_with_metadata(mutated.qe, params, generator)
+        mutated.qd, component_summaries["qd"] = _mutate_three_sign_candidate_with_metadata(mutated.qd, params, generator)
+    elif torch.rand(1, generator=generator).item() < 0.5:
+        mutated.qe, component_summaries["qe"] = _mutate_three_sign_candidate_with_metadata(mutated.qe, params, generator)
+    else:
+        mutated.qd, component_summaries["qd"] = _mutate_three_sign_candidate_with_metadata(mutated.qd, params, generator)
+    total_flips = sum(summary.get("total_flips", 0) for summary in component_summaries.values())
+    return mutated, {
+        "origin": "mutation",
+        "mutated_components": list(component_summaries.keys()),
+        "component_summaries": component_summaries,
+        "total_flips": total_flips,
+    }
+
+
+def _summarize_population_metadata(population_metadata: list[dict[str, Any]]) -> dict[str, Any]:
+    origins: dict[str, int] = {}
+    parent_ranks: dict[int, int] = {}
+    mutation_attr_counts: dict[str, int] = {}
+    total_flips: list[int] = []
+    for metadata in population_metadata:
+        origin = metadata.get("origin", "unknown")
+        origins[origin] = origins.get(origin, 0) + 1
+        if "parent_rank" in metadata:
+            rank = int(metadata["parent_rank"])
+            parent_ranks[rank] = parent_ranks.get(rank, 0) + 1
+        for attr in metadata.get("mutated_attrs", []):
+            mutation_attr_counts[attr] = mutation_attr_counts.get(attr, 0) + 1
+        for summary in metadata.get("component_summaries", {}).values():
+            for attr in summary.get("mutated_attrs", []):
+                key = f"paired.{attr}"
+                mutation_attr_counts[key] = mutation_attr_counts.get(key, 0) + 1
+        if "total_flips" in metadata:
+            total_flips.append(int(metadata["total_flips"]))
+
+    summary: dict[str, Any] = {
+        "origins": origins,
+        "parent_rank_counts": parent_ranks,
+        "mutation_attr_counts": mutation_attr_counts,
+    }
+    if total_flips:
+        summary["mean_total_flips"] = float(sum(total_flips) / len(total_flips))
+        summary["max_total_flips"] = int(max(total_flips))
+    return summary
+
+
+def _initialize_population_metadata(population_size: int) -> list[dict[str, Any]]:
+    metadata = [{"origin": "incumbent"}]
+    while len(metadata) < population_size:
+        metadata.append({"origin": "random"})
+    return metadata
 
 
 def _rank_weights(count: int) -> torch.Tensor:
@@ -330,6 +518,34 @@ def _initialize_global_population(
     return population
 
 
+def _initialize_global_population_signed(
+    site: GlobalRotationSearchSite,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> list[ThreeSignHadamardCandidate]:
+    population = [site.current_candidate.clone()]
+    while len(population) < params.population_size:
+        population.append(random_sign_candidate(site.dimension, generator))
+    return population
+
+def _default_initialize_global_population(
+    site: GlobalRotationSearchSite,
+    params: RotationSearchParams,
+    generator: torch.Generator,
+) -> list[Any]:
+    current = site.current_candidate
+    if isinstance(current, ThreeSignHadamardCandidate):
+        return _initialize_global_population(site, params, generator)
+    if isinstance(current, PairedThreeSignHadamardCandidate):
+        population: list[PairedThreeSignHadamardCandidate] = [current.clone()]
+        while len(population) < params.population_size:
+            population.append(random_paired_three_sign_candidate(site.dimension, generator))
+        return population
+    if isinstance(current, SignHadamardCandidate):
+        return _initialize_global_population_signed(site, params, generator)
+    raise TypeError(f"Unsupported global candidate type: {type(current)!r}")
+
+
 def run_rotation_search(
     adapter: RotationSearchAdapter,
     params: RotationSearchParams,
@@ -344,6 +560,7 @@ def run_rotation_search(
 
     for site in adapter.sites():
         population = _initialize_population(site, params, generator)
+        population_metadata = _initialize_population_metadata(len(population))
         best_score = float("inf")
         best_candidate = site.current_candidate.clone()
         stagnant_generations = 0
@@ -354,6 +571,7 @@ def run_rotation_search(
             print(f"[rotation-search] site={site.site_id} start population={params.population_size}")
 
         for generation in range(params.generations):
+            generation_start = time.perf_counter()
             ranked = sorted(
                 (
                     (candidate, adapter.score_site_candidate(site, candidate))
@@ -361,20 +579,30 @@ def run_rotation_search(
                 ),
                 key=lambda item: item[1],
             )
+            generation_duration = time.perf_counter() - generation_start
             current_best_candidate, current_best_score = ranked[0]
+            elite_scores = [float(score) for _, score in ranked[: params.elite_count]]
+            improved = current_best_score + 1e-12 < best_score
             history.generation_indices.append(generation)
             history.best_scores.append(float(current_best_score))
-            if current_best_score + 1e-12 < best_score:
+            history.generation_durations_sec.append(generation_duration)
+            history.population_scores.append([float(score) for _, score in ranked])
+            history.elite_scores.append(elite_scores)
+            history.improved_flags.append(improved)
+            history.generation_mutation_summaries.append(_summarize_population_metadata(population_metadata))
+            if improved:
                 best_score = current_best_score
                 best_candidate = current_best_candidate.clone()
                 stagnant_generations = 0
             else:
                 stagnant_generations += 1
+            history.running_best_scores.append(float(best_score))
+            history.stagnant_generation_counts.append(stagnant_generations)
 
             if params.verbose:
                 print(
                     f"[rotation-search] site={site.site_id} generation={generation + 1}/{params.generations} "
-                    f"best_nmse={current_best_score:.6f} stagnant={stagnant_generations}"
+                    f"best_score={current_best_score:.6f} stagnant={stagnant_generations}"
                 )
 
             if stagnant_generations >= params.patience:
@@ -383,10 +611,21 @@ def run_rotation_search(
                 break
 
             next_population = [candidate.clone() for candidate, _ in ranked[: params.elite_count]]
+            next_population_metadata = [
+                {"origin": "elite", "source_rank": idx}
+                for idx, _ in enumerate(ranked[: params.elite_count])
+            ]
             while len(next_population) < params.population_size:
                 parent = _sample_parent(ranked, params, generator)
-                next_population.append(mutate_candidate(parent, params, generator))
+                parent_rank = next(
+                    idx for idx, (ranked_candidate, _) in enumerate(ranked) if ranked_candidate is parent
+                )
+                child, child_metadata = _mutate_candidate_with_metadata(parent, params, generator)
+                child_metadata["parent_rank"] = parent_rank
+                next_population.append(child)
+                next_population_metadata.append(child_metadata)
             population = next_population
+            population_metadata = next_population_metadata
 
         adapter.commit_site_candidate(site, best_candidate)
         site.current_candidate = best_candidate.clone()
@@ -395,7 +634,7 @@ def run_rotation_search(
         adapter.refresh_caches()
 
         if params.verbose:
-            print(f"[rotation-search] site={site.site_id} committed_nmse={best_score:.6f}")
+            print(f"[rotation-search] site={site.site_id} committed_score={best_score:.6f}")
 
     return RotationSearchResult(best_candidates=best_candidates, histories=histories)
 
@@ -404,43 +643,101 @@ def run_global_rotation_search(
     adapter: GlobalRotationSearchAdapter,
     site: GlobalRotationSearchSite,
     params: RotationSearchParams,
-) -> tuple[ThreeSignHadamardCandidate, float, RotationSearchHistory]:
+) -> tuple[Any, float, RotationSearchHistory]:
     generator = torch.Generator()
     generator.manual_seed(params.seed)
+    print("running global search")
 
     adapter.refresh_global_caches()
-    population = _initialize_global_population(site, params, generator)
+    print("done setting global caches")
+
+    if hasattr(adapter, "initialize_global_population"):
+        population = adapter.initialize_global_population(params, generator)
+    else:
+        population = _default_initialize_global_population(site, params, generator)
+    population_metadata = _initialize_population_metadata(len(population))
     best_candidate = site.current_candidate.clone()
     best_score = adapter.score_global_candidate(best_candidate)
+    
     stagnant_generations = 0
     history = RotationSearchHistory(site_id=site.site_id)
 
     for generation in range(params.generations):
-        ranked = sorted(
-            (
-                (candidate, adapter.score_global_candidate(candidate))
-                for candidate in population
-            ),
-            key=lambda item: item[1],
-        )
+        generation_start = time.perf_counter()
+        population_results = []
+        for candidate in tqdm(population):            
+            population_results.append((candidate, adapter.score_global_candidate(candidate)))
+        # start = time.perf_counter()
+        for i in range(len(population_results)):
+            print(f"candidate {i} fitness {population_results[i][1]} ")
+
+        # with ProcessPoolExecutor(max_workers=6) as executor:
+        #     population_results = list(executor.map(adapter.score_global_candidate, population) )
+        # print(f"Multi {time.time() - start}")        
+        # results = 
+
+        ranked = sorted(population_results, key=lambda item: item[1] )
+        generation_duration = time.perf_counter() - generation_start
+        # ranked = sorted(
+        #     (
+        #         (candidate, adapter.score_global_candidate(candidate))
+        #         for candidate in population
+        #     ),
+        #     key=lambda item: item[1],
+        # )
         current_best_candidate, current_best_score = ranked[0]
+        print(f"global_generation: {generation} current_best_score: {ranked}")
+        elite_scores = [float(score) for _, score in ranked[: params.elite_count]]
+        improved = current_best_score + 1e-12 < best_score
+        
         history.generation_indices.append(generation)
         history.best_scores.append(float(current_best_score))
-        if current_best_score + 1e-12 < best_score:
+        history.generation_durations_sec.append(generation_duration)
+        history.population_scores.append([float(score) for _, score in ranked])
+        history.elite_scores.append(elite_scores)
+        history.improved_flags.append(improved)
+        history.generation_mutation_summaries.append(_summarize_population_metadata(population_metadata))
+        if improved:
             best_score = current_best_score
             best_candidate = current_best_candidate.clone()
             stagnant_generations = 0
         else:
             stagnant_generations += 1
+        history.running_best_scores.append(float(best_score))
+        history.stagnant_generation_counts.append(stagnant_generations)
 
         if stagnant_generations >= params.patience:
             break
 
         next_population = [candidate.clone() for candidate, _ in ranked[: params.elite_count]]
+        next_population_metadata = [
+            {"origin": "elite", "source_rank": idx}
+            for idx, _ in enumerate(ranked[: params.elite_count])
+        ]
         while len(next_population) < params.population_size:
             parent = _sample_global_parent(ranked, params, generator)
-            next_population.append(mutate_three_sign_candidate(parent, params, generator))
+            parent_rank = next(
+                idx for idx, (ranked_candidate, _) in enumerate(ranked) if ranked_candidate is parent
+            )
+            if hasattr(adapter, "mutate_global_candidate"):
+                child = adapter.mutate_global_candidate(parent, params, generator)
+                child_metadata = {"origin": "mutation", "parent_rank": parent_rank}
+                next_population.append(child)
+                next_population_metadata.append(child_metadata)
+            else:
+                if isinstance(parent, ThreeSignHadamardCandidate):
+                    child, child_metadata = _mutate_three_sign_candidate_with_metadata(parent, params, generator)
+                elif isinstance(parent, PairedThreeSignHadamardCandidate):
+                    child, child_metadata = _mutate_paired_three_sign_candidate_with_metadata(parent, params, generator)
+                elif isinstance(parent, SignHadamardCandidate):
+                    child, child_metadata = _mutate_candidate_with_metadata(parent, params, generator)
+                else:
+                    raise TypeError(f"Unsupported global candidate type: {type(parent)!r}")
+                child_metadata["parent_rank"] = parent_rank
+                next_population.append(child)
+                next_population_metadata.append(child_metadata)
         population = next_population
+        population_metadata = next_population_metadata
 
     adapter.commit_global_candidate(best_candidate)
     site.current_candidate = best_candidate.clone()
@@ -453,22 +750,37 @@ def run_alternating_rotation_search(
     local_adapter: RotationSearchAdapter,
     global_adapter: GlobalRotationSearchAdapter,
     params: AlternatingSearchParams,
+    save_path: str | None = None,
 ) -> AlternatingRotationSearchResult:
     local_result = run_rotation_search(local_adapter, params.q2_params)
+    local_history_rounds: list[dict[str, Any]] = [
+        {
+            "round_index": 0,
+            "histories": local_result.histories,
+        }
+    ]
     global_site = global_adapter.global_site()
     best_global_candidate = global_site.current_candidate.clone()
     best_global_score = global_adapter.score_global_candidate(best_global_candidate)
     outer_stagnation = 0
     outer_rounds_completed = 0
     global_history: list[RotationSearchHistory] = []
+    
+    save_dir = Path(save_path).parent if save_path is not None else None
+    save_name = Path(save_path).stem if save_path is not None else None
+
     print(f"="*20)
     print(f"Starting Alternating Search!")
 
     for round_idx in range(params.outer_rounds):
         print(f"="*20)
-
+        global_epoch_time = 0
+        local_epoch_time = 0
         print(f"Round {round_idx + 1}")
+        start_time = time.perf_counter()
         qe_candidate, qe_score, qe_history = run_global_rotation_search(global_adapter, global_site, params.qe_params)
+        global_epoch_time  = time.perf_counter() - start_time
+
         qe_history.site_id = f"{qe_history.site_id}.round_{round_idx + 1}"
         global_history.append(qe_history)
         outer_rounds_completed = round_idx + 1
@@ -477,15 +789,40 @@ def run_alternating_rotation_search(
             best_global_score = qe_score
             best_global_candidate = qe_candidate.clone()
             outer_stagnation = 0
+            start_time = time.perf_counter()
             local_result = run_rotation_search(local_adapter, params.q2_refine_params)
+            local_epoch_time  = time.perf_counter() - start_time
+            local_history_rounds.append(
+                {
+                    "round_index": round_idx + 1,
+                    "histories": local_result.histories,
+                }
+            )
         else:
             outer_stagnation += 1
             if outer_stagnation >= params.outer_patience:
                 break
-
+        
+                    
+        if save_dir is not None and save_name is not None:
+            to_save: dict[str, Any] = {}
+            if hasattr(global_adapter, "rotation_state"):
+                to_save.update(global_adapter.rotation_state())
+            elif hasattr(global_adapter, "qe_param"):
+                to_save["Qe"] = global_adapter.qe_param.data.detach().cpu()
+            if hasattr(local_adapter, "q2_params"):
+                to_save["Q2s"] = {k: v.data.detach().cpu() for k, v in local_adapter.q2_params.items()}
+            to_save["global_histories"] = [_serialize_history(history) for history in global_history]
+            to_save["local_history_rounds"] = _serialize_round_histories(local_history_rounds)
+            to_save["local_epoch_time"] = local_epoch_time
+            to_save["global_epoch_time"] = global_epoch_time
+            torch.save(to_save, os.path.join(save_dir, f"{save_name}_{round_idx}.pt"))
+            print(f" saved to {save_name}_{round_idx}.pt")
+        
     return AlternatingRotationSearchResult(
         local_result=local_result,
         global_history=global_history,
+        local_history_rounds=local_history_rounds,
         best_global_candidate=best_global_candidate,
         best_global_score=best_global_score,
         outer_rounds_completed=outer_rounds_completed,
@@ -502,11 +839,7 @@ def save_rotation_search_artifacts(
     plot_path = rotation_file.with_name(f"{rotation_file.stem}_search_progress.png")
 
     serializable = {
-        site_id: {
-            "generation_indices": history.generation_indices,
-            "best_scores": history.best_scores,
-            "committed_score": history.committed_score,
-        }
+        site_id: _serialize_history(history)
         for site_id, history in result.histories.items()
     }
     torch.save(serializable, history_path)
@@ -536,16 +869,18 @@ def save_alternating_search_artifacts(
     global_history_path = rotation_file.with_name(f"{rotation_file.stem}_global_search_history.pt")
     global_plot_path = rotation_file.with_name(f"{rotation_file.stem}_global_search_progress.png")
 
-    serialized_global = [
-        {
-            "site_id": history.site_id,
-            "generation_indices": history.generation_indices,
-            "best_scores": history.best_scores,
-            "committed_score": history.committed_score,
-        }
-        for history in result.global_history
-    ]
+    serialized_global = [_serialize_history(history) for history in result.global_history]
     torch.save(serialized_global, global_history_path)
+    torch.save(
+        {
+            "site_histories": {
+                site_id: _serialize_history(history)
+                for site_id, history in result.local_result.histories.items()
+            },
+            "round_histories": _serialize_round_histories(result.local_history_rounds),
+        },
+        local["history_path"],
+    )
 
     plt.figure(figsize=(12, 6))
     for history in result.global_history:

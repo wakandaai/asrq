@@ -1,0 +1,16 @@
+[NeMo W 2026-07-25 23:10:01 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/512 [00:00<?, ?it/s]Loading calibration samples: 100%|██████████| 512/512 [00:00<00:00, 5504.51it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Traceback (most recent call last):
+  File "<stdin>", line 57, in <module>
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 133, in obtain_transform
+    obtain_rotations_for_whisper_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1352, in obtain_rotations_for_whisper_search
+    global_history_path = _save_global_rotation_search_artifacts(global_histories, save_path)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 746, in _save_global_rotation_search_artifacts
+    history_path = str(Path(rotation_path).with_name(f"{Path(rotation_path).stem}_global_search_history.pt"))
+NameError: name 'Path' is not defined

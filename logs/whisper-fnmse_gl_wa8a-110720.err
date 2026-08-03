@@ -1,0 +1,60 @@
+[NeMo W 2026-08-01 21:02:34 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/768 [00:00<?, ?it/s]Loading calibration samples:  58%|█████▊    | 449/768 [00:00<00:00, 4483.22it/s]Loading calibration samples: 100%|██████████| 768/768 [00:00<00:00, 4625.39it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[W801 21:03:26.906185013 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1235222528 bytes (free: 658374656, total: 85019328512).
+[W801 21:03:26.147960782 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 1235222528 bytes (free: 828243968, total: 85019328512).
+Traceback (most recent call last):
+  File "<stdin>", line 65, in <module>
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 138, in obtain_transform
+    obtain_rotations_for_whisper_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1456, in obtain_rotations_for_whisper_search
+    _, _, qe_history = run_global_rotation_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/search.py", line 651, in run_global_rotation_search
+    adapter.refresh_global_caches()
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1187, in refresh_global_caches
+    self._cached_fp_outputs = self._cache_fp_outputs()
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1234, in _cache_fp_outputs
+    outputs = self.model(
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/transformers/models/whisper/modeling_whisper.py", line 1314, in forward
+    loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.reshape(-1))
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/modules/loss.py", line 1400, in forward
+    return F.cross_entropy(
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/nn/functional.py", line 3555, in cross_entropy
+    return torch._C._nn.cross_entropy_loss(
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.15 GiB. GPU 0 has a total capacity of 79.18 GiB of which 789.88 MiB is free. Including non-PyTorch memory, this process has 78.40 GiB memory in use. Of the allocated memory 74.16 GiB is allocated by PyTorch, and 3.60 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+[NeMo W 2026-08-01 21:03:35 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/2048 [00:00<?, ?it/s]Loading calibration samples:  21%|██▏       | 437/2048 [00:00<00:00, 4360.91it/s]Loading calibration samples:  44%|████▍     | 906/2048 [00:00<00:00, 4552.94it/s]Loading calibration samples:  67%|██████▋   | 1362/2048 [00:00<00:00, 4552.40it/s]Loading calibration samples:  89%|████████▉ | 1819/2048 [00:00<00:00, 4555.41it/s]Loading calibration samples: 100%|██████████| 2048/2048 [00:00<00:00, 4561.89it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Error executing job with overrides: ['model=whisper', 'quantizer=gptq', 'quantizer.bits=4', 'activation_bits=8', 'transform=rotation', 'transform.type=search', 'transform.type=global_qe_qd', 'transform.path=/home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_final_nmse.pt', 'evaluate=true']
+Traceback (most recent call last):
+  File "/home/blessedg/asrq/asrq/exp.py", line 92, in main
+    transform.apply_transform(modelQ)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 277, in apply_transform
+    rotate_whisper_model(model, processor, self.audio, self.sr, path, device="cuda") # type: ignore
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1539, in rotate_whisper_model
+    rotations = torch.load(rotation_path, weights_only=False)  # load the learned rotations from file
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 1561, in load
+    with _open_file_like(f, "rb") as opened_file:
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 795, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 776, in __init__
+    super().__init__(open(name, mode))  # noqa: SIM115
+FileNotFoundError: [Errno 2] No such file or directory: '/home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_final_nmse.pt'
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

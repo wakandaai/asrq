@@ -1,0 +1,20 @@
+[NeMo W 2026-07-26 20:57:41 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/2048 [00:00<?, ?it/s]Loading calibration samples:  14%|█▍        | 284/2048 [00:00<00:00, 2829.88it/s]Loading calibration samples:  28%|██▊       | 575/2048 [00:00<00:00, 2875.46it/s]Loading calibration samples:  43%|████▎     | 888/2048 [00:00<00:00, 2989.23it/s]Loading calibration samples:  58%|█████▊    | 1191/2048 [00:00<00:00, 3001.35it/s]Loading calibration samples:  73%|███████▎  | 1494/2048 [00:00<00:00, 3011.62it/s]Loading calibration samples:  88%|████████▊ | 1801/2048 [00:00<00:00, 3030.60it/s]Loading calibration samples: 100%|██████████| 2048/2048 [00:00<00:00, 3003.57it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Error executing job with overrides: ['model=whisper', 'quantizer=gptq', 'quantizer.bits=4', 'activation_bits=8', 'transform=rotation', 'transform.type=search', 'transform.path=/home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_global_qe.pt', 'evaluate=true']
+Traceback (most recent call last):
+  File "/home/blessedg/asrq/asrq/exp.py", line 92, in main
+    transform.apply_transform(modelQ)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 236, in apply_transform
+    rotate_whisper_model(model, processor, self.audio, self.sr, path, device="cuda") # type: ignore
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1372, in rotate_whisper_model
+    fuse_whisper_layers_with_rotations(model, Qe, Qd, Q2s, device=device)  # fuse the rotations into the model weights
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 561, in fuse_whisper_layers_with_rotations
+    raise ValueError(f"Q2 for layer '{stem_name}' not found in Q2s dictionary.")
+ValueError: Q2 for layer 'model.encoder.layers.0.self_attn' not found in Q2s dictionary.
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

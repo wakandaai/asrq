@@ -26,6 +26,32 @@ from transformers import GenerationConfig
 wer_metric = evaluate.load("wer")
 
 
+TEDLIUM_PUBLIC_FALLBACK_PATH = "TwinkStart/tedlium"
+
+
+def _should_use_tedlium_public_fallback(
+    dataset_path: str,
+    dataset_name: str,
+    split: str,
+) -> bool:
+    return (
+        dataset_path == "hf-audio/esb-datasets-test-only-sorted"
+        and dataset_name == "tedlium"
+        and split == "test"
+    )
+
+
+def _load_tedlium_public_fallback(split: str):
+    print(
+        "Falling back to public TEDLIUM mirror "
+        f"'{TEDLIUM_PUBLIC_FALLBACK_PATH}' for split '{split}'."
+    )
+    return load_dataset(
+        TEDLIUM_PUBLIC_FALLBACK_PATH,
+        split=split,
+    )
+
+
 def load_openasr_dataset(dataset_path: str, dataset_name: str, split: str):
     try:
         return load_dataset(
@@ -54,13 +80,22 @@ def load_openasr_dataset(dataset_path: str, dataset_name: str, split: str):
                 f"{dataset_name}/{split}; retrying with a fresh cache dir at "
                 f"{fresh_cache_dir}."
             )
-            return load_dataset(
-                dataset_path,
-                dataset_name,
-                split=split,
-                cache_dir=fresh_cache_dir,
-                download_mode=DownloadMode.FORCE_REDOWNLOAD,
-            )
+            try:
+                return load_dataset(
+                    dataset_path,
+                    dataset_name,
+                    split=split,
+                    cache_dir=fresh_cache_dir,
+                    download_mode=DownloadMode.FORCE_REDOWNLOAD,
+                )
+            except (NonMatchingSplitsSizesError, ValueError) as exc:
+                if _should_use_tedlium_public_fallback(dataset_path, dataset_name, split):
+                    return _load_tedlium_public_fallback(split)
+                raise exc
+    except ValueError as exc:
+        if _should_use_tedlium_public_fallback(dataset_path, dataset_name, split) and "corresponds to no data" in str(exc):
+            return _load_tedlium_public_fallback(split)
+        raise
 
 
 

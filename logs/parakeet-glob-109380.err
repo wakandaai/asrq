@@ -1,0 +1,35 @@
+[NeMo W 2026-07-27 14:30:31 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/512 [00:00<?, ?it/s]Loading calibration samples:  55%|█████▌    | 284/512 [00:00<00:00, 2835.55it/s]Loading calibration samples: 100%|██████████| 512/512 [00:00<00:00, 2866.22it/s]
+[NeMo W 2026-07-27 14:31:20 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-27 14:31:20 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+[NeMo W 2026-07-27 14:31:22 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-27 14:31:22 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+[NeMo W 2026-07-27 14:31:23 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-27 14:31:23 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+[NeMo W 2026-07-27 15:19:37 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/2048 [00:00<?, ?it/s]Loading calibration samples:  14%|█▎        | 280/2048 [00:00<00:00, 2797.03it/s]Loading calibration samples:  28%|██▊       | 573/2048 [00:00<00:00, 2871.40it/s]Loading calibration samples:  42%|████▏     | 868/2048 [00:00<00:00, 2903.75it/s]Loading calibration samples:  57%|█████▋    | 1159/2048 [00:00<00:00, 2888.67it/s]Loading calibration samples:  71%|███████   | 1454/2048 [00:00<00:00, 2906.58it/s]Loading calibration samples:  85%|████████▌ | 1747/2048 [00:00<00:00, 2914.11it/s]Loading calibration samples: 100%|█████████▉| 2045/2048 [00:00<00:00, 2934.58it/s]Loading calibration samples: 100%|██████████| 2048/2048 [00:00<00:00, 2909.03it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Error executing job with overrides: ['model=whisper', 'quantizer=gptq', 'quantizer.bits=4', 'activation_bits=8', 'transform=rotation', 'transform.type=search', 'transform.type=global_qe_qd', 'transform.path=/home/blessedg/asrq/outputs/rotation/parakeet_globalqe.pt', 'evaluate=true']
+Traceback (most recent call last):
+  File "/home/blessedg/asrq/asrq/exp.py", line 92, in main
+    transform.apply_transform(modelQ)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 236, in apply_transform
+    rotate_whisper_model(model, processor, self.audio, self.sr, path, device="cuda") # type: ignore
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1416, in rotate_whisper_model
+    rotations = torch.load(rotation_path)  # load the learned rotations from file
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 1609, in load
+    raise pickle.UnpicklingError(_get_wo_message(str(e))) from None
+_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, [1mdo those steps only if you trust the source of the checkpoint[0m. 
+	(1) In PyTorch 2.6, we changed the default value of the `weights_only` argument in `torch.load` from `False` to `True`. Re-running `torch.load` with `weights_only` set to `False` will likely succeed, but it can result in arbitrary code execution. Do it only if you got the file from a trusted source.
+	(2) Alternatively, to load with `weights_only=True` please check the recommended steps in the following error message.
+	WeightsUnpickler error: Unsupported global: GLOBAL asrq.transforms.rotation.search.RotationSearchHistory was not an allowed global by default. Please use `torch.serialization.add_safe_globals([asrq.transforms.rotation.search.RotationSearchHistory])` or the `torch.serialization.safe_globals([asrq.transforms.rotation.search.RotationSearchHistory])` context manager to allowlist this global if you trust this class/function.
+
+Check the documentation of torch.load to learn more about types accepted by default with weights_only https://pytorch.org/docs/stable/generated/torch.load.html.
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

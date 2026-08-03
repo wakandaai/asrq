@@ -1,0 +1,47 @@
+[NeMo W 2026-07-26 22:41:32 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+
+Loading calibration samples:   0%|          | 0/512 [00:00<?, ?it/s]
+Loading calibration samples: 100%|██████████| 512/512 [00:00<00:00, 5625.78it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Traceback (most recent call last):
+  File "<stdin>", line 64, in <module>
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 133, in obtain_transform
+    obtain_rotations_for_whisper_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1315, in obtain_rotations_for_whisper_search
+    alternating_result = run_alternating_rotation_search(
+  File "/home/blessedg/asrq/asrq/transforms/rotation/search.py", line 468, in run_alternating_rotation_search
+    save_dir= save_path.parent
+AttributeError: 'str' object has no attribute 'parent'
+[NeMo W 2026-07-27 00:26:05 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+
+Loading calibration samples:   0%|          | 0/2048 [00:00<?, ?it/s]
+Loading calibration samples:  28%|██▊       | 568/2048 [00:00<00:00, 5676.57it/s]
+Loading calibration samples:  57%|█████▋    | 1158/2048 [00:00<00:00, 5801.63it/s]
+Loading calibration samples:  85%|████████▌ | 1741/2048 [00:00<00:00, 5812.68it/s]
+Loading calibration samples: 100%|██████████| 2048/2048 [00:00<00:00, 5808.60it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+Error executing job with overrides: ['model=whisper', 'quantizer=gptq', 'quantizer.bits=4', 'activation_bits=8', 'transform=rotation', 'transform.type=search', 'transform.path=/home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_alternating.pt', 'evaluate=true']
+Traceback (most recent call last):
+  File "/home/blessedg/asrq/asrq/exp.py", line 92, in main
+    transform.apply_transform(modelQ)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 236, in apply_transform
+    rotate_whisper_model(model, processor, self.audio, self.sr, path, device="cuda") # type: ignore
+  File "/home/blessedg/asrq/asrq/transforms/rotation/whisper_utils.py", line 1370, in rotate_whisper_model
+    rotations = torch.load(rotation_path)  # load the learned rotations from file
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 1561, in load
+    with _open_file_like(f, "rb") as opened_file:
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 795, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/blessedg/miniconda3/envs/asrq/lib/python3.10/site-packages/torch/serialization.py", line 776, in __init__
+    super().__init__(open(name, mode))  # noqa: SIM115
+FileNotFoundError: [Errno 2] No such file or directory: '/home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_alternating.pt'
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

@@ -1,0 +1,69 @@
+whisper glob search
+[NeMo I 2026-08-01 21:02:38 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+save_path : /home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_final_nmse.pt
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 162 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.
+total calilbration samples 768 batch_size 64
+starting global_qe  save_path : /home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_final_nmse.pt
+running global search
+whisper glob quantize
+[NeMo I 2026-08-01 21:03:39 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+quantizer:
+  name: gptq
+  bits: 4
+  group_size: 128
+  block_size: 128
+  symmetric: true
+  percdamp: 0.01
+model:
+  name: openai/whisper-large-v3
+  exclude_modules:
+  - proj_out
+  eval_batch_size: 64
+  generate_fn: generate_whisper
+transform:
+  name: rotation
+  type: global_qe_qd
+  search_mode: local_q2
+  num_samples: 800
+  epochs: 1
+  learning_rate: 0.01
+  batch_size: 4
+  path: /home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_final_nmse.pt
+  learn_rotation: false
+  use: true
+  population_size: 8
+  elite_count: 2
+  parent_pool_fraction: 0.5
+  generations: 16
+  patience: 4
+  outer_rounds: 1
+  outer_patience: 1
+  qe_min_delta: 0.0
+  q2_refine_generations: 16
+  qe_generations: 16
+  qe_patience: 4
+  mutate_both_probability: 0.1
+  large_mutation_probability: 0.1
+  small_mutation_min: 1
+  small_mutation_max: 2
+  medium_mutation_min: 4
+  medium_mutation_max: 8
+  large_mutation_fraction: 0.25
+seed: 42
+calibration:
+  num_samples: 2048
+evaluate: true
+method: asrq
+activation_bits: 8
+create_audio_files: false
+
+Running ASRQ experiment:
+  Quantizer:      gptq
+  Model:          openai/whisper-large-v3
+  Transform:      rotation
+  Seed:           42
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 162 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.

@@ -15,7 +15,8 @@ from asrq.transforms.rotation.utils import (
     STEQuantize,
     convert_model_layernorms_to_rmsnorms,
     get_orthogonal_matrix,
-    fuse_normalization_weights_and_bias_into_adjacent_linears
+    fuse_normalization_weights_and_bias_into_adjacent_linears,
+    set_rotation_fake_quant_state,
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -37,6 +38,26 @@ except ImportError:
     pass
 from datasets import load_dataset
 from itertools import islice
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+from asrq.transforms.rotation.search import (
+    AlternatingSearchParams,
+    GlobalRotationSearchSite,
+    PairedThreeSignHadamardCandidate,
+    RotationSearchParams,
+    RotationSearchSite,
+    SignHadamardCandidate,
+    normalized_hadamard_matrix,
+    random_paired_three_sign_candidate,
+    random_sign_candidate,
+    random_three_sign_candidate,
+    run_alternating_rotation_search,
+    run_global_rotation_search,
+    run_rotation_search,
+    save_rotation_search_artifacts,
+)
 
 
 
@@ -147,6 +168,39 @@ def canaryqwen_loss_fn(model, batch):
     return loss
 
 
+def _clone_tree(value, device: Optional[Union[str, torch.device]] = None):
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().clone()
+        if device is not None:
+            tensor = tensor.to(device)
+        return tensor
+    if isinstance(value, dict):
+        return {k: _clone_tree(v, device=device) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_clone_tree(v, device=device) for v in value)
+    if isinstance(value, list):
+        return [_clone_tree(v, device=device) for v in value]
+    return value
+
+
+def _extract_hidden_state(output):
+    if isinstance(output, tuple):
+        return output[0]
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state
+    return output
+
+
+def _replace_first_arg(args: Tuple[torch.Tensor, ...], hidden: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    return (hidden,) + tuple(_clone_tree(arg, device="cpu") for arg in args[1:])
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        return tensor.device
+    return torch.device("cpu")
+
+
 def modify_linear_with_rotation_param(
         linear: Union[nn.Linear, RMSNormFusedM, nn.Conv1d],
         Q: nn.Parameter,
@@ -160,8 +214,8 @@ def modify_linear_with_rotation_param(
 
     def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
         # quantize the input activations with STE quantization
-        if include_activation_quant:
-            x = STEQuantize.apply(x, bit=8) # type: ignore
+        if getattr(self, "_rotation_quantize_activation", include_activation_quant):
+            x = STEQuantize.apply(x, bit=getattr(self, "_rotation_activation_bits", 8)) # type: ignore
         # Apply the rotation to the weight
         rotated_bias = self.bias
         rotated_weight = self.weight
@@ -204,7 +258,12 @@ def modify_linear_with_rotation_param(
                 temp = rotated_weight.reshape(-1, org_shape[-1]//hdim, hdim)
                 temp = temp.to(Q2.dtype) @ Q2
                 rotated_weight = temp.reshape(org_shape)
-        
+        if getattr(self, "_rotation_quantize_weight", False):
+            rotated_weight = STEQuantize.apply(
+                rotated_weight,
+                bit=getattr(self, "_rotation_weight_bits", bit),
+            )
+
         if for_norm_out and rotated_weight.shape != orig_shape:
             w = rotated_weight
             if rotated_bias is not None: rotated_bias = rotated_bias.squeeze(0).to(x.dtype)
@@ -222,7 +281,11 @@ def modify_linear_with_rotation_param(
             return F.rms_norm(x, normalized_shape=self.normalized_shape, eps=self.eps) @  w.to(x.dtype) + (rotated_bias if self.bias is not None else 0.0)
         else:
             raise Exception()
-        
+    linear._rotation_search_ready = True
+    linear._rotation_quantize_weight = False
+    linear._rotation_quantize_activation = include_activation_quant
+    linear._rotation_weight_bits = bit
+    linear._rotation_activation_bits = 8
     linear.forward = types.MethodType(modified_forward, linear)
 
 
@@ -855,6 +918,654 @@ def transcribe(model, filepath):
     )
     transcript = (model.tokenizer.ids_to_text(answer_ids[0].cpu()))
     return transcript
+
+
+def _prepare_canary_llm_inputs(
+    model: nn.Module,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = next(model.parameters()).device
+    audios = batch["audios"].to(device)
+    audio_lens = batch["audio_lens"].to(device)
+    tokens = batch["tokens"].to(device)
+
+    audio_embeds, audio_embed_lens = model.perception(  # type: ignore[attr-defined]
+        input_signal=audios, input_signal_length=audio_lens,
+    )
+    audio_embeds = [audio_embeds[i, :elen] for i, elen in enumerate(audio_embed_lens)]
+
+    tokens_to_embed = tokens.where(tokens != model.audio_locator_tag_id, 0)
+    token_embeds = model.embed_tokens(tokens_to_embed)
+
+    input_embeds, target_ids, attention_mask = replace_placeholders_and_build_targets(
+        input_ids=tokens,
+        embeds=token_embeds,
+        padding_id=model.text_pad_id,
+        placeholder_id=model.audio_locator_tag_id,
+        replacements=audio_embeds,
+        target_ids=tokens.where(tokens != model.text_pad_id, -100),
+    )
+
+    input_embeds = input_embeds[:, :-1]
+    attention_mask = attention_mask[:, :-1]
+    target_ids = target_ids[:, 1:]  # type: ignore
+    return input_embeds, attention_mask, target_ids
+
+
+def _average_canary_fake_quant_loss(
+    model: nn.Module,
+    calibration_batches: List[dict[str, torch.Tensor]],
+    *,
+    activation_bits: int,
+    weight_bits: int,
+) -> float:
+    set_rotation_fake_quant_state(
+        model,
+        enabled=True,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+    )
+    try:
+        total_loss = 0.0
+        with torch.no_grad():
+            for batch in calibration_batches:
+                total_loss += float(canaryqwen_loss_fn(model, _clone_tree(batch)).item())
+    finally:
+        set_rotation_fake_quant_state(
+            model,
+            enabled=False,
+            activation_bits=activation_bits,
+            weight_bits=weight_bits,
+        )
+    return total_loss / max(len(calibration_batches), 1)
+
+
+def _save_global_rotation_search_artifacts(
+    histories: List[dict[str, object]],
+    rotation_path: str,
+) -> str:
+    history_path = str(Path(rotation_path).with_name(f"{Path(rotation_path).stem}_global_search_history.pt"))
+    torch.save(histories, history_path)
+    return history_path
+
+
+class _CanaryQwenRotationSearchAdapter:
+    def __init__(
+        self,
+        model: nn.Module,
+        calibration_batches: List[dict[str, torch.Tensor]],
+        q2_params: Dict[str, nn.Parameter],
+        sites: List[RotationSearchSite],
+        *,
+        device: str,
+        weight_bits: int,
+        activation_bits: int,
+    ) -> None:
+        self.model = model
+        self.calibration_batches = calibration_batches
+        self.q2_params = q2_params
+        self._sites = sites
+        self.device = device
+        self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
+        self._block_cache: Dict[str, List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor], torch.Tensor]]] = {}
+        self._named_modules = dict(model.named_modules())
+        self._site_positions = {site.site_id: index for index, site in enumerate(sites)}
+        self._current_site_index: Optional[int] = None
+        self._pending_site_index: int = 0
+        self._current_site_inputs: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]] = []
+        self._cached_decoder_first_inputs: Optional[List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]] = None
+
+    def sites(self) -> List[RotationSearchSite]:
+        return self._sites
+
+    def refresh_caches(self) -> None:
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        if not self._sites:
+            self._block_cache = {}
+            self._current_site_inputs = []
+            self._current_site_index = None
+            self._pending_site_index = 0
+            self._cached_decoder_first_inputs = None
+            return
+
+        if self._pending_site_index >= len(self._sites):
+            self._block_cache = {}
+            self._current_site_inputs = []
+            self._current_site_index = None
+            self._pending_site_index = 0
+            self._cached_decoder_first_inputs = None
+            return
+
+        target_index = self._pending_site_index
+        target_site = self._sites[target_index]
+
+        if self._current_site_index is None or target_index == 0:
+            current_inputs = self._capture_first_inputs_for_site(target_site)
+        else:
+            current_site = self._sites[self._current_site_index]
+            if target_site.block_id == current_site.block_id:
+                current_inputs = self._current_site_inputs
+            elif self._is_first_site_of_pipeline(target_site):
+                current_inputs = self._capture_first_inputs_for_site(target_site)
+            elif target_index == self._current_site_index + 1:
+                current_inputs = self._advance_to_next_block_inputs(self._current_site_index, self._current_site_inputs)
+            else:
+                current_inputs = self._capture_first_inputs_for_site(target_site)
+
+        self._current_site_inputs = current_inputs
+        self._current_site_index = target_index
+        self._block_cache = {
+            target_site.block_id: self._build_site_cache_entries(target_index, current_inputs)
+        }
+
+    def score_site_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> float:
+        self._apply_candidate(site, candidate)
+        block = self._named_modules[site.block_id]
+        numerator = 0.0
+        denominator = 0.0
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=True,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        with torch.no_grad():
+            for args, kwargs, fp_output in self._block_cache[site.block_id]:
+                block_device = _module_device(block)
+                out = block(
+                    *_clone_tree(args, device=block_device),
+                    **_clone_tree(kwargs, device=block_device),
+                )
+                hidden = _extract_hidden_state(out)
+                fp_output_gpu = fp_output.to(hidden.device, dtype=torch.float32)
+                diff = hidden.float() - fp_output_gpu
+                numerator += diff.pow(2).sum().item()
+                denominator += fp_output_gpu.pow(2).sum().item()
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+        return numerator / max(denominator, 1e-12)
+
+    def commit_site_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> None:
+        self._apply_candidate(site, candidate)
+        site.current_candidate = candidate.clone()
+        self._pending_site_index = self._site_positions[site.site_id] + 1
+        if site.block_id.startswith("perception.encoder.layers."):
+            self._cached_decoder_first_inputs = None
+
+    def _apply_candidate(
+        self,
+        site: RotationSearchSite,
+        candidate: SignHadamardCandidate,
+    ) -> None:
+        q2 = self.q2_params[site.site_id]
+        rotation = candidate.to_rotation(site.base_h, device=q2.device, dtype=q2.dtype)
+        q2.data.copy_(rotation)
+
+    def _capture_first_encoder_block_inputs(self) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]:
+        blocks = self.model.perception.encoder.layers  # type: ignore[attr-defined]
+        captured: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]] = []
+
+        class Catcher(nn.Module):
+            def __init__(self, module: nn.Module) -> None:
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args, **kwargs):
+                captured.append((_clone_tree(args, device="cpu"), _clone_tree(kwargs, device="cpu")))
+                raise Exception("Caught input")
+
+            def __getattr__(self, name):
+                if name == "module":
+                    return super().__getattr__(name)
+                return getattr(self.module, name)
+
+            def __getattr__(self, name):
+                if name == "module":
+                    return super().__getattr__(name)
+                return getattr(self.module, name)
+
+        original = blocks[0]
+        blocks[0] = Catcher(original)
+        try:
+            for batch in self.calibration_batches:
+                try:
+                    self.model.perception(  # type: ignore[attr-defined]
+                        input_signal=batch["audios"].to(self.device),
+                        input_signal_length=batch["audio_lens"].to(self.device),
+                    )
+                except Exception as exc:
+                    assert str(exc) == "Caught input", str(exc)
+        finally:
+            blocks[0] = original
+        return captured
+
+    def _capture_first_decoder_block_inputs(self) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]:
+        if self._cached_decoder_first_inputs is not None:
+            return self._cached_decoder_first_inputs
+
+        blocks = self.model.llm.base_model.model.model.layers  # type: ignore[attr-defined]
+        captured: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]] = []
+        original = blocks[0]
+
+        def catcher_forward(_self, *args, **kwargs):
+            captured.append((_clone_tree(args, device="cpu"), _clone_tree(kwargs, device="cpu")))
+            raise Exception("Caught input")
+
+        original_forward = original.forward
+        original.forward = types.MethodType(catcher_forward, original)
+        try:
+            for batch in self.calibration_batches:
+                input_embeds, attention_mask, _ = _prepare_canary_llm_inputs(self.model, batch)
+                try:
+                    self.model(input_embeds, attention_mask=attention_mask)
+                except Exception as exc:
+                    assert str(exc) == "Caught input", str(exc)
+        finally:
+            original.forward = original_forward
+        self._cached_decoder_first_inputs = captured
+        return captured
+
+    def _capture_first_inputs_for_site(
+        self,
+        site: RotationSearchSite,
+    ) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]:
+        if site.block_id.startswith("perception.encoder.layers."):
+            return self._capture_first_encoder_block_inputs()
+        return self._capture_first_decoder_block_inputs()
+
+    def _is_first_site_of_pipeline(self, site: RotationSearchSite) -> bool:
+        return site.site_id in {
+            "perception.encoder.layers.0.self_attn",
+            "llm.base_model.model.model.layers.0.self_attn",
+        }
+
+    def _get_block_for_site_index(self, index: int) -> nn.Module:
+        site = self._sites[index]
+        if site.block_id.startswith("perception.encoder.layers."):
+            layer_index = int(site.block_id.split(".")[3])
+            return self.model.perception.encoder.layers[layer_index]  # type: ignore[attr-defined]
+        layer_index = int(site.block_id.split(".")[5])
+        return self.model.llm.base_model.model.model.layers[layer_index]  # type: ignore[attr-defined]
+
+    def _run_block_for_site_index(
+        self,
+        index: int,
+        args: Tuple[torch.Tensor, ...],
+        kwargs: Dict[str, torch.Tensor],
+    ):
+        block = self._get_block_for_site_index(index)
+        block_device = _module_device(block)
+        replay_args = _clone_tree(args, device=block_device)
+        replay_kwargs = _clone_tree(kwargs, device=block_device)
+        if self._sites[index].block_id.startswith("perception.encoder.layers."):
+            return block(**replay_kwargs)
+        return block(*replay_args, **replay_kwargs)
+
+    def _build_site_cache_entries(
+        self,
+        index: int,
+        current_inputs: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]],
+    ) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor], torch.Tensor]]:
+        entries = []
+        with torch.no_grad():
+            for args, kwargs in current_inputs:
+                out = self._run_block_for_site_index(index, args, kwargs)
+                hidden = _extract_hidden_state(out).detach().cpu()
+                entries.append((_clone_tree(args, device="cpu"), _clone_tree(kwargs, device="cpu"), hidden.clone()))
+        return entries
+
+    def _advance_to_next_block_inputs(
+        self,
+        index: int,
+        current_inputs: List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]],
+    ) -> List[Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]]:
+        next_inputs = []
+        with torch.no_grad():
+            for args, kwargs in current_inputs:
+                out = self._run_block_for_site_index(index, args, kwargs)
+                hidden = _extract_hidden_state(out).detach().cpu()
+                if self._sites[index].block_id.startswith("perception.encoder.layers."):
+                    next_kwargs = _clone_tree(kwargs, device="cpu")
+                    next_kwargs["x"] = hidden.clone()
+                    next_inputs.append((tuple(), next_kwargs))
+                else:
+                    next_inputs.append((_replace_first_arg(args, hidden.clone()), _clone_tree(kwargs, device="cpu")))
+        return next_inputs
+
+
+class _CanaryQwenGlobalQeQdSearchAdapter:
+    def __init__(
+        self,
+        model: nn.Module,
+        calibration_batches: List[dict[str, torch.Tensor]],
+        qe_param: nn.Parameter,
+        qd_param: nn.Parameter,
+        *,
+        activation_bits: int,
+        weight_bits: int,
+        global_site: Optional[GlobalRotationSearchSite] = None,
+    ) -> None:
+        self.model = model
+        self.calibration_batches = calibration_batches
+        self.qe_param = qe_param
+        self.qd_param = qd_param
+        self.activation_bits = activation_bits
+        self.weight_bits = weight_bits
+        self._global_site = global_site or GlobalRotationSearchSite(
+            site_id="encoder_decoder.qe_qd",
+            dimension=qe_param.shape[0],
+            base_h=normalized_hadamard_matrix(qe_param.shape[0]),
+            current_candidate=random_paired_three_sign_candidate(
+                qe_param.shape[0],
+                torch.Generator().manual_seed(0),
+            ),
+        )
+
+    def global_site(self) -> GlobalRotationSearchSite:
+        return self._global_site
+
+    def refresh_global_caches(self) -> None:
+        set_rotation_fake_quant_state(
+            self.model,
+            enabled=False,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+
+    def score_global_candidate(self, candidate: PairedThreeSignHadamardCandidate) -> float:
+        self._apply_candidate(candidate)
+        return _average_canary_fake_quant_loss(
+            self.model,
+            self.calibration_batches,
+            activation_bits=self.activation_bits,
+            weight_bits=self.weight_bits,
+        )
+
+    def commit_global_candidate(self, candidate: PairedThreeSignHadamardCandidate) -> None:
+        self._apply_candidate(candidate)
+        self._global_site.current_candidate = candidate.clone()
+
+    def _apply_candidate(self, candidate: PairedThreeSignHadamardCandidate) -> None:
+        qe_rotation = candidate.qe.to_rotation(
+            normalized_hadamard_matrix(self.qe_param.shape[0]),
+            device=self.qe_param.device,
+            dtype=self.qe_param.dtype,
+        )
+        qd_rotation = candidate.qd.to_rotation(
+            normalized_hadamard_matrix(self.qd_param.shape[0]),
+            device=self.qd_param.device,
+            dtype=self.qd_param.dtype,
+        )
+        self.qe_param.data.copy_(qe_rotation)
+        self.qd_param.data.copy_(qd_rotation)
+
+    def initialize_global_population(
+        self,
+        params: RotationSearchParams,
+        generator: torch.Generator,
+    ) -> list[PairedThreeSignHadamardCandidate]:
+        population = [self._global_site.current_candidate.clone()]
+        while len(population) < params.population_size:
+            population.append(
+                PairedThreeSignHadamardCandidate(
+                    qe=random_three_sign_candidate(self.qe_param.shape[0], generator),
+                    qd=random_three_sign_candidate(self.qd_param.shape[0], generator),
+                )
+            )
+        return population
+
+    def mutate_global_candidate(
+        self,
+        candidate: PairedThreeSignHadamardCandidate,
+        params: RotationSearchParams,
+        generator: torch.Generator,
+    ) -> Any:
+        from asrq.transforms.rotation.search import mutate_paired_three_sign_candidate
+        return mutate_paired_three_sign_candidate(candidate, params, generator)
+
+    def rotation_state(self) -> dict[str, torch.Tensor]:
+        return {
+            "Qe": self.qe_param.data.detach().cpu(),
+            "Qd": self.qd_param.data.detach().cpu(),
+        }
+
+
+def obtain_rotations_for_canary_qwen_search(
+    model,
+    test_audio_path: str,
+    calib_samples: int,
+    batch_size: int,
+    search_params: RotationSearchParams,
+    save_path: str,
+    *,
+    device: str = "cuda",
+    weight_bits: int = 4,
+    activation_bits: int = 16,
+    search_mode: str = "local_q2",
+    qe_search_params: Optional[RotationSearchParams] = None,
+    q2_refine_search_params: Optional[RotationSearchParams] = None,
+    outer_rounds: int = 1,
+    outer_patience: int = 1,
+    qe_min_delta: float = 0.0,
+) -> None:
+    model.to(device)
+    with torch.no_grad():
+        orig_transcription = transcribe(model, test_audio_path)
+        prepare_canaryqwen_for_rotation(model)
+        prep_transcription = transcribe(model, test_audio_path)
+        assert orig_transcription == prep_transcription, (
+            f"Transcriptions do not match after preparation steps!\n"
+            f"Original: '{orig_transcription}'\n"
+            f"After Preparation: '{prep_transcription}'"
+        )
+
+    hidden_size = model.llm.config.hidden_size
+    encoder_hidden_size = model.perception.encoder.layers[0].conv.d_model
+    num_decoder_layers = model.llm.config.num_hidden_layers
+    num_encoder_layers = len(model.perception.encoder.layers)
+    seed = torch.initial_seed() & 0xFFFFFFFF
+    generator = torch.Generator().manual_seed(search_params.seed)
+
+    qe_base_h = normalized_hadamard_matrix(encoder_hidden_size)
+    qd_base_h = normalized_hadamard_matrix(hidden_size)
+    qe_candidate = random_three_sign_candidate(encoder_hidden_size, generator)
+    qd_candidate = random_three_sign_candidate(hidden_size, generator)
+    qe_param = nn.Parameter(
+        qe_candidate.to_rotation(qe_base_h, device=device, dtype=torch.float32),
+        requires_grad=False,
+    )
+    qd_param = nn.Parameter(
+        qd_candidate.to_rotation(qd_base_h, device=device, dtype=torch.float32),
+        requires_grad=False,
+    )
+
+    q2_rotation_params: Dict[str, nn.Parameter] = {}
+    sites: List[RotationSearchSite] = []
+
+    for i in range(num_encoder_layers):
+        head_dim = model.perception.encoder.layers[i].self_attn.d_k
+        base_h = normalized_hadamard_matrix(head_dim)
+        candidate = random_sign_candidate(head_dim, generator)
+        stem = f"perception.encoder.layers.{i}.self_attn"
+        q2_tensor = candidate.to_rotation(base_h, device=device, dtype=torch.float64)
+        q2_rotation_params[stem] = nn.Parameter(q2_tensor, requires_grad=False)
+        if search_mode not in {"global_qe", "global_qe_qd"}:
+            sites.append(
+                RotationSearchSite(
+                    site_id=stem,
+                    block_id=f"perception.encoder.layers.{i}",
+                    dimension=head_dim,
+                    base_h=base_h,
+                    current_candidate=candidate,
+                )
+            )
+
+    for i in range(num_decoder_layers):
+        head_dim = model.llm.base_model.model.model.layers[i].self_attn.head_dim
+        base_h = normalized_hadamard_matrix(head_dim)
+        candidate = random_sign_candidate(head_dim, generator)
+        stem = f"llm.base_model.model.model.layers.{i}.self_attn"
+        q2_tensor = candidate.to_rotation(base_h, device=device, dtype=torch.float64)
+        q2_rotation_params[stem] = nn.Parameter(q2_tensor, requires_grad=False)
+        if search_mode not in {"global_qe", "global_qe_qd"}:
+            sites.append(
+                RotationSearchSite(
+                    site_id=stem,
+                    block_id=f"llm.base_model.model.model.layers.{i}",
+                    dimension=head_dim,
+                    base_h=base_h,
+                    current_candidate=candidate,
+                )
+            )
+
+    modify_canaryqwen_layers_with_rotation_params(
+        model,
+        qe_param,
+        qd_param,
+        q2_rotation_params,
+        include_weight_quant=False,
+        include_activation_quant=False,
+    )
+    monkey_patch_canaryqwen_for_train(model, qe_param, qd_param)
+    set_rotation_fake_quant_state(
+        model,
+        enabled=False,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+    )
+
+    with torch.no_grad():
+        rot_transcription = transcribe(model, "outputs/rotation_test_audio.wav")
+        assert orig_transcription == rot_transcription, (
+            f"Transcriptions do not match after applying rotations!\n"
+            f"Original: '{orig_transcription}'\n"
+            f"After Rotation: '{rot_transcription}'"
+        )
+
+    calib_ds = CanaryQwenCalibrationDataset(model, num_samples=calib_samples, seed=seed)
+    collate_fn = partial(canaryqwen_collate_fn, pad_id=model.text_pad_id)
+    train_loader = torch.utils.data.DataLoader(
+        calib_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
+    )
+    calibration_batches = [{k: v.cpu() for k, v in batch.items()} for batch in train_loader]
+
+    result: Optional[object] = None
+    global_histories: list[dict[str, object]] = []
+
+    global_adapter = _CanaryQwenGlobalQeQdSearchAdapter(
+        model,
+        calibration_batches,
+        qe_param,
+        qd_param,
+        activation_bits=activation_bits,
+        weight_bits=weight_bits,
+        global_site=GlobalRotationSearchSite(
+            site_id="encoder_decoder.qe_qd",
+            dimension=max(encoder_hidden_size, hidden_size),
+            base_h=qe_base_h,
+            current_candidate=PairedThreeSignHadamardCandidate(
+                qe=qe_candidate.clone(),
+                qd=qd_candidate.clone(),
+            ),
+        ),
+    )
+
+    if search_mode in {"global_qe", "global_qe_qd"}:
+        global_search_params = qe_search_params or search_params
+        _, _, qe_history = run_global_rotation_search(
+            global_adapter,
+            global_adapter.global_site(),
+            global_search_params,
+        )
+        global_histories = [
+            {
+                "site_id": qe_history.site_id,
+                "generation_indices": qe_history.generation_indices,
+                "best_scores": qe_history.best_scores,
+                "generation_durations_sec": qe_history.generation_durations_sec,
+                "committed_score": qe_history.committed_score,
+            }
+        ]
+    else:
+        adapter = _CanaryQwenRotationSearchAdapter(
+            model,
+            calibration_batches,
+            q2_rotation_params,
+            sites,
+            device=device,
+            weight_bits=weight_bits,
+            activation_bits=activation_bits,
+        )
+
+    if search_mode == "alternating":
+        if qe_search_params is None or q2_refine_search_params is None:
+            raise ValueError("Alternating search requires qe_search_params and q2_refine_search_params.")
+        alternating_result = run_alternating_rotation_search(
+            adapter,
+            global_adapter,
+            AlternatingSearchParams(
+                q2_params=search_params,
+                qe_params=qe_search_params,
+                q2_refine_params=q2_refine_search_params,
+                outer_rounds=outer_rounds,
+                outer_patience=outer_patience,
+                qe_min_delta=qe_min_delta,
+            ),
+            save_path,
+        )
+        result = alternating_result.local_result
+        global_histories = [
+            {
+                "site_id": history.site_id,
+                "generation_indices": history.generation_indices,
+                "best_scores": history.best_scores,
+                "generation_durations_sec": history.generation_durations_sec,
+                "committed_score": history.committed_score,
+            }
+            for history in alternating_result.global_history
+        ]
+    elif search_mode == "local_q2":
+        result = run_rotation_search(adapter, search_params)
+    elif search_mode not in {"global_qe", "global_qe_qd"}:
+        raise ValueError(f"Unsupported canary_qwen search_mode: {search_mode}")
+
+    to_save = {
+        "Qe": qe_param.data.detach().cpu(),
+        "Qd": qd_param.data.detach().cpu(),
+        "Q2s": {k: v.data.detach().cpu() for k, v in q2_rotation_params.items()},
+        "global_histories": global_histories,
+    }
+    torch.save(to_save, save_path)
+    if result is not None:
+        artifacts = save_rotation_search_artifacts(result, save_path)
+        print(f"[rotation-search] saved history to {artifacts['history_path']}")
+        print(f"[rotation-search] saved plot to {artifacts['plot_path']}")
+    if global_histories:
+        global_history_path = _save_global_rotation_search_artifacts(global_histories, save_path)
+        print(f"[rotation-search] saved global history to {global_history_path}")
 
 
 def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:int, epochs:int, batch_size:int, lr:float, save_path:str):

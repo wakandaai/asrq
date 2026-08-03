@@ -221,15 +221,15 @@ with initialize_config_dir(version_base=None, config_dir=os.path.abspath(CONFIG_
         "transform=rotation",
         "transform.type=search",
         "transform.search_mode=alternating",
-        "transform.num_samples=800",
+        "transform.num_samples=128",
         "transform.batch_size=64",
         "transform.population_size=8",
         "transform.elite_count=2",
-        "transform.generations=12",
+        "transform.generations=2",
         "transform.patience=4",
         "transform.qe_generations=8",
         "transform.qe_patience=4",
-        "transform.q2_refine_generations=6",
+        "transform.q2_refine_generations=2",
         "transform.outer_rounds=3",
         "transform.outer_patience=1",
         "transform.qe_min_delta=1e-3",
@@ -255,3 +255,5 @@ transform.obtain_transform(modelQ)
 
 print("Saved rotation to:", transform.cfg.path)
 PY
+
+

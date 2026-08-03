@@ -1,0 +1,2 @@
+whisper alternating search
+[NeMo I 2026-07-27 12:22:01 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.

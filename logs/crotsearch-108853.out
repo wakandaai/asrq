@@ -1,0 +1,1 @@
+[NeMo I 2026-07-25 11:01:12 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.

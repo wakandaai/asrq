@@ -16,6 +16,7 @@ from asrq.transforms.rotation import (
     rotate_whisper_model, 
     obtain_rotations_for_canary_qwen, 
     rotate_canary_qwen, 
+    obtain_rotations_for_canary_qwen_search,
     obtain_rotations_for_parakeet, 
     rotate_parakeet,
     obtain_rotations_for_whisper_search,
@@ -49,6 +50,7 @@ class RotationTransformConfig(TransformConfig):
         self.q2_refine_generations = getattr(cfg, "q2_refine_generations", self.generations)
         self.qe_generations = getattr(cfg, "qe_generations", self.generations)
         self.qe_patience = getattr(cfg, "qe_patience", self.patience)
+        self.global_score_metric = getattr(cfg, "global_score_metric", "task_loss")
         self.mutate_both_probability = cfg.mutate_both_probability
         self.large_mutation_probability = cfg.large_mutation_probability
         self.small_mutation_min = cfg.small_mutation_min
@@ -73,6 +75,7 @@ class RotationTransformConfig(TransformConfig):
             medium_mutation_min=self.medium_mutation_min,
             medium_mutation_max=self.medium_mutation_max,
             large_mutation_fraction=self.large_mutation_fraction,
+            global_score_metric=self.global_score_metric,
             seed=seed,
         )
 
@@ -90,6 +93,7 @@ class RotationTransformConfig(TransformConfig):
             medium_mutation_min=self.medium_mutation_min,
             medium_mutation_max=self.medium_mutation_max,
             large_mutation_fraction=self.large_mutation_fraction,
+            global_score_metric=self.global_score_metric,
             seed=seed,
         )
 
@@ -107,6 +111,7 @@ class RotationTransformConfig(TransformConfig):
             medium_mutation_min=self.medium_mutation_min,
             medium_mutation_max=self.medium_mutation_max,
             large_mutation_fraction=self.large_mutation_fraction,
+            global_score_metric=self.global_score_metric,
             seed=seed,
         )
 
@@ -129,7 +134,7 @@ class RotationTransform(BaseTransform):
             assert isinstance(model, WhisperForConditionalGeneration)
             if self.cfg.type == "search":
                 seed = int(torch.initial_seed() & 0xFFFFFFFF)
-                if self.cfg.search_mode == "alternating":
+                if self.cfg.search_mode in {"alternating", "global_qe", "global_qe_qd"}:
                     obtain_rotations_for_whisper_search(
                         model,
                         processor,
@@ -143,7 +148,11 @@ class RotationTransform(BaseTransform):
                         activation_bits=self.cfg.abits,
                         search_mode=self.cfg.search_mode,
                         qe_search_params=self.cfg.qe_search_params(seed + 1),
-                        q2_refine_search_params=self.cfg.q2_refine_search_params(seed + 2),
+                        q2_refine_search_params=(
+                            self.cfg.q2_refine_search_params(seed + 2)
+                            if self.cfg.search_mode == "alternating"
+                            else None
+                        ),
                         outer_rounds=self.cfg.outer_rounds,
                         outer_patience=self.cfg.outer_patience,
                         qe_min_delta=self.cfg.qe_min_delta,
@@ -160,6 +169,7 @@ class RotationTransform(BaseTransform):
                         self.cfg.path,
                         weight_bits=self.cfg.wbits,
                         activation_bits=self.cfg.abits,
+                        search_mode=self.cfg.search_mode,
                     )
             else:
                 obtain_rotations_for_whisper(
@@ -170,7 +180,7 @@ class RotationTransform(BaseTransform):
         elif self.cfg.model_name == ModelNames.NVIDIA_PARAKEET_CTC_1_1B:
             if self.cfg.type == "search":
                 seed = int(torch.initial_seed() & 0xFFFFFFFF)
-                if self.cfg.search_mode == "alternating":
+                if self.cfg.search_mode in {"alternating", "global_qe", "global_qe_qd"}:
                     obtain_rotations_for_parakeet_search(
                         model,
                         "outputs/rotation_test_audio.wav",
@@ -183,7 +193,11 @@ class RotationTransform(BaseTransform):
                         activation_bits=self.cfg.abits,
                         search_mode=self.cfg.search_mode,
                         qe_search_params=self.cfg.qe_search_params(seed + 1),
-                        q2_refine_search_params=self.cfg.q2_refine_search_params(seed + 2),
+                        q2_refine_search_params=(
+                            self.cfg.q2_refine_search_params(seed + 2)
+                            if self.cfg.search_mode == "alternating"
+                            else None
+                        ),
                         outer_rounds=self.cfg.outer_rounds,
                         outer_patience=self.cfg.outer_patience,
                         qe_min_delta=self.cfg.qe_min_delta,
@@ -199,6 +213,7 @@ class RotationTransform(BaseTransform):
                         device="cuda",
                         weight_bits=self.cfg.wbits,
                         activation_bits=self.cfg.abits,
+                        search_mode=self.cfg.search_mode,
                     )
             else:
                 obtain_rotations_for_parakeet(
@@ -208,7 +223,43 @@ class RotationTransform(BaseTransform):
                 )
         elif self.cfg.model_name == ModelNames.NVIDIA_CANARY_QWEN_2_5B:
             if self.cfg.type == "search":
-                raise ValueError("Rotation search is not implemented for Canary-Qwen yet.")
+                seed = int(torch.initial_seed() & 0xFFFFFFFF)
+                if self.cfg.search_mode in {"alternating", "global_qe", "global_qe_qd"}:
+                    obtain_rotations_for_canary_qwen_search(
+                        model,
+                        "outputs/rotation_test_audio.wav",
+                        self.cfg.num_samples,
+                        self.cfg.batch_size,
+                        self.cfg.search_params(seed),
+                        self.cfg.path,
+                        device="cuda",
+                        weight_bits=self.cfg.wbits,
+                        activation_bits=self.cfg.abits,
+                        search_mode=self.cfg.search_mode,
+                        qe_search_params=self.cfg.qe_search_params(seed + 1),
+                        q2_refine_search_params=(
+                            self.cfg.q2_refine_search_params(seed + 2)
+                            if self.cfg.search_mode == "alternating"
+                            else None
+                        ),
+                        outer_rounds=self.cfg.outer_rounds,
+                        outer_patience=self.cfg.outer_patience,
+                        qe_min_delta=self.cfg.qe_min_delta,
+                    )
+                else:
+                    obtain_rotations_for_canary_qwen_search(
+                        model,
+                        "outputs/rotation_test_audio.wav",
+                        self.cfg.num_samples,
+                        self.cfg.batch_size,
+                        self.cfg.search_params(seed),
+                        self.cfg.path,
+                        device="cuda",
+                        weight_bits=self.cfg.wbits,
+                        activation_bits=self.cfg.abits,
+                        search_mode=self.cfg.search_mode,
+                    )
+                return
             obtain_rotations_for_canary_qwen(
                 model, "outputs/rotation_test_audio.wav", self.cfg.num_samples,
                 self.cfg.epochs, self.cfg.batch_size, self.cfg.learning_rate,

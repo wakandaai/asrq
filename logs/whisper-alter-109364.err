@@ -1,0 +1,4 @@
+[NeMo W 2026-07-27 12:21:55 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+slurmstepd: error: *** JOB 109364 ON node-gpu04 CANCELLED AT 2026-07-27T12:22:08 ***

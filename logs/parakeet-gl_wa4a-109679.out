@@ -1,0 +1,521 @@
+whisper glob search
+[NeMo I 2026-07-28 16:24:22 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+====================
+search_mode : global_qe
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 210 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.
+global_generation 0
+global_generation 1
+global_generation 2
+global_generation 3
+global_generation 4
+global_generation 5
+global_generation 6
+global_generation 7
+[rotation-search] saved global history to /home/blessedg/asrq/outputs/rotation/parakeet_globalqe_w4a4_global_search_history.pt
+Saved rotation to: /home/blessedg/asrq/outputs/rotation/parakeet_globalqe_w4a4.pt
+whisper glob quantize
+[NeMo I 2026-07-28 17:28:24 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+quantizer:
+  name: gptq
+  bits: 4
+  group_size: 128
+  block_size: 128
+  symmetric: true
+  percdamp: 0.01
+model:
+  name: nvidia/parakeet-ctc-1.1b
+  exclude_modules: []
+  eval_batch_size: 192
+  generate_fn: generate_parakeet
+transform:
+  name: rotation
+  type: global_qe_qd
+  search_mode: local_q2
+  num_samples: 800
+  epochs: 1
+  learning_rate: 0.01
+  batch_size: 4
+  path: /home/blessedg/asrq/outputs/rotation/parakeet_globalqe_w4a4.pt
+  learn_rotation: false
+  use: true
+  population_size: 8
+  elite_count: 2
+  parent_pool_fraction: 0.5
+  generations: 16
+  patience: 4
+  outer_rounds: 1
+  outer_patience: 1
+  qe_min_delta: 0.0
+  q2_refine_generations: 16
+  qe_generations: 16
+  qe_patience: 4
+  mutate_both_probability: 0.1
+  large_mutation_probability: 0.1
+  small_mutation_min: 1
+  small_mutation_max: 2
+  medium_mutation_min: 4
+  medium_mutation_max: 8
+  large_mutation_fraction: 0.25
+seed: 42
+calibration:
+  num_samples: 2048
+evaluate: true
+method: asrq
+activation_bits: 4
+create_audio_files: false
+
+Running ASRQ experiment:
+  Quantizer:      gptq
+  Model:          nvidia/parakeet-ctc-1.1b
+  Transform:      rotation
+  Seed:           42
+[2026-07-28 17:28:59,425][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpr6cu0c3z/manifest.json'
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 210 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.
+[2026-07-28 17:29:08,679][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpeg5g3g36/manifest.json'
+Quantizing speech encoder...
+Quantized encoder.layers.0.feed_forward1.linear1
+Quantized encoder.layers.0.feed_forward1.linear2
+Quantized encoder.layers.0.self_attn.linear_q
+Quantized encoder.layers.0.self_attn.linear_k
+Quantized encoder.layers.0.self_attn.linear_v
+Quantized encoder.layers.0.self_attn.linear_out
+Quantized encoder.layers.0.self_attn.linear_pos
+Quantized encoder.layers.0.feed_forward2.linear1
+Quantized encoder.layers.0.feed_forward2.linear2
+Quantized encoder.layers.1.feed_forward1.linear1
+Quantized encoder.layers.1.feed_forward1.linear2
+Quantized encoder.layers.1.self_attn.linear_q
+Quantized encoder.layers.1.self_attn.linear_k
+Quantized encoder.layers.1.self_attn.linear_v
+Quantized encoder.layers.1.self_attn.linear_out
+Quantized encoder.layers.1.self_attn.linear_pos
+Quantized encoder.layers.1.feed_forward2.linear1
+Quantized encoder.layers.1.feed_forward2.linear2
+Quantized encoder.layers.2.feed_forward1.linear1
+Quantized encoder.layers.2.feed_forward1.linear2
+Quantized encoder.layers.2.self_attn.linear_q
+Quantized encoder.layers.2.self_attn.linear_k
+Quantized encoder.layers.2.self_attn.linear_v
+Quantized encoder.layers.2.self_attn.linear_out
+Quantized encoder.layers.2.self_attn.linear_pos
+Quantized encoder.layers.2.feed_forward2.linear1
+Quantized encoder.layers.2.feed_forward2.linear2
+Quantized encoder.layers.3.feed_forward1.linear1
+Quantized encoder.layers.3.feed_forward1.linear2
+Quantized encoder.layers.3.self_attn.linear_q
+Quantized encoder.layers.3.self_attn.linear_k
+Quantized encoder.layers.3.self_attn.linear_v
+Quantized encoder.layers.3.self_attn.linear_out
+Quantized encoder.layers.3.self_attn.linear_pos
+Quantized encoder.layers.3.feed_forward2.linear1
+Quantized encoder.layers.3.feed_forward2.linear2
+Quantized encoder.layers.4.feed_forward1.linear1
+Quantized encoder.layers.4.feed_forward1.linear2
+Quantized encoder.layers.4.self_attn.linear_q
+Quantized encoder.layers.4.self_attn.linear_k
+Quantized encoder.layers.4.self_attn.linear_v
+Quantized encoder.layers.4.self_attn.linear_out
+Quantized encoder.layers.4.self_attn.linear_pos
+Quantized encoder.layers.4.feed_forward2.linear1
+Quantized encoder.layers.4.feed_forward2.linear2
+Quantized encoder.layers.5.feed_forward1.linear1
+Quantized encoder.layers.5.feed_forward1.linear2
+Quantized encoder.layers.5.self_attn.linear_q
+Quantized encoder.layers.5.self_attn.linear_k
+Quantized encoder.layers.5.self_attn.linear_v
+Quantized encoder.layers.5.self_attn.linear_out
+Quantized encoder.layers.5.self_attn.linear_pos
+Quantized encoder.layers.5.feed_forward2.linear1
+Quantized encoder.layers.5.feed_forward2.linear2
+Quantized encoder.layers.6.feed_forward1.linear1
+Quantized encoder.layers.6.feed_forward1.linear2
+Quantized encoder.layers.6.self_attn.linear_q
+Quantized encoder.layers.6.self_attn.linear_k
+Quantized encoder.layers.6.self_attn.linear_v
+Quantized encoder.layers.6.self_attn.linear_out
+Quantized encoder.layers.6.self_attn.linear_pos
+Quantized encoder.layers.6.feed_forward2.linear1
+Quantized encoder.layers.6.feed_forward2.linear2
+Quantized encoder.layers.7.feed_forward1.linear1
+Quantized encoder.layers.7.feed_forward1.linear2
+Quantized encoder.layers.7.self_attn.linear_q
+Quantized encoder.layers.7.self_attn.linear_k
+Quantized encoder.layers.7.self_attn.linear_v
+Quantized encoder.layers.7.self_attn.linear_out
+Quantized encoder.layers.7.self_attn.linear_pos
+Quantized encoder.layers.7.feed_forward2.linear1
+Quantized encoder.layers.7.feed_forward2.linear2
+Quantized encoder.layers.8.feed_forward1.linear1
+Quantized encoder.layers.8.feed_forward1.linear2
+Quantized encoder.layers.8.self_attn.linear_q
+Quantized encoder.layers.8.self_attn.linear_k
+Quantized encoder.layers.8.self_attn.linear_v
+Quantized encoder.layers.8.self_attn.linear_out
+Quantized encoder.layers.8.self_attn.linear_pos
+Quantized encoder.layers.8.feed_forward2.linear1
+Quantized encoder.layers.8.feed_forward2.linear2
+Quantized encoder.layers.9.feed_forward1.linear1
+Quantized encoder.layers.9.feed_forward1.linear2
+Quantized encoder.layers.9.self_attn.linear_q
+Quantized encoder.layers.9.self_attn.linear_k
+Quantized encoder.layers.9.self_attn.linear_v
+Quantized encoder.layers.9.self_attn.linear_out
+Quantized encoder.layers.9.self_attn.linear_pos
+Quantized encoder.layers.9.feed_forward2.linear1
+Quantized encoder.layers.9.feed_forward2.linear2
+Quantized encoder.layers.10.feed_forward1.linear1
+Quantized encoder.layers.10.feed_forward1.linear2
+Quantized encoder.layers.10.self_attn.linear_q
+Quantized encoder.layers.10.self_attn.linear_k
+Quantized encoder.layers.10.self_attn.linear_v
+Quantized encoder.layers.10.self_attn.linear_out
+Quantized encoder.layers.10.self_attn.linear_pos
+Quantized encoder.layers.10.feed_forward2.linear1
+Quantized encoder.layers.10.feed_forward2.linear2
+Quantized encoder.layers.11.feed_forward1.linear1
+Quantized encoder.layers.11.feed_forward1.linear2
+Quantized encoder.layers.11.self_attn.linear_q
+Quantized encoder.layers.11.self_attn.linear_k
+Quantized encoder.layers.11.self_attn.linear_v
+Quantized encoder.layers.11.self_attn.linear_out
+Quantized encoder.layers.11.self_attn.linear_pos
+Quantized encoder.layers.11.feed_forward2.linear1
+Quantized encoder.layers.11.feed_forward2.linear2
+Quantized encoder.layers.12.feed_forward1.linear1
+Quantized encoder.layers.12.feed_forward1.linear2
+Quantized encoder.layers.12.self_attn.linear_q
+Quantized encoder.layers.12.self_attn.linear_k
+Quantized encoder.layers.12.self_attn.linear_v
+Quantized encoder.layers.12.self_attn.linear_out
+Quantized encoder.layers.12.self_attn.linear_pos
+Quantized encoder.layers.12.feed_forward2.linear1
+Quantized encoder.layers.12.feed_forward2.linear2
+Quantized encoder.layers.13.feed_forward1.linear1
+Quantized encoder.layers.13.feed_forward1.linear2
+Quantized encoder.layers.13.self_attn.linear_q
+Quantized encoder.layers.13.self_attn.linear_k
+Quantized encoder.layers.13.self_attn.linear_v
+Quantized encoder.layers.13.self_attn.linear_out
+Quantized encoder.layers.13.self_attn.linear_pos
+Quantized encoder.layers.13.feed_forward2.linear1
+Quantized encoder.layers.13.feed_forward2.linear2
+Quantized encoder.layers.14.feed_forward1.linear1
+Quantized encoder.layers.14.feed_forward1.linear2
+Quantized encoder.layers.14.self_attn.linear_q
+Quantized encoder.layers.14.self_attn.linear_k
+Quantized encoder.layers.14.self_attn.linear_v
+Quantized encoder.layers.14.self_attn.linear_out
+Quantized encoder.layers.14.self_attn.linear_pos
+Quantized encoder.layers.14.feed_forward2.linear1
+Quantized encoder.layers.14.feed_forward2.linear2
+Quantized encoder.layers.15.feed_forward1.linear1
+Quantized encoder.layers.15.feed_forward1.linear2
+Quantized encoder.layers.15.self_attn.linear_q
+Quantized encoder.layers.15.self_attn.linear_k
+Quantized encoder.layers.15.self_attn.linear_v
+Quantized encoder.layers.15.self_attn.linear_out
+Quantized encoder.layers.15.self_attn.linear_pos
+Quantized encoder.layers.15.feed_forward2.linear1
+Quantized encoder.layers.15.feed_forward2.linear2
+Quantized encoder.layers.16.feed_forward1.linear1
+Quantized encoder.layers.16.feed_forward1.linear2
+Quantized encoder.layers.16.self_attn.linear_q
+Quantized encoder.layers.16.self_attn.linear_k
+Quantized encoder.layers.16.self_attn.linear_v
+Quantized encoder.layers.16.self_attn.linear_out
+Quantized encoder.layers.16.self_attn.linear_pos
+Quantized encoder.layers.16.feed_forward2.linear1
+Quantized encoder.layers.16.feed_forward2.linear2
+Quantized encoder.layers.17.feed_forward1.linear1
+Quantized encoder.layers.17.feed_forward1.linear2
+Quantized encoder.layers.17.self_attn.linear_q
+Quantized encoder.layers.17.self_attn.linear_k
+Quantized encoder.layers.17.self_attn.linear_v
+Quantized encoder.layers.17.self_attn.linear_out
+Quantized encoder.layers.17.self_attn.linear_pos
+Quantized encoder.layers.17.feed_forward2.linear1
+Quantized encoder.layers.17.feed_forward2.linear2
+Quantized encoder.layers.18.feed_forward1.linear1
+Quantized encoder.layers.18.feed_forward1.linear2
+Quantized encoder.layers.18.self_attn.linear_q
+Quantized encoder.layers.18.self_attn.linear_k
+Quantized encoder.layers.18.self_attn.linear_v
+Quantized encoder.layers.18.self_attn.linear_out
+Quantized encoder.layers.18.self_attn.linear_pos
+Quantized encoder.layers.18.feed_forward2.linear1
+Quantized encoder.layers.18.feed_forward2.linear2
+Quantized encoder.layers.19.feed_forward1.linear1
+Quantized encoder.layers.19.feed_forward1.linear2
+Quantized encoder.layers.19.self_attn.linear_q
+Quantized encoder.layers.19.self_attn.linear_k
+Quantized encoder.layers.19.self_attn.linear_v
+Quantized encoder.layers.19.self_attn.linear_out
+Quantized encoder.layers.19.self_attn.linear_pos
+Quantized encoder.layers.19.feed_forward2.linear1
+Quantized encoder.layers.19.feed_forward2.linear2
+Quantized encoder.layers.20.feed_forward1.linear1
+Quantized encoder.layers.20.feed_forward1.linear2
+Quantized encoder.layers.20.self_attn.linear_q
+Quantized encoder.layers.20.self_attn.linear_k
+Quantized encoder.layers.20.self_attn.linear_v
+Quantized encoder.layers.20.self_attn.linear_out
+Quantized encoder.layers.20.self_attn.linear_pos
+Quantized encoder.layers.20.feed_forward2.linear1
+Quantized encoder.layers.20.feed_forward2.linear2
+Quantized encoder.layers.21.feed_forward1.linear1
+Quantized encoder.layers.21.feed_forward1.linear2
+Quantized encoder.layers.21.self_attn.linear_q
+Quantized encoder.layers.21.self_attn.linear_k
+Quantized encoder.layers.21.self_attn.linear_v
+Quantized encoder.layers.21.self_attn.linear_out
+Quantized encoder.layers.21.self_attn.linear_pos
+Quantized encoder.layers.21.feed_forward2.linear1
+Quantized encoder.layers.21.feed_forward2.linear2
+Quantized encoder.layers.22.feed_forward1.linear1
+Quantized encoder.layers.22.feed_forward1.linear2
+Quantized encoder.layers.22.self_attn.linear_q
+Quantized encoder.layers.22.self_attn.linear_k
+Quantized encoder.layers.22.self_attn.linear_v
+Quantized encoder.layers.22.self_attn.linear_out
+Quantized encoder.layers.22.self_attn.linear_pos
+Quantized encoder.layers.22.feed_forward2.linear1
+Quantized encoder.layers.22.feed_forward2.linear2
+Quantized encoder.layers.23.feed_forward1.linear1
+Quantized encoder.layers.23.feed_forward1.linear2
+Quantized encoder.layers.23.self_attn.linear_q
+Quantized encoder.layers.23.self_attn.linear_k
+Quantized encoder.layers.23.self_attn.linear_v
+Quantized encoder.layers.23.self_attn.linear_out
+Quantized encoder.layers.23.self_attn.linear_pos
+Quantized encoder.layers.23.feed_forward2.linear1
+Quantized encoder.layers.23.feed_forward2.linear2
+Quantized encoder.layers.24.feed_forward1.linear1
+Quantized encoder.layers.24.feed_forward1.linear2
+Quantized encoder.layers.24.self_attn.linear_q
+Quantized encoder.layers.24.self_attn.linear_k
+Quantized encoder.layers.24.self_attn.linear_v
+Quantized encoder.layers.24.self_attn.linear_out
+Quantized encoder.layers.24.self_attn.linear_pos
+Quantized encoder.layers.24.feed_forward2.linear1
+Quantized encoder.layers.24.feed_forward2.linear2
+Quantized encoder.layers.25.feed_forward1.linear1
+Quantized encoder.layers.25.feed_forward1.linear2
+Quantized encoder.layers.25.self_attn.linear_q
+Quantized encoder.layers.25.self_attn.linear_k
+Quantized encoder.layers.25.self_attn.linear_v
+Quantized encoder.layers.25.self_attn.linear_out
+Quantized encoder.layers.25.self_attn.linear_pos
+Quantized encoder.layers.25.feed_forward2.linear1
+Quantized encoder.layers.25.feed_forward2.linear2
+Quantized encoder.layers.26.feed_forward1.linear1
+Quantized encoder.layers.26.feed_forward1.linear2
+Quantized encoder.layers.26.self_attn.linear_q
+Quantized encoder.layers.26.self_attn.linear_k
+Quantized encoder.layers.26.self_attn.linear_v
+Quantized encoder.layers.26.self_attn.linear_out
+Quantized encoder.layers.26.self_attn.linear_pos
+Quantized encoder.layers.26.feed_forward2.linear1
+Quantized encoder.layers.26.feed_forward2.linear2
+Quantized encoder.layers.27.feed_forward1.linear1
+Quantized encoder.layers.27.feed_forward1.linear2
+Quantized encoder.layers.27.self_attn.linear_q
+Quantized encoder.layers.27.self_attn.linear_k
+Quantized encoder.layers.27.self_attn.linear_v
+Quantized encoder.layers.27.self_attn.linear_out
+Quantized encoder.layers.27.self_attn.linear_pos
+Quantized encoder.layers.27.feed_forward2.linear1
+Quantized encoder.layers.27.feed_forward2.linear2
+Quantized encoder.layers.28.feed_forward1.linear1
+Quantized encoder.layers.28.feed_forward1.linear2
+Quantized encoder.layers.28.self_attn.linear_q
+Quantized encoder.layers.28.self_attn.linear_k
+Quantized encoder.layers.28.self_attn.linear_v
+Quantized encoder.layers.28.self_attn.linear_out
+Quantized encoder.layers.28.self_attn.linear_pos
+Quantized encoder.layers.28.feed_forward2.linear1
+Quantized encoder.layers.28.feed_forward2.linear2
+Quantized encoder.layers.29.feed_forward1.linear1
+Quantized encoder.layers.29.feed_forward1.linear2
+Quantized encoder.layers.29.self_attn.linear_q
+Quantized encoder.layers.29.self_attn.linear_k
+Quantized encoder.layers.29.self_attn.linear_v
+Quantized encoder.layers.29.self_attn.linear_out
+Quantized encoder.layers.29.self_attn.linear_pos
+Quantized encoder.layers.29.feed_forward2.linear1
+Quantized encoder.layers.29.feed_forward2.linear2
+Quantized encoder.layers.30.feed_forward1.linear1
+Quantized encoder.layers.30.feed_forward1.linear2
+Quantized encoder.layers.30.self_attn.linear_q
+Quantized encoder.layers.30.self_attn.linear_k
+Quantized encoder.layers.30.self_attn.linear_v
+Quantized encoder.layers.30.self_attn.linear_out
+Quantized encoder.layers.30.self_attn.linear_pos
+Quantized encoder.layers.30.feed_forward2.linear1
+Quantized encoder.layers.30.feed_forward2.linear2
+Quantized encoder.layers.31.feed_forward1.linear1
+Quantized encoder.layers.31.feed_forward1.linear2
+Quantized encoder.layers.31.self_attn.linear_q
+Quantized encoder.layers.31.self_attn.linear_k
+Quantized encoder.layers.31.self_attn.linear_v
+Quantized encoder.layers.31.self_attn.linear_out
+Quantized encoder.layers.31.self_attn.linear_pos
+Quantized encoder.layers.31.feed_forward2.linear1
+Quantized encoder.layers.31.feed_forward2.linear2
+Quantized encoder.layers.32.feed_forward1.linear1
+Quantized encoder.layers.32.feed_forward1.linear2
+Quantized encoder.layers.32.self_attn.linear_q
+Quantized encoder.layers.32.self_attn.linear_k
+Quantized encoder.layers.32.self_attn.linear_v
+Quantized encoder.layers.32.self_attn.linear_out
+Quantized encoder.layers.32.self_attn.linear_pos
+Quantized encoder.layers.32.feed_forward2.linear1
+Quantized encoder.layers.32.feed_forward2.linear2
+Quantized encoder.layers.33.feed_forward1.linear1
+Quantized encoder.layers.33.feed_forward1.linear2
+Quantized encoder.layers.33.self_attn.linear_q
+Quantized encoder.layers.33.self_attn.linear_k
+Quantized encoder.layers.33.self_attn.linear_v
+Quantized encoder.layers.33.self_attn.linear_out
+Quantized encoder.layers.33.self_attn.linear_pos
+Quantized encoder.layers.33.feed_forward2.linear1
+Quantized encoder.layers.33.feed_forward2.linear2
+Quantized encoder.layers.34.feed_forward1.linear1
+Quantized encoder.layers.34.feed_forward1.linear2
+Quantized encoder.layers.34.self_attn.linear_q
+Quantized encoder.layers.34.self_attn.linear_k
+Quantized encoder.layers.34.self_attn.linear_v
+Quantized encoder.layers.34.self_attn.linear_out
+Quantized encoder.layers.34.self_attn.linear_pos
+Quantized encoder.layers.34.feed_forward2.linear1
+Quantized encoder.layers.34.feed_forward2.linear2
+Quantized encoder.layers.35.feed_forward1.linear1
+Quantized encoder.layers.35.feed_forward1.linear2
+Quantized encoder.layers.35.self_attn.linear_q
+Quantized encoder.layers.35.self_attn.linear_k
+Quantized encoder.layers.35.self_attn.linear_v
+Quantized encoder.layers.35.self_attn.linear_out
+Quantized encoder.layers.35.self_attn.linear_pos
+Quantized encoder.layers.35.feed_forward2.linear1
+Quantized encoder.layers.35.feed_forward2.linear2
+Quantized encoder.layers.36.feed_forward1.linear1
+Quantized encoder.layers.36.feed_forward1.linear2
+Quantized encoder.layers.36.self_attn.linear_q
+Quantized encoder.layers.36.self_attn.linear_k
+Quantized encoder.layers.36.self_attn.linear_v
+Quantized encoder.layers.36.self_attn.linear_out
+Quantized encoder.layers.36.self_attn.linear_pos
+Quantized encoder.layers.36.feed_forward2.linear1
+Quantized encoder.layers.36.feed_forward2.linear2
+Quantized encoder.layers.37.feed_forward1.linear1
+Quantized encoder.layers.37.feed_forward1.linear2
+Quantized encoder.layers.37.self_attn.linear_q
+Quantized encoder.layers.37.self_attn.linear_k
+Quantized encoder.layers.37.self_attn.linear_v
+Quantized encoder.layers.37.self_attn.linear_out
+Quantized encoder.layers.37.self_attn.linear_pos
+Quantized encoder.layers.37.feed_forward2.linear1
+Quantized encoder.layers.37.feed_forward2.linear2
+Quantized encoder.layers.38.feed_forward1.linear1
+Quantized encoder.layers.38.feed_forward1.linear2
+Quantized encoder.layers.38.self_attn.linear_q
+Quantized encoder.layers.38.self_attn.linear_k
+Quantized encoder.layers.38.self_attn.linear_v
+Quantized encoder.layers.38.self_attn.linear_out
+Quantized encoder.layers.38.self_attn.linear_pos
+Quantized encoder.layers.38.feed_forward2.linear1
+Quantized encoder.layers.38.feed_forward2.linear2
+Quantized encoder.layers.39.feed_forward1.linear1
+Quantized encoder.layers.39.feed_forward1.linear2
+Quantized encoder.layers.39.self_attn.linear_q
+Quantized encoder.layers.39.self_attn.linear_k
+Quantized encoder.layers.39.self_attn.linear_v
+Quantized encoder.layers.39.self_attn.linear_out
+Quantized encoder.layers.39.self_attn.linear_pos
+Quantized encoder.layers.39.feed_forward2.linear1
+Quantized encoder.layers.39.feed_forward2.linear2
+Quantized encoder.layers.40.feed_forward1.linear1
+Quantized encoder.layers.40.feed_forward1.linear2
+Quantized encoder.layers.40.self_attn.linear_q
+Quantized encoder.layers.40.self_attn.linear_k
+Quantized encoder.layers.40.self_attn.linear_v
+Quantized encoder.layers.40.self_attn.linear_out
+Quantized encoder.layers.40.self_attn.linear_pos
+Quantized encoder.layers.40.feed_forward2.linear1
+Quantized encoder.layers.40.feed_forward2.linear2
+Quantized encoder.layers.41.feed_forward1.linear1
+Quantized encoder.layers.41.feed_forward1.linear2
+Quantized encoder.layers.41.self_attn.linear_q
+Quantized encoder.layers.41.self_attn.linear_k
+Quantized encoder.layers.41.self_attn.linear_v
+Quantized encoder.layers.41.self_attn.linear_out
+Quantized encoder.layers.41.self_attn.linear_pos
+Quantized encoder.layers.41.feed_forward2.linear1
+Quantized encoder.layers.41.feed_forward2.linear2
+Quantizing text decoder...
+Quantization complete.
+Evaluating dataset ami split test...
+[2026-07-28 17:48:45,610][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpr2sgtqlc/manifest.json'
+[2026-07-28 17:48:59,678][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmppnha1n8s/manifest.json'
+RTFX: 239.94
+WER: 46.39 %
+Evaluation completed in 220.12 seconds
+Evaluating dataset earnings22 split test...
+[2026-07-28 17:51:46,820][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpu3todza0/manifest.json'
+[2026-07-28 17:52:03,356][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpzlu4m9qz/manifest.json'
+RTFX: 326.01
+WER: 48.29 %
+Evaluation completed in 114.52 seconds
+Evaluating dataset gigaspeech split test...
+[2026-07-28 17:55:59,821][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpuu0ufv6y/manifest.json'
+[2026-07-28 17:56:10,553][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmp330pt9gx/manifest.json'
+RTFX: 338.23
+WER: 31.91 %
+Evaluation completed in 567.43 seconds
+Evaluating dataset librispeech split test.clean...
+[2026-07-28 18:02:58,924][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpzpxe1uv1/manifest.json'
+[2026-07-28 18:03:16,151][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmp_mu4yjb3/manifest.json'
+RTFX: 312.55
+WER: 15.88 %
+Evaluation completed in 107.55 seconds
+Evaluating dataset librispeech split test.other...
+[2026-07-28 18:04:52,756][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmp1u_m78a4/manifest.json'
+[2026-07-28 18:05:09,906][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpmbxev3gv/manifest.json'
+RTFX: 315.94
+WER: 17.79 %
+Evaluation completed in 112.36 seconds
+Evaluating dataset spgispeech split test...
+[2026-07-28 18:16:47,761][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmph8eurvtc/manifest.json'
+[2026-07-28 18:17:01,255][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpfat9cixu/manifest.json'
+RTFX: 274.55
+WER: 30.58 %
+Evaluation completed in 1971.83 seconds
+Evaluating dataset tedlium split test...
+Falling back to public TEDLIUM mirror 'TwinkStart/tedlium' for split 'test'.
+[2026-07-28 18:39:14,071][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpagv02uax/manifest.json'
+[2026-07-28 18:39:29,660][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpis5rjsbh/manifest.json'
+RTFX: 294.23
+WER: 25.05 %
+Evaluation completed in 58.18 seconds
+Evaluating dataset voxpopuli split test...
+[2026-07-28 18:40:20,382][root][INFO] - Initializing Lhotse CutSet from a single NeMo manifest
+            (is_tarred=False): '/tmp/tmpaskdc0ga/manifest.json'

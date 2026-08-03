@@ -1,0 +1,649 @@
+whisper alternating search
+[NeMo I 2026-07-27 09:54:10 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+save_path : /home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_alternating.pt
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 162 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.
+total calilbration samples 512 batch_size 64
+starting alternating  save_path : /home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_alternating.pt
+[rotation-search] site=model.encoder.layers.0.self_attn start population=3
+[rotation-search] site=model.encoder.layers.0.self_attn generation=1/1 best_nmse=0.177520 stagnant=0
+[rotation-search] site=model.encoder.layers.0.self_attn committed_nmse=0.177520
+[rotation-search] site=model.encoder.layers.1.self_attn start population=3
+[rotation-search] site=model.encoder.layers.1.self_attn generation=1/1 best_nmse=0.080650 stagnant=0
+[rotation-search] site=model.encoder.layers.1.self_attn committed_nmse=0.080650
+[rotation-search] site=model.encoder.layers.2.self_attn start population=3
+[rotation-search] site=model.encoder.layers.2.self_attn generation=1/1 best_nmse=0.069829 stagnant=0
+[rotation-search] site=model.encoder.layers.2.self_attn committed_nmse=0.069829
+[rotation-search] site=model.encoder.layers.3.self_attn start population=3
+[rotation-search] site=model.encoder.layers.3.self_attn generation=1/1 best_nmse=0.105223 stagnant=0
+[rotation-search] site=model.encoder.layers.3.self_attn committed_nmse=0.105223
+[rotation-search] site=model.encoder.layers.4.self_attn start population=3
+[rotation-search] site=model.encoder.layers.4.self_attn generation=1/1 best_nmse=0.113657 stagnant=0
+[rotation-search] site=model.encoder.layers.4.self_attn committed_nmse=0.113657
+[rotation-search] site=model.encoder.layers.5.self_attn start population=3
+[rotation-search] site=model.encoder.layers.5.self_attn generation=1/1 best_nmse=0.023547 stagnant=0
+[rotation-search] site=model.encoder.layers.5.self_attn committed_nmse=0.023547
+[rotation-search] site=model.encoder.layers.6.self_attn start population=3
+[rotation-search] site=model.encoder.layers.6.self_attn generation=1/1 best_nmse=0.036955 stagnant=0
+[rotation-search] site=model.encoder.layers.6.self_attn committed_nmse=0.036955
+[rotation-search] site=model.encoder.layers.7.self_attn start population=3
+[rotation-search] site=model.encoder.layers.7.self_attn generation=1/1 best_nmse=0.012498 stagnant=0
+[rotation-search] site=model.encoder.layers.7.self_attn committed_nmse=0.012498
+[rotation-search] site=model.encoder.layers.8.self_attn start population=3
+[rotation-search] site=model.encoder.layers.8.self_attn generation=1/1 best_nmse=0.005248 stagnant=0
+[rotation-search] site=model.encoder.layers.8.self_attn committed_nmse=0.005248
+[rotation-search] site=model.encoder.layers.9.self_attn start population=3
+[rotation-search] site=model.encoder.layers.9.self_attn generation=1/1 best_nmse=0.003632 stagnant=0
+[rotation-search] site=model.encoder.layers.9.self_attn committed_nmse=0.003632
+[rotation-search] site=model.encoder.layers.10.self_attn start population=3
+[rotation-search] site=model.encoder.layers.10.self_attn generation=1/1 best_nmse=0.004411 stagnant=0
+[rotation-search] site=model.encoder.layers.10.self_attn committed_nmse=0.004411
+[rotation-search] site=model.encoder.layers.11.self_attn start population=3
+[rotation-search] site=model.encoder.layers.11.self_attn generation=1/1 best_nmse=0.008567 stagnant=0
+[rotation-search] site=model.encoder.layers.11.self_attn committed_nmse=0.008567
+[rotation-search] site=model.encoder.layers.12.self_attn start population=3
+[rotation-search] site=model.encoder.layers.12.self_attn generation=1/1 best_nmse=0.005775 stagnant=0
+[rotation-search] site=model.encoder.layers.12.self_attn committed_nmse=0.005775
+[rotation-search] site=model.encoder.layers.13.self_attn start population=3
+[rotation-search] site=model.encoder.layers.13.self_attn generation=1/1 best_nmse=0.004564 stagnant=0
+[rotation-search] site=model.encoder.layers.13.self_attn committed_nmse=0.004564
+[rotation-search] site=model.encoder.layers.14.self_attn start population=3
+[rotation-search] site=model.encoder.layers.14.self_attn generation=1/1 best_nmse=0.022728 stagnant=0
+[rotation-search] site=model.encoder.layers.14.self_attn committed_nmse=0.022728
+[rotation-search] site=model.encoder.layers.15.self_attn start population=3
+[rotation-search] site=model.encoder.layers.15.self_attn generation=1/1 best_nmse=0.003494 stagnant=0
+[rotation-search] site=model.encoder.layers.15.self_attn committed_nmse=0.003494
+[rotation-search] site=model.encoder.layers.16.self_attn start population=3
+[rotation-search] site=model.encoder.layers.16.self_attn generation=1/1 best_nmse=0.003227 stagnant=0
+[rotation-search] site=model.encoder.layers.16.self_attn committed_nmse=0.003227
+[rotation-search] site=model.encoder.layers.17.self_attn start population=3
+[rotation-search] site=model.encoder.layers.17.self_attn generation=1/1 best_nmse=0.016971 stagnant=0
+[rotation-search] site=model.encoder.layers.17.self_attn committed_nmse=0.016971
+[rotation-search] site=model.encoder.layers.18.self_attn start population=3
+[rotation-search] site=model.encoder.layers.18.self_attn generation=1/1 best_nmse=0.020059 stagnant=0
+[rotation-search] site=model.encoder.layers.18.self_attn committed_nmse=0.020059
+[rotation-search] site=model.encoder.layers.19.self_attn start population=3
+[rotation-search] site=model.encoder.layers.19.self_attn generation=1/1 best_nmse=0.093156 stagnant=0
+[rotation-search] site=model.encoder.layers.19.self_attn committed_nmse=0.093156
+[rotation-search] site=model.encoder.layers.20.self_attn start population=3
+[rotation-search] site=model.encoder.layers.20.self_attn generation=1/1 best_nmse=0.003882 stagnant=0
+[rotation-search] site=model.encoder.layers.20.self_attn committed_nmse=0.003882
+[rotation-search] site=model.encoder.layers.21.self_attn start population=3
+[rotation-search] site=model.encoder.layers.21.self_attn generation=1/1 best_nmse=0.000281 stagnant=0
+[rotation-search] site=model.encoder.layers.21.self_attn committed_nmse=0.000281
+[rotation-search] site=model.encoder.layers.22.self_attn start population=3
+[rotation-search] site=model.encoder.layers.22.self_attn generation=1/1 best_nmse=0.000369 stagnant=0
+[rotation-search] site=model.encoder.layers.22.self_attn committed_nmse=0.000369
+[rotation-search] site=model.encoder.layers.23.self_attn start population=3
+[rotation-search] site=model.encoder.layers.23.self_attn generation=1/1 best_nmse=0.000015 stagnant=0
+[rotation-search] site=model.encoder.layers.23.self_attn committed_nmse=0.000015
+[rotation-search] site=model.encoder.layers.24.self_attn start population=3
+[rotation-search] site=model.encoder.layers.24.self_attn generation=1/1 best_nmse=0.000045 stagnant=0
+[rotation-search] site=model.encoder.layers.24.self_attn committed_nmse=0.000045
+[rotation-search] site=model.encoder.layers.25.self_attn start population=3
+[rotation-search] site=model.encoder.layers.25.self_attn generation=1/1 best_nmse=0.000016 stagnant=0
+[rotation-search] site=model.encoder.layers.25.self_attn committed_nmse=0.000016
+[rotation-search] site=model.encoder.layers.26.self_attn start population=3
+[rotation-search] site=model.encoder.layers.26.self_attn generation=1/1 best_nmse=0.000151 stagnant=0
+[rotation-search] site=model.encoder.layers.26.self_attn committed_nmse=0.000151
+[rotation-search] site=model.encoder.layers.27.self_attn start population=3
+[rotation-search] site=model.encoder.layers.27.self_attn generation=1/1 best_nmse=0.001806 stagnant=0
+[rotation-search] site=model.encoder.layers.27.self_attn committed_nmse=0.001806
+[rotation-search] site=model.encoder.layers.28.self_attn start population=3
+[rotation-search] site=model.encoder.layers.28.self_attn generation=1/1 best_nmse=0.001346 stagnant=0
+[rotation-search] site=model.encoder.layers.28.self_attn committed_nmse=0.001346
+[rotation-search] site=model.encoder.layers.29.self_attn start population=3
+[rotation-search] site=model.encoder.layers.29.self_attn generation=1/1 best_nmse=0.000362 stagnant=0
+[rotation-search] site=model.encoder.layers.29.self_attn committed_nmse=0.000362
+[rotation-search] site=model.encoder.layers.30.self_attn start population=3
+[rotation-search] site=model.encoder.layers.30.self_attn generation=1/1 best_nmse=0.000123 stagnant=0
+[rotation-search] site=model.encoder.layers.30.self_attn committed_nmse=0.000123
+[rotation-search] site=model.encoder.layers.31.self_attn start population=3
+[rotation-search] site=model.encoder.layers.31.self_attn generation=1/1 best_nmse=0.000742 stagnant=0
+[rotation-search] site=model.encoder.layers.31.self_attn committed_nmse=0.000742
+[rotation-search] site=model.decoder.layers.0.self_attn start population=3
+[rotation-search] site=model.decoder.layers.0.self_attn generation=1/1 best_nmse=0.045441 stagnant=0
+[rotation-search] site=model.decoder.layers.0.self_attn committed_nmse=0.045441
+[rotation-search] site=model.decoder.layers.0.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.0.encoder_attn generation=1/1 best_nmse=0.045441 stagnant=0
+[rotation-search] site=model.decoder.layers.0.encoder_attn committed_nmse=0.045441
+[rotation-search] site=model.decoder.layers.1.self_attn start population=3
+[rotation-search] site=model.decoder.layers.1.self_attn generation=1/1 best_nmse=0.010317 stagnant=0
+[rotation-search] site=model.decoder.layers.1.self_attn committed_nmse=0.010317
+[rotation-search] site=model.decoder.layers.1.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.1.encoder_attn generation=1/1 best_nmse=0.010317 stagnant=0
+[rotation-search] site=model.decoder.layers.1.encoder_attn committed_nmse=0.010317
+[rotation-search] site=model.decoder.layers.2.self_attn start population=3
+[rotation-search] site=model.decoder.layers.2.self_attn generation=1/1 best_nmse=0.007312 stagnant=0
+[rotation-search] site=model.decoder.layers.2.self_attn committed_nmse=0.007312
+[rotation-search] site=model.decoder.layers.2.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.2.encoder_attn generation=1/1 best_nmse=0.007256 stagnant=0
+[rotation-search] site=model.decoder.layers.2.encoder_attn committed_nmse=0.007256
+[rotation-search] site=model.decoder.layers.3.self_attn start population=3
+[rotation-search] site=model.decoder.layers.3.self_attn generation=1/1 best_nmse=0.005760 stagnant=0
+[rotation-search] site=model.decoder.layers.3.self_attn committed_nmse=0.005760
+[rotation-search] site=model.decoder.layers.3.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.3.encoder_attn generation=1/1 best_nmse=0.005760 stagnant=0
+[rotation-search] site=model.decoder.layers.3.encoder_attn committed_nmse=0.005760
+[rotation-search] site=model.decoder.layers.4.self_attn start population=3
+[rotation-search] site=model.decoder.layers.4.self_attn generation=1/1 best_nmse=0.001084 stagnant=0
+[rotation-search] site=model.decoder.layers.4.self_attn committed_nmse=0.001084
+[rotation-search] site=model.decoder.layers.4.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.4.encoder_attn generation=1/1 best_nmse=0.001084 stagnant=0
+[rotation-search] site=model.decoder.layers.4.encoder_attn committed_nmse=0.001084
+[rotation-search] site=model.decoder.layers.5.self_attn start population=3
+[rotation-search] site=model.decoder.layers.5.self_attn generation=1/1 best_nmse=0.000439 stagnant=0
+[rotation-search] site=model.decoder.layers.5.self_attn committed_nmse=0.000439
+[rotation-search] site=model.decoder.layers.5.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.5.encoder_attn generation=1/1 best_nmse=0.000439 stagnant=0
+[rotation-search] site=model.decoder.layers.5.encoder_attn committed_nmse=0.000439
+[rotation-search] site=model.decoder.layers.6.self_attn start population=3
+[rotation-search] site=model.decoder.layers.6.self_attn generation=1/1 best_nmse=0.000586 stagnant=0
+[rotation-search] site=model.decoder.layers.6.self_attn committed_nmse=0.000586
+[rotation-search] site=model.decoder.layers.6.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.6.encoder_attn generation=1/1 best_nmse=0.000527 stagnant=0
+[rotation-search] site=model.decoder.layers.6.encoder_attn committed_nmse=0.000527
+[rotation-search] site=model.decoder.layers.7.self_attn start population=3
+[rotation-search] site=model.decoder.layers.7.self_attn generation=1/1 best_nmse=0.000691 stagnant=0
+[rotation-search] site=model.decoder.layers.7.self_attn committed_nmse=0.000691
+[rotation-search] site=model.decoder.layers.7.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.7.encoder_attn generation=1/1 best_nmse=0.000632 stagnant=0
+[rotation-search] site=model.decoder.layers.7.encoder_attn committed_nmse=0.000632
+[rotation-search] site=model.decoder.layers.8.self_attn start population=3
+[rotation-search] site=model.decoder.layers.8.self_attn generation=1/1 best_nmse=0.000428 stagnant=0
+[rotation-search] site=model.decoder.layers.8.self_attn committed_nmse=0.000428
+[rotation-search] site=model.decoder.layers.8.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.8.encoder_attn generation=1/1 best_nmse=0.000428 stagnant=0
+[rotation-search] site=model.decoder.layers.8.encoder_attn committed_nmse=0.000428
+[rotation-search] site=model.decoder.layers.9.self_attn start population=3
+[rotation-search] site=model.decoder.layers.9.self_attn generation=1/1 best_nmse=0.000572 stagnant=0
+[rotation-search] site=model.decoder.layers.9.self_attn committed_nmse=0.000572
+[rotation-search] site=model.decoder.layers.9.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.9.encoder_attn generation=1/1 best_nmse=0.000572 stagnant=0
+[rotation-search] site=model.decoder.layers.9.encoder_attn committed_nmse=0.000572
+[rotation-search] site=model.decoder.layers.10.self_attn start population=3
+[rotation-search] site=model.decoder.layers.10.self_attn generation=1/1 best_nmse=0.000610 stagnant=0
+[rotation-search] site=model.decoder.layers.10.self_attn committed_nmse=0.000610
+[rotation-search] site=model.decoder.layers.10.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.10.encoder_attn generation=1/1 best_nmse=0.000566 stagnant=0
+[rotation-search] site=model.decoder.layers.10.encoder_attn committed_nmse=0.000566
+[rotation-search] site=model.decoder.layers.11.self_attn start population=3
+[rotation-search] site=model.decoder.layers.11.self_attn generation=1/1 best_nmse=0.000599 stagnant=0
+[rotation-search] site=model.decoder.layers.11.self_attn committed_nmse=0.000599
+[rotation-search] site=model.decoder.layers.11.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.11.encoder_attn generation=1/1 best_nmse=0.000592 stagnant=0
+[rotation-search] site=model.decoder.layers.11.encoder_attn committed_nmse=0.000592
+[rotation-search] site=model.decoder.layers.12.self_attn start population=3
+[rotation-search] site=model.decoder.layers.12.self_attn generation=1/1 best_nmse=0.000679 stagnant=0
+[rotation-search] site=model.decoder.layers.12.self_attn committed_nmse=0.000679
+[rotation-search] site=model.decoder.layers.12.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.12.encoder_attn generation=1/1 best_nmse=0.000679 stagnant=0
+[rotation-search] site=model.decoder.layers.12.encoder_attn committed_nmse=0.000679
+[rotation-search] site=model.decoder.layers.13.self_attn start population=3
+[rotation-search] site=model.decoder.layers.13.self_attn generation=1/1 best_nmse=0.000956 stagnant=0
+[rotation-search] site=model.decoder.layers.13.self_attn committed_nmse=0.000956
+[rotation-search] site=model.decoder.layers.13.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.13.encoder_attn generation=1/1 best_nmse=0.000956 stagnant=0
+[rotation-search] site=model.decoder.layers.13.encoder_attn committed_nmse=0.000956
+[rotation-search] site=model.decoder.layers.14.self_attn start population=3
+[rotation-search] site=model.decoder.layers.14.self_attn generation=1/1 best_nmse=0.000775 stagnant=0
+[rotation-search] site=model.decoder.layers.14.self_attn committed_nmse=0.000775
+[rotation-search] site=model.decoder.layers.14.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.14.encoder_attn generation=1/1 best_nmse=0.000725 stagnant=0
+[rotation-search] site=model.decoder.layers.14.encoder_attn committed_nmse=0.000725
+[rotation-search] site=model.decoder.layers.15.self_attn start population=3
+[rotation-search] site=model.decoder.layers.15.self_attn generation=1/1 best_nmse=0.000874 stagnant=0
+[rotation-search] site=model.decoder.layers.15.self_attn committed_nmse=0.000874
+[rotation-search] site=model.decoder.layers.15.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.15.encoder_attn generation=1/1 best_nmse=0.000833 stagnant=0
+[rotation-search] site=model.decoder.layers.15.encoder_attn committed_nmse=0.000833
+[rotation-search] site=model.decoder.layers.16.self_attn start population=3
+[rotation-search] site=model.decoder.layers.16.self_attn generation=1/1 best_nmse=0.001000 stagnant=0
+[rotation-search] site=model.decoder.layers.16.self_attn committed_nmse=0.001000
+[rotation-search] site=model.decoder.layers.16.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.16.encoder_attn generation=1/1 best_nmse=0.000991 stagnant=0
+[rotation-search] site=model.decoder.layers.16.encoder_attn committed_nmse=0.000991
+[rotation-search] site=model.decoder.layers.17.self_attn start population=3
+[rotation-search] site=model.decoder.layers.17.self_attn generation=1/1 best_nmse=0.000783 stagnant=0
+[rotation-search] site=model.decoder.layers.17.self_attn committed_nmse=0.000783
+[rotation-search] site=model.decoder.layers.17.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.17.encoder_attn generation=1/1 best_nmse=0.000783 stagnant=0
+[rotation-search] site=model.decoder.layers.17.encoder_attn committed_nmse=0.000783
+[rotation-search] site=model.decoder.layers.18.self_attn start population=3
+[rotation-search] site=model.decoder.layers.18.self_attn generation=1/1 best_nmse=0.001079 stagnant=0
+[rotation-search] site=model.decoder.layers.18.self_attn committed_nmse=0.001079
+[rotation-search] site=model.decoder.layers.18.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.18.encoder_attn generation=1/1 best_nmse=0.001033 stagnant=0
+[rotation-search] site=model.decoder.layers.18.encoder_attn committed_nmse=0.001033
+[rotation-search] site=model.decoder.layers.19.self_attn start population=3
+[rotation-search] site=model.decoder.layers.19.self_attn generation=1/1 best_nmse=0.001109 stagnant=0
+[rotation-search] site=model.decoder.layers.19.self_attn committed_nmse=0.001109
+[rotation-search] site=model.decoder.layers.19.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.19.encoder_attn generation=1/1 best_nmse=0.000924 stagnant=0
+[rotation-search] site=model.decoder.layers.19.encoder_attn committed_nmse=0.000924
+[rotation-search] site=model.decoder.layers.20.self_attn start population=3
+[rotation-search] site=model.decoder.layers.20.self_attn generation=1/1 best_nmse=0.000988 stagnant=0
+[rotation-search] site=model.decoder.layers.20.self_attn committed_nmse=0.000988
+[rotation-search] site=model.decoder.layers.20.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.20.encoder_attn generation=1/1 best_nmse=0.000988 stagnant=0
+[rotation-search] site=model.decoder.layers.20.encoder_attn committed_nmse=0.000988
+[rotation-search] site=model.decoder.layers.21.self_attn start population=3
+[rotation-search] site=model.decoder.layers.21.self_attn generation=1/1 best_nmse=0.000882 stagnant=0
+[rotation-search] site=model.decoder.layers.21.self_attn committed_nmse=0.000882
+[rotation-search] site=model.decoder.layers.21.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.21.encoder_attn generation=1/1 best_nmse=0.000858 stagnant=0
+[rotation-search] site=model.decoder.layers.21.encoder_attn committed_nmse=0.000858
+[rotation-search] site=model.decoder.layers.22.self_attn start population=3
+[rotation-search] site=model.decoder.layers.22.self_attn generation=1/1 best_nmse=0.000711 stagnant=0
+[rotation-search] site=model.decoder.layers.22.self_attn committed_nmse=0.000711
+[rotation-search] site=model.decoder.layers.22.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.22.encoder_attn generation=1/1 best_nmse=0.000711 stagnant=0
+[rotation-search] site=model.decoder.layers.22.encoder_attn committed_nmse=0.000711
+[rotation-search] site=model.decoder.layers.23.self_attn start population=3
+[rotation-search] site=model.decoder.layers.23.self_attn generation=1/1 best_nmse=0.001015 stagnant=0
+[rotation-search] site=model.decoder.layers.23.self_attn committed_nmse=0.001015
+[rotation-search] site=model.decoder.layers.23.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.23.encoder_attn generation=1/1 best_nmse=0.000827 stagnant=0
+[rotation-search] site=model.decoder.layers.23.encoder_attn committed_nmse=0.000827
+[rotation-search] site=model.decoder.layers.24.self_attn start population=3
+[rotation-search] site=model.decoder.layers.24.self_attn generation=1/1 best_nmse=0.000972 stagnant=0
+[rotation-search] site=model.decoder.layers.24.self_attn committed_nmse=0.000972
+[rotation-search] site=model.decoder.layers.24.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.24.encoder_attn generation=1/1 best_nmse=0.000869 stagnant=0
+[rotation-search] site=model.decoder.layers.24.encoder_attn committed_nmse=0.000869
+[rotation-search] site=model.decoder.layers.25.self_attn start population=3
+[rotation-search] site=model.decoder.layers.25.self_attn generation=1/1 best_nmse=0.000936 stagnant=0
+[rotation-search] site=model.decoder.layers.25.self_attn committed_nmse=0.000936
+[rotation-search] site=model.decoder.layers.25.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.25.encoder_attn generation=1/1 best_nmse=0.000936 stagnant=0
+[rotation-search] site=model.decoder.layers.25.encoder_attn committed_nmse=0.000936
+[rotation-search] site=model.decoder.layers.26.self_attn start population=3
+[rotation-search] site=model.decoder.layers.26.self_attn generation=1/1 best_nmse=0.000748 stagnant=0
+[rotation-search] site=model.decoder.layers.26.self_attn committed_nmse=0.000748
+[rotation-search] site=model.decoder.layers.26.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.26.encoder_attn generation=1/1 best_nmse=0.000725 stagnant=0
+[rotation-search] site=model.decoder.layers.26.encoder_attn committed_nmse=0.000725
+[rotation-search] site=model.decoder.layers.27.self_attn start population=3
+[rotation-search] site=model.decoder.layers.27.self_attn generation=1/1 best_nmse=0.001519 stagnant=0
+[rotation-search] site=model.decoder.layers.27.self_attn committed_nmse=0.001519
+[rotation-search] site=model.decoder.layers.27.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.27.encoder_attn generation=1/1 best_nmse=0.001166 stagnant=0
+[rotation-search] site=model.decoder.layers.27.encoder_attn committed_nmse=0.001166
+[rotation-search] site=model.decoder.layers.28.self_attn start population=3
+[rotation-search] site=model.decoder.layers.28.self_attn generation=1/1 best_nmse=0.000705 stagnant=0
+[rotation-search] site=model.decoder.layers.28.self_attn committed_nmse=0.000705
+[rotation-search] site=model.decoder.layers.28.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.28.encoder_attn generation=1/1 best_nmse=0.000644 stagnant=0
+[rotation-search] site=model.decoder.layers.28.encoder_attn committed_nmse=0.000644
+[rotation-search] site=model.decoder.layers.29.self_attn start population=3
+[rotation-search] site=model.decoder.layers.29.self_attn generation=1/1 best_nmse=0.000970 stagnant=0
+[rotation-search] site=model.decoder.layers.29.self_attn committed_nmse=0.000970
+[rotation-search] site=model.decoder.layers.29.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.29.encoder_attn generation=1/1 best_nmse=0.000893 stagnant=0
+[rotation-search] site=model.decoder.layers.29.encoder_attn committed_nmse=0.000893
+[rotation-search] site=model.decoder.layers.30.self_attn start population=3
+[rotation-search] site=model.decoder.layers.30.self_attn generation=1/1 best_nmse=0.001403 stagnant=0
+[rotation-search] site=model.decoder.layers.30.self_attn committed_nmse=0.001403
+[rotation-search] site=model.decoder.layers.30.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.30.encoder_attn generation=1/1 best_nmse=0.001403 stagnant=0
+[rotation-search] site=model.decoder.layers.30.encoder_attn committed_nmse=0.001403
+[rotation-search] site=model.decoder.layers.31.self_attn start population=3
+[rotation-search] site=model.decoder.layers.31.self_attn generation=1/1 best_nmse=0.001423 stagnant=0
+[rotation-search] site=model.decoder.layers.31.self_attn committed_nmse=0.001423
+[rotation-search] site=model.decoder.layers.31.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.31.encoder_attn generation=1/1 best_nmse=0.001088 stagnant=0
+[rotation-search] site=model.decoder.layers.31.encoder_attn committed_nmse=0.001088
+====================
+Starting Alternating Search!
+====================
+Round 1
+global_generation 0
+[rotation-search] site=model.encoder.layers.0.self_attn start population=3
+[rotation-search] site=model.encoder.layers.0.self_attn generation=1/1 best_nmse=0.169194 stagnant=0
+[rotation-search] site=model.encoder.layers.0.self_attn committed_nmse=0.169194
+[rotation-search] site=model.encoder.layers.1.self_attn start population=3
+[rotation-search] site=model.encoder.layers.1.self_attn generation=1/1 best_nmse=0.080663 stagnant=0
+[rotation-search] site=model.encoder.layers.1.self_attn committed_nmse=0.080663
+[rotation-search] site=model.encoder.layers.2.self_attn start population=3
+[rotation-search] site=model.encoder.layers.2.self_attn generation=1/1 best_nmse=0.068523 stagnant=0
+[rotation-search] site=model.encoder.layers.2.self_attn committed_nmse=0.068523
+[rotation-search] site=model.encoder.layers.3.self_attn start population=3
+[rotation-search] site=model.encoder.layers.3.self_attn generation=1/1 best_nmse=0.078324 stagnant=0
+[rotation-search] site=model.encoder.layers.3.self_attn committed_nmse=0.078324
+[rotation-search] site=model.encoder.layers.4.self_attn start population=3
+[rotation-search] site=model.encoder.layers.4.self_attn generation=1/1 best_nmse=0.118835 stagnant=0
+[rotation-search] site=model.encoder.layers.4.self_attn committed_nmse=0.118835
+[rotation-search] site=model.encoder.layers.5.self_attn start population=3
+[rotation-search] site=model.encoder.layers.5.self_attn generation=1/1 best_nmse=0.026752 stagnant=0
+[rotation-search] site=model.encoder.layers.5.self_attn committed_nmse=0.026752
+[rotation-search] site=model.encoder.layers.6.self_attn start population=3
+[rotation-search] site=model.encoder.layers.6.self_attn generation=1/1 best_nmse=0.038010 stagnant=0
+[rotation-search] site=model.encoder.layers.6.self_attn committed_nmse=0.038010
+[rotation-search] site=model.encoder.layers.7.self_attn start population=3
+[rotation-search] site=model.encoder.layers.7.self_attn generation=1/1 best_nmse=0.014374 stagnant=0
+[rotation-search] site=model.encoder.layers.7.self_attn committed_nmse=0.014374
+[rotation-search] site=model.encoder.layers.8.self_attn start population=3
+[rotation-search] site=model.encoder.layers.8.self_attn generation=1/1 best_nmse=0.004913 stagnant=0
+[rotation-search] site=model.encoder.layers.8.self_attn committed_nmse=0.004913
+[rotation-search] site=model.encoder.layers.9.self_attn start population=3
+[rotation-search] site=model.encoder.layers.9.self_attn generation=1/1 best_nmse=0.003720 stagnant=0
+[rotation-search] site=model.encoder.layers.9.self_attn committed_nmse=0.003720
+[rotation-search] site=model.encoder.layers.10.self_attn start population=3
+[rotation-search] site=model.encoder.layers.10.self_attn generation=1/1 best_nmse=0.005877 stagnant=0
+[rotation-search] site=model.encoder.layers.10.self_attn committed_nmse=0.005877
+[rotation-search] site=model.encoder.layers.11.self_attn start population=3
+[rotation-search] site=model.encoder.layers.11.self_attn generation=1/1 best_nmse=0.011073 stagnant=0
+[rotation-search] site=model.encoder.layers.11.self_attn committed_nmse=0.011073
+[rotation-search] site=model.encoder.layers.12.self_attn start population=3
+[rotation-search] site=model.encoder.layers.12.self_attn generation=1/1 best_nmse=0.006645 stagnant=0
+[rotation-search] site=model.encoder.layers.12.self_attn committed_nmse=0.006645
+[rotation-search] site=model.encoder.layers.13.self_attn start population=3
+[rotation-search] site=model.encoder.layers.13.self_attn generation=1/1 best_nmse=0.004878 stagnant=0
+[rotation-search] site=model.encoder.layers.13.self_attn committed_nmse=0.004878
+[rotation-search] site=model.encoder.layers.14.self_attn start population=3
+[rotation-search] site=model.encoder.layers.14.self_attn generation=1/1 best_nmse=0.026449 stagnant=0
+[rotation-search] site=model.encoder.layers.14.self_attn committed_nmse=0.026449
+[rotation-search] site=model.encoder.layers.15.self_attn start population=3
+[rotation-search] site=model.encoder.layers.15.self_attn generation=1/1 best_nmse=0.003768 stagnant=0
+[rotation-search] site=model.encoder.layers.15.self_attn committed_nmse=0.003768
+[rotation-search] site=model.encoder.layers.16.self_attn start population=3
+[rotation-search] site=model.encoder.layers.16.self_attn generation=1/1 best_nmse=0.003299 stagnant=0
+[rotation-search] site=model.encoder.layers.16.self_attn committed_nmse=0.003299
+[rotation-search] site=model.encoder.layers.17.self_attn start population=3
+[rotation-search] site=model.encoder.layers.17.self_attn generation=1/1 best_nmse=0.026377 stagnant=0
+[rotation-search] site=model.encoder.layers.17.self_attn committed_nmse=0.026377
+[rotation-search] site=model.encoder.layers.18.self_attn start population=3
+[rotation-search] site=model.encoder.layers.18.self_attn generation=1/1 best_nmse=0.033115 stagnant=0
+[rotation-search] site=model.encoder.layers.18.self_attn committed_nmse=0.033115
+[rotation-search] site=model.encoder.layers.19.self_attn start population=3
+[rotation-search] site=model.encoder.layers.19.self_attn generation=1/1 best_nmse=0.102627 stagnant=0
+[rotation-search] site=model.encoder.layers.19.self_attn committed_nmse=0.102627
+[rotation-search] site=model.encoder.layers.20.self_attn start population=3
+[rotation-search] site=model.encoder.layers.20.self_attn generation=1/1 best_nmse=0.003388 stagnant=0
+[rotation-search] site=model.encoder.layers.20.self_attn committed_nmse=0.003388
+[rotation-search] site=model.encoder.layers.21.self_attn start population=3
+[rotation-search] site=model.encoder.layers.21.self_attn generation=1/1 best_nmse=0.000194 stagnant=0
+[rotation-search] site=model.encoder.layers.21.self_attn committed_nmse=0.000194
+[rotation-search] site=model.encoder.layers.22.self_attn start population=3
+[rotation-search] site=model.encoder.layers.22.self_attn generation=1/1 best_nmse=0.000313 stagnant=0
+[rotation-search] site=model.encoder.layers.22.self_attn committed_nmse=0.000313
+[rotation-search] site=model.encoder.layers.23.self_attn start population=3
+[rotation-search] site=model.encoder.layers.23.self_attn generation=1/1 best_nmse=0.000016 stagnant=0
+[rotation-search] site=model.encoder.layers.23.self_attn committed_nmse=0.000016
+[rotation-search] site=model.encoder.layers.24.self_attn start population=3
+[rotation-search] site=model.encoder.layers.24.self_attn generation=1/1 best_nmse=0.000087 stagnant=0
+[rotation-search] site=model.encoder.layers.24.self_attn committed_nmse=0.000087
+[rotation-search] site=model.encoder.layers.25.self_attn start population=3
+[rotation-search] site=model.encoder.layers.25.self_attn generation=1/1 best_nmse=0.000016 stagnant=0
+[rotation-search] site=model.encoder.layers.25.self_attn committed_nmse=0.000016
+[rotation-search] site=model.encoder.layers.26.self_attn start population=3
+[rotation-search] site=model.encoder.layers.26.self_attn generation=1/1 best_nmse=0.000078 stagnant=0
+[rotation-search] site=model.encoder.layers.26.self_attn committed_nmse=0.000078
+[rotation-search] site=model.encoder.layers.27.self_attn start population=3
+[rotation-search] site=model.encoder.layers.27.self_attn generation=1/1 best_nmse=0.001766 stagnant=0
+[rotation-search] site=model.encoder.layers.27.self_attn committed_nmse=0.001766
+[rotation-search] site=model.encoder.layers.28.self_attn start population=3
+[rotation-search] site=model.encoder.layers.28.self_attn generation=1/1 best_nmse=0.000969 stagnant=0
+[rotation-search] site=model.encoder.layers.28.self_attn committed_nmse=0.000969
+[rotation-search] site=model.encoder.layers.29.self_attn start population=3
+[rotation-search] site=model.encoder.layers.29.self_attn generation=1/1 best_nmse=0.000195 stagnant=0
+[rotation-search] site=model.encoder.layers.29.self_attn committed_nmse=0.000195
+[rotation-search] site=model.encoder.layers.30.self_attn start population=3
+[rotation-search] site=model.encoder.layers.30.self_attn generation=1/1 best_nmse=0.000091 stagnant=0
+[rotation-search] site=model.encoder.layers.30.self_attn committed_nmse=0.000091
+[rotation-search] site=model.encoder.layers.31.self_attn start population=3
+[rotation-search] site=model.encoder.layers.31.self_attn generation=1/1 best_nmse=0.000849 stagnant=0
+[rotation-search] site=model.encoder.layers.31.self_attn committed_nmse=0.000849
+[rotation-search] site=model.decoder.layers.0.self_attn start population=3
+[rotation-search] site=model.decoder.layers.0.self_attn generation=1/1 best_nmse=0.048704 stagnant=0
+[rotation-search] site=model.decoder.layers.0.self_attn committed_nmse=0.048704
+[rotation-search] site=model.decoder.layers.0.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.0.encoder_attn generation=1/1 best_nmse=0.046665 stagnant=0
+[rotation-search] site=model.decoder.layers.0.encoder_attn committed_nmse=0.046665
+[rotation-search] site=model.decoder.layers.1.self_attn start population=3
+[rotation-search] site=model.decoder.layers.1.self_attn generation=1/1 best_nmse=0.011556 stagnant=0
+[rotation-search] site=model.decoder.layers.1.self_attn committed_nmse=0.011556
+[rotation-search] site=model.decoder.layers.1.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.1.encoder_attn generation=1/1 best_nmse=0.010167 stagnant=0
+[rotation-search] site=model.decoder.layers.1.encoder_attn committed_nmse=0.010167
+[rotation-search] site=model.decoder.layers.2.self_attn start population=3
+[rotation-search] site=model.decoder.layers.2.self_attn generation=1/1 best_nmse=0.007101 stagnant=0
+[rotation-search] site=model.decoder.layers.2.self_attn committed_nmse=0.007101
+[rotation-search] site=model.decoder.layers.2.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.2.encoder_attn generation=1/1 best_nmse=0.007101 stagnant=0
+[rotation-search] site=model.decoder.layers.2.encoder_attn committed_nmse=0.007101
+[rotation-search] site=model.decoder.layers.3.self_attn start population=3
+[rotation-search] site=model.decoder.layers.3.self_attn generation=1/1 best_nmse=0.006318 stagnant=0
+[rotation-search] site=model.decoder.layers.3.self_attn committed_nmse=0.006318
+[rotation-search] site=model.decoder.layers.3.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.3.encoder_attn generation=1/1 best_nmse=0.005620 stagnant=0
+[rotation-search] site=model.decoder.layers.3.encoder_attn committed_nmse=0.005620
+[rotation-search] site=model.decoder.layers.4.self_attn start population=3
+[rotation-search] site=model.decoder.layers.4.self_attn generation=1/1 best_nmse=0.001172 stagnant=0
+[rotation-search] site=model.decoder.layers.4.self_attn committed_nmse=0.001172
+[rotation-search] site=model.decoder.layers.4.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.4.encoder_attn generation=1/1 best_nmse=0.001141 stagnant=0
+[rotation-search] site=model.decoder.layers.4.encoder_attn committed_nmse=0.001141
+[rotation-search] site=model.decoder.layers.5.self_attn start population=3
+[rotation-search] site=model.decoder.layers.5.self_attn generation=1/1 best_nmse=0.000486 stagnant=0
+[rotation-search] site=model.decoder.layers.5.self_attn committed_nmse=0.000486
+[rotation-search] site=model.decoder.layers.5.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.5.encoder_attn generation=1/1 best_nmse=0.000453 stagnant=0
+[rotation-search] site=model.decoder.layers.5.encoder_attn committed_nmse=0.000453
+[rotation-search] site=model.decoder.layers.6.self_attn start population=3
+[rotation-search] site=model.decoder.layers.6.self_attn generation=1/1 best_nmse=0.000664 stagnant=0
+[rotation-search] site=model.decoder.layers.6.self_attn committed_nmse=0.000664
+[rotation-search] site=model.decoder.layers.6.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.6.encoder_attn generation=1/1 best_nmse=0.000584 stagnant=0
+[rotation-search] site=model.decoder.layers.6.encoder_attn committed_nmse=0.000584
+[rotation-search] site=model.decoder.layers.7.self_attn start population=3
+[rotation-search] site=model.decoder.layers.7.self_attn generation=1/1 best_nmse=0.000685 stagnant=0
+[rotation-search] site=model.decoder.layers.7.self_attn committed_nmse=0.000685
+[rotation-search] site=model.decoder.layers.7.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.7.encoder_attn generation=1/1 best_nmse=0.000685 stagnant=0
+[rotation-search] site=model.decoder.layers.7.encoder_attn committed_nmse=0.000685
+[rotation-search] site=model.decoder.layers.8.self_attn start population=3
+[rotation-search] site=model.decoder.layers.8.self_attn generation=1/1 best_nmse=0.000413 stagnant=0
+[rotation-search] site=model.decoder.layers.8.self_attn committed_nmse=0.000413
+[rotation-search] site=model.decoder.layers.8.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.8.encoder_attn generation=1/1 best_nmse=0.000413 stagnant=0
+[rotation-search] site=model.decoder.layers.8.encoder_attn committed_nmse=0.000413
+[rotation-search] site=model.decoder.layers.9.self_attn start population=3
+[rotation-search] site=model.decoder.layers.9.self_attn generation=1/1 best_nmse=0.000597 stagnant=0
+[rotation-search] site=model.decoder.layers.9.self_attn committed_nmse=0.000597
+[rotation-search] site=model.decoder.layers.9.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.9.encoder_attn generation=1/1 best_nmse=0.000537 stagnant=0
+[rotation-search] site=model.decoder.layers.9.encoder_attn committed_nmse=0.000537
+[rotation-search] site=model.decoder.layers.10.self_attn start population=3
+[rotation-search] site=model.decoder.layers.10.self_attn generation=1/1 best_nmse=0.000533 stagnant=0
+[rotation-search] site=model.decoder.layers.10.self_attn committed_nmse=0.000533
+[rotation-search] site=model.decoder.layers.10.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.10.encoder_attn generation=1/1 best_nmse=0.000533 stagnant=0
+[rotation-search] site=model.decoder.layers.10.encoder_attn committed_nmse=0.000533
+[rotation-search] site=model.decoder.layers.11.self_attn start population=3
+[rotation-search] site=model.decoder.layers.11.self_attn generation=1/1 best_nmse=0.000543 stagnant=0
+[rotation-search] site=model.decoder.layers.11.self_attn committed_nmse=0.000543
+[rotation-search] site=model.decoder.layers.11.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.11.encoder_attn generation=1/1 best_nmse=0.000543 stagnant=0
+[rotation-search] site=model.decoder.layers.11.encoder_attn committed_nmse=0.000543
+[rotation-search] site=model.decoder.layers.12.self_attn start population=3
+[rotation-search] site=model.decoder.layers.12.self_attn generation=1/1 best_nmse=0.000659 stagnant=0
+[rotation-search] site=model.decoder.layers.12.self_attn committed_nmse=0.000659
+[rotation-search] site=model.decoder.layers.12.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.12.encoder_attn generation=1/1 best_nmse=0.000611 stagnant=0
+[rotation-search] site=model.decoder.layers.12.encoder_attn committed_nmse=0.000611
+[rotation-search] site=model.decoder.layers.13.self_attn start population=3
+[rotation-search] site=model.decoder.layers.13.self_attn generation=1/1 best_nmse=0.000956 stagnant=0
+[rotation-search] site=model.decoder.layers.13.self_attn committed_nmse=0.000956
+[rotation-search] site=model.decoder.layers.13.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.13.encoder_attn generation=1/1 best_nmse=0.000894 stagnant=0
+[rotation-search] site=model.decoder.layers.13.encoder_attn committed_nmse=0.000894
+[rotation-search] site=model.decoder.layers.14.self_attn start population=3
+[rotation-search] site=model.decoder.layers.14.self_attn generation=1/1 best_nmse=0.000735 stagnant=0
+[rotation-search] site=model.decoder.layers.14.self_attn committed_nmse=0.000735
+[rotation-search] site=model.decoder.layers.14.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.14.encoder_attn generation=1/1 best_nmse=0.000735 stagnant=0
+[rotation-search] site=model.decoder.layers.14.encoder_attn committed_nmse=0.000735
+[rotation-search] site=model.decoder.layers.15.self_attn start population=3
+[rotation-search] site=model.decoder.layers.15.self_attn generation=1/1 best_nmse=0.000840 stagnant=0
+[rotation-search] site=model.decoder.layers.15.self_attn committed_nmse=0.000840
+[rotation-search] site=model.decoder.layers.15.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.15.encoder_attn generation=1/1 best_nmse=0.000802 stagnant=0
+[rotation-search] site=model.decoder.layers.15.encoder_attn committed_nmse=0.000802
+[rotation-search] site=model.decoder.layers.16.self_attn start population=3
+[rotation-search] site=model.decoder.layers.16.self_attn generation=1/1 best_nmse=0.001241 stagnant=0
+[rotation-search] site=model.decoder.layers.16.self_attn committed_nmse=0.001241
+[rotation-search] site=model.decoder.layers.16.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.16.encoder_attn generation=1/1 best_nmse=0.000870 stagnant=0
+[rotation-search] site=model.decoder.layers.16.encoder_attn committed_nmse=0.000870
+[rotation-search] site=model.decoder.layers.17.self_attn start population=3
+[rotation-search] site=model.decoder.layers.17.self_attn generation=1/1 best_nmse=0.000763 stagnant=0
+[rotation-search] site=model.decoder.layers.17.self_attn committed_nmse=0.000763
+[rotation-search] site=model.decoder.layers.17.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.17.encoder_attn generation=1/1 best_nmse=0.000763 stagnant=0
+[rotation-search] site=model.decoder.layers.17.encoder_attn committed_nmse=0.000763
+[rotation-search] site=model.decoder.layers.18.self_attn start population=3
+[rotation-search] site=model.decoder.layers.18.self_attn generation=1/1 best_nmse=0.001027 stagnant=0
+[rotation-search] site=model.decoder.layers.18.self_attn committed_nmse=0.001027
+[rotation-search] site=model.decoder.layers.18.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.18.encoder_attn generation=1/1 best_nmse=0.001027 stagnant=0
+[rotation-search] site=model.decoder.layers.18.encoder_attn committed_nmse=0.001027
+[rotation-search] site=model.decoder.layers.19.self_attn start population=3
+[rotation-search] site=model.decoder.layers.19.self_attn generation=1/1 best_nmse=0.001185 stagnant=0
+[rotation-search] site=model.decoder.layers.19.self_attn committed_nmse=0.001185
+[rotation-search] site=model.decoder.layers.19.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.19.encoder_attn generation=1/1 best_nmse=0.000995 stagnant=0
+[rotation-search] site=model.decoder.layers.19.encoder_attn committed_nmse=0.000995
+[rotation-search] site=model.decoder.layers.20.self_attn start population=3
+[rotation-search] site=model.decoder.layers.20.self_attn generation=1/1 best_nmse=0.000916 stagnant=0
+[rotation-search] site=model.decoder.layers.20.self_attn committed_nmse=0.000916
+[rotation-search] site=model.decoder.layers.20.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.20.encoder_attn generation=1/1 best_nmse=0.000916 stagnant=0
+[rotation-search] site=model.decoder.layers.20.encoder_attn committed_nmse=0.000916
+[rotation-search] site=model.decoder.layers.21.self_attn start population=3
+[rotation-search] site=model.decoder.layers.21.self_attn generation=1/1 best_nmse=0.000900 stagnant=0
+[rotation-search] site=model.decoder.layers.21.self_attn committed_nmse=0.000900
+[rotation-search] site=model.decoder.layers.21.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.21.encoder_attn generation=1/1 best_nmse=0.000820 stagnant=0
+[rotation-search] site=model.decoder.layers.21.encoder_attn committed_nmse=0.000820
+[rotation-search] site=model.decoder.layers.22.self_attn start population=3
+[rotation-search] site=model.decoder.layers.22.self_attn generation=1/1 best_nmse=0.000782 stagnant=0
+[rotation-search] site=model.decoder.layers.22.self_attn committed_nmse=0.000782
+[rotation-search] site=model.decoder.layers.22.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.22.encoder_attn generation=1/1 best_nmse=0.000683 stagnant=0
+[rotation-search] site=model.decoder.layers.22.encoder_attn committed_nmse=0.000683
+[rotation-search] site=model.decoder.layers.23.self_attn start population=3
+[rotation-search] site=model.decoder.layers.23.self_attn generation=1/1 best_nmse=0.000929 stagnant=0
+[rotation-search] site=model.decoder.layers.23.self_attn committed_nmse=0.000929
+[rotation-search] site=model.decoder.layers.23.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.23.encoder_attn generation=1/1 best_nmse=0.000881 stagnant=0
+[rotation-search] site=model.decoder.layers.23.encoder_attn committed_nmse=0.000881
+[rotation-search] site=model.decoder.layers.24.self_attn start population=3
+[rotation-search] site=model.decoder.layers.24.self_attn generation=1/1 best_nmse=0.000881 stagnant=0
+[rotation-search] site=model.decoder.layers.24.self_attn committed_nmse=0.000881
+[rotation-search] site=model.decoder.layers.24.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.24.encoder_attn generation=1/1 best_nmse=0.000881 stagnant=0
+[rotation-search] site=model.decoder.layers.24.encoder_attn committed_nmse=0.000881
+[rotation-search] site=model.decoder.layers.25.self_attn start population=3
+[rotation-search] site=model.decoder.layers.25.self_attn generation=1/1 best_nmse=0.000991 stagnant=0
+[rotation-search] site=model.decoder.layers.25.self_attn committed_nmse=0.000991
+[rotation-search] site=model.decoder.layers.25.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.25.encoder_attn generation=1/1 best_nmse=0.000974 stagnant=0
+[rotation-search] site=model.decoder.layers.25.encoder_attn committed_nmse=0.000974
+[rotation-search] site=model.decoder.layers.26.self_attn start population=3
+[rotation-search] site=model.decoder.layers.26.self_attn generation=1/1 best_nmse=0.000764 stagnant=0
+[rotation-search] site=model.decoder.layers.26.self_attn committed_nmse=0.000764
+[rotation-search] site=model.decoder.layers.26.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.26.encoder_attn generation=1/1 best_nmse=0.000758 stagnant=0
+[rotation-search] site=model.decoder.layers.26.encoder_attn committed_nmse=0.000758
+[rotation-search] site=model.decoder.layers.27.self_attn start population=3
+[rotation-search] site=model.decoder.layers.27.self_attn generation=1/1 best_nmse=0.001620 stagnant=0
+[rotation-search] site=model.decoder.layers.27.self_attn committed_nmse=0.001620
+[rotation-search] site=model.decoder.layers.27.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.27.encoder_attn generation=1/1 best_nmse=0.001302 stagnant=0
+[rotation-search] site=model.decoder.layers.27.encoder_attn committed_nmse=0.001302
+[rotation-search] site=model.decoder.layers.28.self_attn start population=3
+[rotation-search] site=model.decoder.layers.28.self_attn generation=1/1 best_nmse=0.000676 stagnant=0
+[rotation-search] site=model.decoder.layers.28.self_attn committed_nmse=0.000676
+[rotation-search] site=model.decoder.layers.28.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.28.encoder_attn generation=1/1 best_nmse=0.000637 stagnant=0
+[rotation-search] site=model.decoder.layers.28.encoder_attn committed_nmse=0.000637
+[rotation-search] site=model.decoder.layers.29.self_attn start population=3
+[rotation-search] site=model.decoder.layers.29.self_attn generation=1/1 best_nmse=0.000831 stagnant=0
+[rotation-search] site=model.decoder.layers.29.self_attn committed_nmse=0.000831
+[rotation-search] site=model.decoder.layers.29.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.29.encoder_attn generation=1/1 best_nmse=0.000831 stagnant=0
+[rotation-search] site=model.decoder.layers.29.encoder_attn committed_nmse=0.000831
+[rotation-search] site=model.decoder.layers.30.self_attn start population=3
+[rotation-search] site=model.decoder.layers.30.self_attn generation=1/1 best_nmse=0.001424 stagnant=0
+[rotation-search] site=model.decoder.layers.30.self_attn committed_nmse=0.001424
+[rotation-search] site=model.decoder.layers.30.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.30.encoder_attn generation=1/1 best_nmse=0.001359 stagnant=0
+[rotation-search] site=model.decoder.layers.30.encoder_attn committed_nmse=0.001359
+[rotation-search] site=model.decoder.layers.31.self_attn start population=3
+[rotation-search] site=model.decoder.layers.31.self_attn generation=1/1 best_nmse=0.001183 stagnant=0
+[rotation-search] site=model.decoder.layers.31.self_attn committed_nmse=0.001183
+[rotation-search] site=model.decoder.layers.31.encoder_attn start population=3
+[rotation-search] site=model.decoder.layers.31.encoder_attn generation=1/1 best_nmse=0.001096 stagnant=0
+[rotation-search] site=model.decoder.layers.31.encoder_attn committed_nmse=0.001096
+whisper alternating quantize
+[NeMo I 2026-07-27 10:33:17 <frozen importlib:241] Triton available & CUDA detected. Using Triton kernel for batch_matmul.
+quantizer:
+  name: gptq
+  bits: 4
+  group_size: 128
+  block_size: 128
+  symmetric: true
+  percdamp: 0.01
+model:
+  name: openai/whisper-large-v3
+  exclude_modules:
+  - proj_out
+  eval_batch_size: 64
+  generate_fn: generate_whisper
+transform:
+  name: rotation
+  type: search
+  search_mode: local_q2
+  num_samples: 800
+  epochs: 1
+  learning_rate: 0.01
+  batch_size: 4
+  path: /home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a8_alternating.pt
+  learn_rotation: false
+  use: true
+  population_size: 8
+  elite_count: 2
+  parent_pool_fraction: 0.5
+  generations: 16
+  patience: 4
+  outer_rounds: 1
+  outer_patience: 1
+  qe_min_delta: 0.0
+  q2_refine_generations: 16
+  qe_generations: 16
+  qe_patience: 4
+  mutate_both_probability: 0.1
+  large_mutation_probability: 0.1
+  small_mutation_min: 1
+  small_mutation_max: 2
+  medium_mutation_min: 4
+  medium_mutation_max: 8
+  large_mutation_fraction: 0.25
+seed: 42
+calibration:
+  num_samples: 2048
+evaluate: true
+method: asrq
+activation_bits: 8
+create_audio_files: false
+
+Running ASRQ experiment:
+  Quantizer:      gptq
+  Model:          openai/whisper-large-v3
+  Transform:      rotation
+  Seed:           42
+Starting fusion of normalization weights and biases into adjacent linear layers...
+Found 162 norm layers to process.
+Fused normalization weights and biases into adjacent linear layers.

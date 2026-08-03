@@ -78,6 +78,25 @@ class RotationGlobalQeCandidateTests(unittest.TestCase):
 
         self.assertEqual(rotation.shape, (8, 8))
 
+    def test_three_sign_hadamard_candidate_matches_d0_h_d1_h_d2(self) -> None:
+        base_h = normalized_hadamard_matrix(8)
+        candidate = ThreeSignHadamardCandidate(
+            s0=torch.tensor([1, -1, 1, -1, 1, -1, 1, -1], dtype=torch.int8),
+            s1=torch.tensor([-1, -1, 1, 1, -1, -1, 1, 1], dtype=torch.int8),
+            s2=torch.tensor([1, 1, -1, -1, 1, 1, -1, -1], dtype=torch.int8),
+        )
+
+        rotation = candidate.to_rotation(base_h, device="cpu", dtype=torch.float64)
+        expected = (
+            torch.diag(candidate.s0.to(torch.float64))
+            @ base_h
+            @ torch.diag(candidate.s1.to(torch.float64))
+            @ base_h
+            @ torch.diag(candidate.s2.to(torch.float64))
+        )
+
+        self.assertTrue(torch.allclose(rotation, expected, atol=1e-6))
+
     def test_global_search_commits_candidate_and_records_history(self) -> None:
         base_h = normalized_hadamard_matrix(8)
         start = ThreeSignHadamardCandidate(
@@ -112,6 +131,13 @@ class RotationGlobalQeCandidateTests(unittest.TestCase):
         self.assertTrue(adapter.commits)
         self.assertLessEqual(best_score, adapter.score_global_candidate(start))
         self.assertEqual(len(history.best_scores), len(history.generation_indices))
+        self.assertEqual(len(history.best_scores), len(history.generation_durations_sec))
+        self.assertEqual(len(history.best_scores), len(history.running_best_scores))
+        self.assertEqual(len(history.best_scores), len(history.population_scores))
+        self.assertEqual(len(history.best_scores), len(history.elite_scores))
+        self.assertEqual(len(history.best_scores), len(history.improved_flags))
+        self.assertEqual(len(history.best_scores), len(history.stagnant_generation_counts))
+        self.assertEqual(len(history.best_scores), len(history.generation_mutation_summaries))
         self.assertGreaterEqual(adapter.refresh_count, 2)
         self.assertIsInstance(best_candidate, ThreeSignHadamardCandidate)
 

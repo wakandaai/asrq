@@ -1,0 +1,10 @@
+[NeMo W 2026-07-25 11:00:56 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading calibration samples:   0%|          | 0/256 [00:00<?, ?it/s]Loading calibration samples: 100%|██████████| 256/256 [00:00<00:00, 4495.11it/s]
+Traceback (most recent call last):
+  File "<stdin>", line 63, in <module>
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 211, in obtain_transform
+    raise ValueError("Rotation search is not implemented for Canary-Qwen yet.")
+ValueError: Rotation search is not implemented for Canary-Qwen yet.

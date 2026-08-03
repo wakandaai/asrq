@@ -1,0 +1,28 @@
+[NeMo W 2026-07-28 16:35:57 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/512 [00:00<?, ?it/s]Loading calibration samples: 100%|██████████| 512/512 [00:00<00:00, 5662.87it/s]
+Using custom `forced_decoder_ids` from the (generation) config. This is deprecated in favor of the `task` and `language` flags/config options.
+Transcription using a multilingual Whisper will default to language detection followed by transcription instead of translation to English. This might be a breaking change for your use case. If you want to instead always translate your audio to English, make sure to pass `language='en'`. See https://github.com/huggingface/transformers/pull/28687 for more details.
+The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[NeMo W 2026-07-28 21:31:09 <frozen importlib:241] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Loading calibration samples:   0%|          | 0/2048 [00:00<?, ?it/s]Loading calibration samples:  27%|██▋       | 563/2048 [00:00<00:00, 5619.47it/s]Loading calibration samples:  57%|█████▋    | 1158/2048 [00:00<00:00, 5807.86it/s]Loading calibration samples:  85%|████████▌ | 1747/2048 [00:00<00:00, 5843.36it/s]Loading calibration samples: 100%|██████████| 2048/2048 [00:00<00:00, 5831.79it/s]
+[NeMo W 2026-07-28 21:31:38 dataloader:335] The following configuration keys are ignored by Lhotse dataloader: use_start_end_token
+[NeMo W 2026-07-28 21:31:38 dataloader:341] You are using a non-tarred dataset and requested tokenization during data sampling (pretokenize=True). This will cause the tokenization to happen in the main (GPU) process,possibly impacting the training speed if your tokenizer is very large.If the impact is noticable, set pretokenize=False in dataloader config.(note: that will disable token-per-second filtering and 2D bucketing features)
+Error executing job with overrides: ['model=parakeet', 'quantizer=gptq', 'quantizer.bits=4', 'activation_bits=4', 'transform=rotation', 'transform.type=search', 'transform.path=/home/blessedg/asrq/outputs/rotation/openai-whisper-large-v3_rotation_w4a4_alternating.pt', 'evaluate=true']
+Traceback (most recent call last):
+  File "/home/blessedg/asrq/asrq/exp.py", line 92, in main
+    transform.apply_transform(modelQ)
+  File "/home/blessedg/asrq/asrq/transforms/rotation/base.py", line 275, in apply_transform
+    rotate_parakeet(model, "outputs/rotation_test_audio.wav", path, device="cuda")
+  File "/home/blessedg/asrq/asrq/transforms/rotation/parakeet_ctc_utils.py", line 1302, in rotate_parakeet
+    fuse_parakeet_ctc_layers_with_rotations(model, Qe, Q2s, device=device)  # fuse rotations into weights
+  File "/home/blessedg/asrq/asrq/transforms/rotation/parakeet_ctc_utils.py", line 655, in fuse_parakeet_ctc_layers_with_rotations
+    fuse_rotation_param_into_linear(layer, Q_layer, Q2=Q2_layer, for_rotated_input=for_rotated_input) # type: ignore
+  File "/home/blessedg/asrq/asrq/transforms/rotation/parakeet_ctc_utils.py", line 237, in fuse_rotation_param_into_linear
+    linear.weight.data = (linear.weight.data.double().flatten(1) @ Q_d).to(dtype=dtype, device=device).reshape(linear.weight.shape)
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (1024x1024 and 1280x1280)
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

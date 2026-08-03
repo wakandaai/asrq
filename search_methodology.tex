@@ -1,0 +1,117 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,bm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\NMSE}{\operatorname{NMSE}}
+
+\title{Methodology: Search-Based Structured Rotations for Quantization-Robust ASR Models}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Methodology}
+
+\subsection{Motivation}
+Low-bit post-training quantization is attractive for large automatic speech recognition (ASR) models because it reduces memory footprint, bandwidth, and inference cost. However, aggressive quantization of weights and activations is often limited by the presence of outliers. A small number of large coordinates stretches the quantization range and forces the majority of values to share a coarse set of quantization levels. The central insight behind SpinQuant is that many Transformer computations are invariant to paired orthogonal rotations in full precision, while the same rotations may substantially alter quantization error after discretization. By rotating intermediate representations into a more quantization-friendly basis, one may reduce the impact of outliers without changing the underlying floating-point model.
+
+Formally, for an activation $x \in \R^d$, weight matrix $W \in \R^{m \times d}$, and orthogonal rotation $R \in \R^{d \times d}$ with $R^\top R = I$, the floating-point computation satisfies
+\begin{equation}
+Wx = (WR)(R^\top x).
+\end{equation}
+Thus, the floating-point network remains unchanged when a rotation is inserted and appropriately fused into adjacent operators. After quantization, however, the equivalence no longer holds because the quantizer $Q(\cdot)$ is nonlinear:
+\begin{equation}
+WQ(x) \neq (WR)Q(R^\top x)
+\end{equation}
+in general. The role of the rotation is therefore to identify a basis in which the post-quantization error is reduced.
+
+SpinQuant demonstrates that learned rotations can substantially improve low-bit quantization accuracy. At the same time, the method also exposes a practical tension: the quantization objective is highly sensitive to the chosen rotation, but optimizing dense orthogonal matrices with Cayley SGD is computationally expensive and operationally delicate. This motivates the search for an alternative optimization strategy that preserves the core benefit of rotation---outlier reduction and reduced fake-quantization error---while lowering the cost and instability of training dense orthogonal parameters.
+
+\subsection{Why Search Instead of Cayley Optimization}
+SpinQuant parameterizes rotations as dense orthogonal matrices and learns them with manifold-constrained optimization. Although effective, this design has several drawbacks when transferred to large ASR systems such as Whisper and Parakeet.
+
+First, dense rotation learning is expensive in both memory and compute. The objective must be evaluated on the fake-quantized model, which requires repeated replay of large Transformer blocks under quantization noise. In speech models, the cost is amplified by long acoustic sequences and by the need to propagate calibration batches through deep encoder stacks.
+
+Second, Cayley-style optimization introduces a difficult optimization problem on the Stiefel manifold. In practice, this makes the method sensitive to learning rate, initialization, and calibration setup. A poor hyperparameter choice may lead to slow progress or unstable optimization even when the underlying rotation family is expressive enough.
+
+Third, dense learned rotations obscure the structure that appears most relevant to quantization. The goal is not arbitrary representational change; it is to redistribute energy, suppress outlier channels, and reduce the quantization error induced by a small number of bits. This suggests that a structured search over fast orthogonal transforms may capture much of the relevant design space without incurring the full cost of dense manifold optimization.
+
+These considerations motivate a search-based alternative. Rather than optimizing dense matrices with gradient updates, we search over a discrete family of structured Hadamard rotations. This design yields three advantages. It removes the need for gradient-based manifold optimization, constrains the search to transforms that are cheap to represent and apply, and permits the use of task-aligned yet non-differentiable selection criteria. In particular, because search does not require backpropagation through the rotation parameters, one can directly rank candidates by fake-quantized reconstruction error or task loss.
+
+\subsection{Structured Rotation Family}
+We restrict the search space to signed Hadamard rotations. Let $H \in \R^{d \times d}$ denote a normalized Hadamard matrix satisfying $H^\top H = I$, and let $D(s) = \diag(s)$ for a sign vector $s \in \{\pm 1\}^d$. For local attention-site rotations, we use the family
+\begin{equation}
+R_2 = D_0 H D_1,
+\end{equation}
+where $D_0$ and $D_1$ are diagonal sign matrices. This family preserves orthogonality while reducing the parameterization from a dense $d \times d$ matrix to two binary sign vectors.
+
+For the global residual-stream rotation, we use a richer family,
+\begin{equation}
+R_1 = D_0 H D_1 H D_2,
+\end{equation}
+which adds a second Hadamard mixing stage while remaining highly structured. The richer global family is justified because the residual-stream rotation affects the entire encoder and therefore has a broader influence on downstream quantization behavior than a local attention-site rotation.
+
+This parameterization offers an appealing compromise between expressivity and efficiency. It is far more structured than a dense learned orthogonal matrix, but substantially richer than a single random Hadamard transform. Moreover, it preserves the fast-transform interpretation of rotation, which is advantageous for deployment and for reasoning about the effect of the search.
+
+\subsection{Search Space Decomposition}
+We decompose the rotation search into two parts. The first part consists of local per-site rotations $R_2^{(\ell)}$, where $\ell$ indexes attention value/output pathways. These rotations primarily control how local activations are mixed before entering the next block computation. The second part is a global residual-stream rotation $R_1$, which affects the basis seen throughout the encoder.
+
+This decomposition is important because the two types of rotations have different scopes. Local $R_2$ rotations act on restricted subspaces and can be evaluated with layer-local proxies. In contrast, the global $R_1$ rotation modifies the basis of the entire encoder representation and must therefore be assessed with a model-level objective. Treating these two rotation classes identically would either make local search unnecessarily expensive or make global search too myopic.
+
+\subsection{Local Search for Attention-Site Rotations}
+For each local site $\ell$, we search over candidates of the form $R_2^{(\ell)} = D_0 H D_1$ using a fixed-size evolutionary population. Each candidate is represented by its two sign vectors. The search is mutation-only: offspring are generated by flipping subsets of entries in one or both sign vectors, while a small number of elite candidates are preserved across generations.
+
+Given a fixed global rotation $R_1$, the fitness of a local candidate is defined by the normalized mean-squared error between the floating-point block output and the fake-quantized block output:
+\begin{equation}
+\mathcal{F}_\ell(R_2^{(\ell)}) =
+\frac{\left\|Y_\ell^{\mathrm{FP}} - Y_\ell^{\mathrm{FQ}}(R_2^{(\ell)})\right\|_2^2}
+{\left\|Y_\ell^{\mathrm{FP}}\right\|_2^2 + \varepsilon},
+\end{equation}
+where $Y_\ell^{\mathrm{FP}}$ is the output of the enclosing floating-point block and $Y_\ell^{\mathrm{FQ}}$ is the corresponding output under fake quantization after inserting the candidate rotation. This objective is local enough to be evaluated efficiently, yet sufficiently faithful to capture how a candidate rotation affects the downstream computation of the block.
+
+The local sites are searched sequentially rather than independently. After a site is committed, the input distribution of subsequent layers changes. A fully independent search would therefore optimize later sites against stale upstream activations. To preserve consistency while avoiding the cost of full cache recomputation, we use a rolling cache update strategy: after committing site $\ell$, we recompute only the cache needed for the next site, rather than rebuilding all downstream caches from the beginning of the encoder. This substantially reduces both runtime and memory usage while preserving the coordinate-descent character of the local search.
+
+\subsection{Global Search for the Residual-Stream Rotation}
+After a sweep over local $R_2$ sites, we search for the global residual-stream rotation $R_1$ over the richer family $D_0 H D_1 H D_2$. Because $R_1$ influences the representation throughout the encoder, we score candidates with an end-to-end fake-quantized objective rather than a block-local proxy.
+
+For Parakeet, the global objective is the average fake-quantized CTC loss over a calibration set:
+\begin{equation}
+\mathcal{L}_{\mathrm{global}}(R_1)
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+\mathcal{L}_{\mathrm{CTC}}
+\left(
+f_{\mathrm{FQ}}(x_i; R_1, \{R_2^{(\ell)}\})
+,
+y_i
+\right).
+\end{equation}
+For Whisper, we analogously use the average fake-quantized teacher-forced cross-entropy loss. In both cases, the objective is directly aligned with the downstream ASR task rather than with a purely statistical property of the activations.
+
+\subsection{Alternating Optimization Schedule}
+Our full procedure alternates between local and global search. Starting from an initialized global rotation $R_1$ and local rotations $\{R_2^{(\ell)}\}$, we first run a local sweep over all $R_2$ sites. We then perform a global search over $R_1$ while keeping the local rotations fixed. If the best global candidate improves the task-level score by at least a threshold $\delta$, we accept the update and run a shorter local refinement sweep. Otherwise, we terminate early.
+
+This alternating schedule reflects the asymmetry between the two rotation types. Local rotations should adapt to the current global basis, while the global basis should be chosen with awareness of the locally optimized quantization behavior. The outer loop is therefore
+\begin{equation}
+R_2 \rightarrow R_1 \rightarrow R_2,
+\end{equation}
+with configurable repetition count and early stopping based on the improvement of the global objective.
+
+\subsection{Computational Advantages}
+The proposed method offers several computational advantages over dense Cayley optimization.
+
+First, the search operates in a discrete structured space, eliminating the need for backpropagation through dense orthogonal parameters and avoiding manifold-specific optimization machinery. Second, the signed Hadamard parameterization yields a compact candidate representation with much lower storage and update cost than a dense rotation matrix. Third, the decomposition into local and global search allows the use of objectives with different fidelities: local block-level $\NMSE$ for $R_2$ and end-to-end fake-quantized task loss for $R_1$. Fourth, the rolling cache update strategy reduces the dominant overhead of repeated block replay by advancing caches only to the next required site rather than rebuilding the full encoder cache after each local update.
+
+Taken together, these choices produce a search method that is more stable, more interpretable, and more deployment-aware than dense Cayley optimization, while preserving the essential insight of SpinQuant: quantization performance depends strongly on the chosen rotation basis, and therefore the basis should be selected rather than assumed.
+
+\subsection{Expected Benefits}
+We emphasize that the goal of the search-based method is not merely to reproduce SpinQuant with a different optimizer. Rather, the aim is to identify a structured, lower-cost alternative that retains most of the quantization benefit of learned rotations. By restricting the search to fast Hadamard families, decomposing the problem into local and global subproblems, and using task-aligned selection criteria, the proposed method seeks to recover the main advantage of SpinQuant---reduced post-quantization degradation---with improved robustness and efficiency.
+
+\end{document}
