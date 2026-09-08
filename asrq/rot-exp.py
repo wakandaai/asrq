@@ -18,7 +18,6 @@ import asrq.evaluation.openasr as openasr
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 
-
 def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)

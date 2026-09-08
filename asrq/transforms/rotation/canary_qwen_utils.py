@@ -7,29 +7,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import types
-from typing import Any, List, Tuple, Optional, Union, Dict
+from typing import List, Tuple, Optional, Union, Dict
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 
 from asrq.transforms.rotation.utils import (
     RMSNormFusedM,
     STEQuantize,
-    ste_quantize_weight,
-    modify_linear_with_rotation_param,
-    fuse_rotation_param_into_linear,
     convert_model_layernorms_to_rmsnorms,
-    fuse_hadamard_into_linear,
     get_orthogonal_matrix,
-    matches_layer_suffix,
-    apply_to_rotated_layers,
     fuse_normalization_weights_and_bias_into_adjacent_linears
-)
-from asrq.transforms.rotation.hadamard_utils import matmul_hadU_auto
-from asrq.transforms.rotation.hadamard_search import (
-    HadamardSearchConfig,
-    check_search_is_meaningful,
-    evolutionary_sign_search,
-    make_batch_evaluator,
-    write_rotations_,
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
 from transformers.models.qwen3.modeling_qwen3 import (
@@ -60,7 +46,7 @@ class CanaryQwenCalibrationDataset(torch.utils.data.Dataset):
 
     def __init__(self, model, num_samples=128, seed=42):
         super().__init__()
-        ds = load_dataset("librispeech_asr", "all", split="train.clean.100")
+        ds = load_dataset("openslr/librispeech_asr", "all", split="train.clean.100")
         ds = ds.shuffle(seed=seed)
         self.samples = list(islice(ds, num_samples))
         self.model = model
@@ -159,6 +145,85 @@ def canaryqwen_loss_fn(model, batch):
         ignore_index=-100,
     ) / num_frames
     return loss
+
+
+def modify_linear_with_rotation_param(
+        linear: Union[nn.Linear, RMSNormFusedM, nn.Conv1d],
+        Q: nn.Parameter,
+        Q2: Optional[nn.Parameter] = None,
+        for_rotated_input: bool = True,
+        for_norm_out: bool = True,
+        bit: int = 4,
+        include_activation_quant: bool = True,
+) -> None:
+    """Modify the given linear layer to include the rotation parameter Q in its forward pass."""
+
+    def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
+        # quantize the input activations with STE quantization
+        if include_activation_quant:
+            x = STEQuantize.apply(x, bit=8) # type: ignore
+        # Apply the rotation to the weight
+        rotated_bias = self.bias
+        rotated_weight = self.weight
+        dtype = self.weight.dtype
+        orig_shape = self.weight.shape
+
+        if for_norm_out:
+            # W_rotated = Q^T @ diag(weight) @ Q  (full D×D matrix when weight is 1-D)
+            w = linear.weight.double()
+            if w.dim() == 1:
+                w = torch.diag(w)
+            rotated_weight = (Q.t().double() @ w) @ Q.double()
+            if rotated_bias is not None:  
+                rotated_bias = (rotated_bias.unsqueeze(0).double() @ Q.double())
+
+        elif for_rotated_input:
+            if Q is not None:
+                rotated_weight = self.weight.to(Q.dtype).flatten(1) @ Q
+            if Q2 is not None:
+                hdim = Q2.shape[0]
+                w_ = rotated_weight.t()
+                org_shape = w_.shape
+                temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
+                temp = (temp.to(Q2.dtype) @ Q2)
+                rotated_weight = temp.reshape(org_shape).t()
+                if self.bias is not None:
+                    org_shape = self.bias.shape
+                    temp = self.bias.reshape(-1, org_shape[-1]//hdim, hdim)
+                    temp = (temp.to(Q2.dtype) @ Q2)
+                    rotated_bias = temp.reshape(org_shape).to(self.bias.dtype)
+
+        else:
+            if Q is not None:
+                rotated_weight = Q.T @ self.weight.to(Q.dtype).flatten(1)
+                if self.bias is not None:
+                    rotated_bias = (self.bias.data.to(Q.dtype) @ Q).to(x.dtype)
+            if Q2 is not None:
+                hdim = Q2.shape[0]
+                org_shape = rotated_weight.shape
+                temp = rotated_weight.reshape(-1, org_shape[-1]//hdim, hdim)
+                temp = temp.to(Q2.dtype) @ Q2
+                rotated_weight = temp.reshape(org_shape)
+        
+        if for_norm_out and rotated_weight.shape != orig_shape:
+            w = rotated_weight
+            if rotated_bias is not None: rotated_bias = rotated_bias.squeeze(0).to(x.dtype)
+        else:
+            w = rotated_weight.reshape(orig_shape)
+            if rotated_bias is not None: rotated_bias = rotated_bias.reshape(self.bias.shape).to(x.dtype)
+        # continue with the normal linear forward using the rotated weight
+        if isinstance(linear, nn.Linear):
+            return F.linear(x, w.to(x.dtype), rotated_bias)
+        elif isinstance(linear, nn.Conv1d):
+            return F.conv1d(
+                x, w.to(x.dtype), rotated_bias, self.stride, self.padding, self.dilation, self.groups
+            )
+        elif isinstance(linear, RMSNormFusedM):
+            return F.rms_norm(x, normalized_shape=self.normalized_shape, eps=self.eps) @  w.to(x.dtype) + (rotated_bias if self.bias is not None else 0.0)
+        else:
+            raise Exception()
+        
+    linear.forward = types.MethodType(modified_forward, linear)
 
 
 def get_canaryqwen_norm_fusion_config(
@@ -631,107 +696,154 @@ def prepare_canaryqwen_for_rotation(model: nn.Module) -> None:
     # fuse_qkv_norms(model, num_decoder_layers)
 
 
-# The down-projections, whose input is the MLP intermediate rather than the Q-rotated
-# residual stream, so they are where the online Hadamard goes: "mlp.down_proj" in the Qwen
-# decoder, and the Conformer encoder's two feed-forward outputs (as in parakeet).
-DOWN_PROJ_SUFFIXES: Tuple[str, ...] = (
-    "mlp.down_proj",
-    "feed_forward1.linear2",
-    "feed_forward2.linear2",
-    # Fed by the conv module's activation, so a down-projection in all but name.
-    "conv.pointwise_conv2",
-)
-
-
-def resolve_canaryqwen_rotations(layer_name: str, Qe, Qd, Q2s: Dict[str, Any]):
-    """Which rotations this layer needs: ``(Q, Q2, for_norm_out)``.
-
-    Two residual streams: Qe for the Conformer encoder, Qd for the Qwen decoder. Q2 is the
-    head-wise rotation, taken by o_proj / v_proj on the decoder side and
-    linear_v / linear_out on the encoder side. norm_out becomes ``Q^T diag(w) Q``.
-
-    v_proj is split by LoRA into three modules that need different treatment:
-      base_layer      -- both Q and Q2
-      lora_A.default  -- Q only (its output is the low-rank bottleneck, not head-shaped)
-      lora_B.default  -- Q2 only; Q is None, since its input is the bottleneck rather than
-                         the rotated residual stream
-    """
-    stem_name, leaf_name = layer_name.rsplit(".", 1)
-    Q = Qe if "encoder" in layer_name else Qd
-    Q2 = None
-    for_norm_out = False
-
-    if "v_proj" in layer_name:
-        left, right = layer_name.split(".v_proj")
-        if right == ".base_layer":
-            Q2 = Q2s.get(left)
-        elif right == ".lora_A.default":
-            Q2 = None
-        elif right == ".lora_B.default":
-            Q, Q2 = None, Q2s.get(left)
-        else:
-            raise ValueError(f"Unexpected v_proj layer name format: '{layer_name}'")
-    elif layer_name.endswith("o_proj"):
-        Q2 = Q2s.get(stem_name)
-        assert Q2 is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
-
-    if leaf_name in ("linear_v", "linear_out"):
-        Q2 = Q2s.get(stem_name)
-        assert Q2 is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
-    elif leaf_name == "norm_out":
-        for_norm_out = True
-
-    return Q, Q2, for_norm_out
-
-
-def _canaryqwen_layers(model):
-    return get_canaryqwen_layers_to_rotate(
-        len(model.perception.encoder.layers),  # type: ignore
-        model.llm.config.num_hidden_layers,    # type: ignore
-    )
-
-
 def modify_canaryqwen_layers_with_rotation_params(
-    model: nn.Module, Qe: nn.Parameter, Qd: nn.Parameter, Q2s: Dict[str, nn.Parameter],
+    model: nn.Module, Qe: nn.Parameter, Qd: nn.Parameter, Q2s: Dict[str, nn.Parameter], 
     include_weight_quant: bool = False,
-    activation_bits: int = 16,
-    online_hadamard: bool = True,
-    quantize_weights: bool = False, weight_bits: int = 4, weight_group_size=None,
+    include_activation_quant: bool = False,
 ) -> None:
-    """Rotate CanaryQwen's layers on the fly (training / search path)."""
-    def resolve(layer_name):
-        Q, Q2, for_norm_out = resolve_canaryqwen_rotations(layer_name, Qe, Qd, Q2s)
-        return Q, Q2, dict(
-            for_norm_out=for_norm_out, bit=weight_bits, activation_bits=activation_bits,
-            quantize_weights=quantize_weights, weight_group_size=weight_group_size,
-            online_hadamard=online_hadamard and matches_layer_suffix(layer_name, DOWN_PROJ_SUFFIXES),
+    """Modify linear layers to include rotation parameters Qe (encoder) and Qd (decoder) in their forward pass."""
+    num_encoder_layers = len(model.perception.encoder.layers) # type: ignore
+    num_decoder_layers = model.llm.config.num_hidden_layers # type: ignore
+    layers_to_rotate = get_canaryqwen_layers_to_rotate(num_encoder_layers, num_decoder_layers) # type: ignore
+    named_modules = dict(model.named_modules())
+    for layer_name, for_rotated_input in layers_to_rotate:
+        layer = named_modules.get(layer_name)
+        if layer is None:
+            raise ValueError(f"Layer '{layer_name}' not found in model.")
+        stem_name, leaf_name = layer_name.rsplit(".", 1)
+        Q_layer = Qe if "encoder" in layer_name else Qd  # per-layer copy; never overwrite the outer Q
+        Q2_layer = None
+
+        # For decoder
+        if "v_proj" in layer_name:
+            left, right = layer_name.split(".v_proj")
+            if right == ".base_layer":
+                Q2_layer = Q2s.get(left, None)
+            elif right == ".lora_A.default":
+                Q2_layer = None
+            elif right == ".lora_B.default":
+                Q_layer = None
+                Q2_layer = Q2s.get(left, None)
+            else:
+                raise ValueError(f"Unexpected v_proj layer name format: '{layer_name}'")
+            
+        elif layer_name.endswith("o_proj"):
+             Q2_layer = Q2s.get(stem_name, None)
+             assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
+        elif "linear_v" in layer_name or "linear_out" in layer_name:
+            Q2_layer = Q2s.get(stem_name, None)
+            assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary." 
+
+        if leaf_name in ["down_proj"]:
+            include_activation_quant = False
+
+        for_norm_out = False
+        # For Encoder
+        if leaf_name in ["linear_v", "linear_out"]:
+            Q2_layer = Q2s.get(stem_name, None)
+            assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
+        # norm out
+        elif leaf_name == "norm_out":
+            # norm out has a linear layer multiplied on the left by Q^T and by Q
+            # layer(XQ^T)Q
+            for_norm_out = True
+
+        modify_linear_with_rotation_param(
+            layer, Q_layer, Q2=Q2_layer, for_rotated_input=for_rotated_input, # type: ignore
+            for_norm_out=for_norm_out, bit=4, include_activation_quant=include_activation_quant
         )
 
-    apply_to_rotated_layers(model, _canaryqwen_layers(model), resolve, modify_linear_with_rotation_param)
+
+def fuse_rotation_param_into_linear(
+        linear: nn.Linear,
+        Q: torch.Tensor,
+        Q2: Optional[torch.Tensor] = None,
+        for_rotated_input: bool = True,
+) -> None:
+    """Fuse the rotation parameter Q into the given linear layer's weights (and bias if for_rotated_input=False)."""
+    dtype = linear.weight.data.dtype
+    device = linear.weight.data.device
+    if isinstance(linear, RMSNormFusedM):
+        w = linear.weight.data.double()
+        if w.dim() == 1:
+            w = torch.diag(w)
+        linear.weight.data = (Q.double().t() @ w @ Q.double()).to(linear.weight.dtype)
+        if linear.bias is not None:
+            linear.bias.data = (linear.bias.data.unsqueeze(0).double() @ Q.double()).to(linear.bias.dtype)
+    elif for_rotated_input: 
+        if Q is not None:
+            Q_d = Q.double().to(device)
+            linear.weight.data = (linear.weight.data.double().flatten(1) @ Q_d).to(dtype=dtype, device=device).reshape(linear.weight.shape)
+        if Q2 is not None:
+            hdim = Q2.shape[0]
+            w_ = linear.weight.data.double().t()
+            org_shape = w_.shape
+            temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
+            temp = (temp.double() @ Q2.double())
+            linear.weight.data = temp.reshape(org_shape).t().to(dtype=dtype, device=device)
+            if linear.bias is not None:
+                org_shape = linear.bias.shape
+                temp = linear.bias.data.double().reshape(-1, org_shape[-1]//hdim, hdim)
+                temp = (temp.double() @ Q2.double())
+                linear.bias.data = temp.reshape(org_shape).to(dtype=linear.bias.data.dtype, device=linear.bias.data.device)
+    else:
+        if Q is not None:
+            Q_d = Q.double().to(device)
+            linear.weight.data = (Q_d.T @ linear.weight.data.double().flatten(1)).to(dtype=dtype, device=device).reshape(linear.weight.shape)
+            if linear.bias is not None:
+                linear.bias.data = (linear.bias.data.double().unsqueeze(0) @ Q_d).to(dtype=dtype, device=device).reshape(linear.bias.shape)
+        if Q2 is not None:
+            hdim = Q2.shape[0]
+            # No transpose here: Q2 rotates within heads of the INPUT dimension
+            # (last dim of weight shape (out, in)), matching the on-the-fly version.
+            w_ = linear.weight.data.double()
+            org_shape = w_.shape
+            temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
+            temp = (temp.double() @ Q2.double())
+            linear.weight.data = temp.reshape(org_shape).to(dtype=dtype, device=device)
 
 
 def fuse_canaryqwen_layers_with_rotations(
     model: nn.Module, Qe: torch.Tensor, Qd: torch.Tensor, Q2s: Dict[str, torch.Tensor],
-    device = "cuda", online_hadamard: bool = True,
-    hadamard_block_size: Optional[int] = None,
+    device = "cuda"
 ) -> None:
-    """Bake CanaryQwen's rotations into the weights (inference path).
+    """Fuse rotation matrices Q (and Q2) into the model's linear layer weights."""
+    named_modules = dict(model.named_modules())
+    num_encoder_layers = len(model.perception.encoder.layers) # type: ignore
+    num_decoder_layers = model.llm.config.num_hidden_layers # type: ignore
+    layers_to_rotate = get_canaryqwen_layers_to_rotate(num_encoder_layers, num_decoder_layers) # type: ignore
+    for layer_name, for_rotated_input in layers_to_rotate:
+        layer = named_modules.get(layer_name)
+        if layer is None:
+            raise ValueError(f"Layer '{layer_name}' not found in model.")
+        stem_name, leaf_name = layer_name.rsplit(".", 1)  # per-layer copy; never overwrite the outer Q
+        Q_layer = Qe if "encoder" in layer_name else Qd
+        Q2_layer = None
 
-    ``online_hadamard=True`` also fuses a Hadamard into each down-projection's weight and
-    leaves a fast Hadamard transform on its input. Note the LoRA layers: v_proj.base_layer
-    and v_proj.lora_A.default both read the same activations and each get their own H,
-    while lora_B.default is rotated on its rank-sized input - so the LoRA rank has to be a
-    size get_hadK can handle.
-    """
-    def resolve(layer_name):
-        # for_norm_out is not passed here: the fuse path detects RMSNormFusedM by type.
-        Q, Q2, _ = resolve_canaryqwen_rotations(layer_name, Qe, Qd, Q2s)
-        return (Q.to(device) if Q is not None else None), (Q2.to(device) if Q2 is not None else None), dict(
-            online_hadamard=online_hadamard and matches_layer_suffix(layer_name, DOWN_PROJ_SUFFIXES),
-            hadamard_block_size=hadamard_block_size,
-        )
+        if "v_proj" in layer_name:
+            left, right = layer_name.split(".v_proj")
+            if right == ".base_layer":
+                Q2_layer = Q2s.get(left, None)
+            elif right == ".lora_A.default":
+                Q2_layer = None
+            elif right == ".lora_B.default":
+                Q_layer = None
+                Q2_layer = Q2s.get(left, None)
+            else:
+                raise ValueError(f"Unexpected v_proj layer name format: '{layer_name}'")
+        elif leaf_name == "o_proj":
+             Q2_layer = Q2s.get(stem_name, None)
+             assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
 
-    apply_to_rotated_layers(model, _canaryqwen_layers(model), resolve, fuse_rotation_param_into_linear)
+        # For Encoder
+        if leaf_name in ["linear_v", "linear_out"]:
+            Q2_layer = Q2s.get(stem_name, None)
+            assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
+
+        if Q_layer is not None: Q_layer = Q_layer.to(device)
+        if Q2_layer is not None: Q2_layer = Q2_layer.to(device)
+
+        fuse_rotation_param_into_linear(layer, Q_layer, Q2=Q2_layer, for_rotated_input=for_rotated_input) # type: ignore
 
 
 def transcribe(model, filepath):
@@ -745,8 +857,7 @@ def transcribe(model, filepath):
     return transcript
 
 
-def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:int, epochs:int, batch_size:int, lr:float, save_path:str,
-                                     activation_bits: int = 16, online_hadamard: bool = True):
+def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:int, epochs:int, batch_size:int, lr:float, save_path:str):
     # if os.path.exists(save_path):
     #     # exit
     #     sys.exit(0)
@@ -799,7 +910,7 @@ def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:i
     # Modify linear layers to include rotation in their forward pass
     modify_canaryqwen_layers_with_rotation_params(
         model, Qe, Qd, Q2s,
-        include_weight_quant=False, activation_bits=activation_bits, online_hadamard=online_hadamard
+        include_weight_quant=False, include_activation_quant=False
     )
     # Monkey-patch the Qwen3Model forward to rotate residual stream
     monkey_patch_canaryqwen_for_train(model, Qe, Qd)
@@ -866,78 +977,7 @@ def obtain_rotations_for_canary_qwen(model, test_audio_path:str, calib_samples:i
     }
     torch.save(to_save, save_path)
     
-def search_rotations_for_canary_qwen(
-        model, calib_samples: int, batch_size: int, save_path: str, activation_bits: int,
-        search_cfg: HadamardSearchConfig = HadamardSearchConfig(),
-        online_hadamard: bool = True, device: str = "cuda",
-        quantize_weights: bool = False, weight_bits: int = 4, weight_group_size=None,
-        rotation_block_size=None,
-    ) -> None:
-    """Pick Qe/Qd/Q2s by searching the sign vectors of randomized Hadamard rotations.
-
-    Saves in the same format as :func:`obtain_rotations_for_canary_qwen`, so the result is
-    applied by the usual :func:`rotate_canary_qwen` path.
-    """
-    from functools import partial
-
-    check_search_is_meaningful(activation_bits, quantize_weights)
-    model.to(device)
-    with torch.no_grad():
-        prepare_canaryqwen_for_rotation(model)
-
-    num_encoder_layers = len(model.perception.encoder.layers)
-    num_decoder_layers = model.llm.config.num_hidden_layers
-    sign_sizes = {
-        "Qe": model.perception.encoder.layers[0].conv.d_model,
-        "Qd": model.llm.config.hidden_size,
-    }
-    for i in range(num_decoder_layers):
-        sign_sizes[f"llm.base_model.model.model.layers.{i}.self_attn"] = \
-            model.llm.base_model.model.model.layers[i].self_attn.head_dim
-    for i in range(num_encoder_layers):
-        sign_sizes[f"perception.encoder.layers.{i}.self_attn"] = \
-            model.perception.encoder.layers[i].self_attn.d_k
-
-    params = {
-        name: nn.Parameter(torch.eye(size, device=device, dtype=torch.float32), requires_grad=False)
-        for name, size in sign_sizes.items()
-    }
-    Qe, Qd = params["Qe"], params["Qd"]
-    Q2s = {name: p for name, p in params.items() if name not in ("Qe", "Qd")}
-
-    modify_canaryqwen_layers_with_rotation_params(
-        model, Qe, Qd, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard,
-        quantize_weights=quantize_weights, weight_bits=weight_bits, weight_group_size=weight_group_size,
-    )
-    monkey_patch_canaryqwen_for_train(model, Qe, Qd)
-
-    calib_ds = CanaryQwenCalibrationDataset(model, num_samples=calib_samples)
-    loader = torch.utils.data.DataLoader(
-        calib_ds, batch_size=batch_size, shuffle=False, num_workers=0,
-        collate_fn=partial(canaryqwen_collate_fn, pad_id=model.text_pad_id),
-    )
-    batches = [b for _, b in zip(range(search_cfg.batches_per_eval), loader)]
-    model.eval()
-
-    # Only the residual-stream rotations are block diagonal; Q2 stays a full head_dim
-    # rotation, since a head is already smaller than a weight quantization group.
-    block_sizes = {name: (rotation_block_size if name in ("Qe", "Qd") else None) for name in sign_sizes}
-    evaluate = make_batch_evaluator(model, canaryqwen_loss_fn, batches, params, block_sizes)
-    best_signs, best_loss, history = evolutionary_sign_search(sign_sizes, evaluate, search_cfg)
-    print(f"[hadamard-search] canary-qwen best loss {best_loss:.6f} (from {history[0]:.6f})")
-
-    write_rotations_(params, best_signs, block_sizes)
-    torch.save(
-        {
-            "Qe": Qe.data.detach().cpu(),
-            "Qd": Qd.data.detach().cpu(),
-            "Q2s": {k: v.data.detach().cpu() for k, v in Q2s.items()},
-        },
-        save_path,
-    )
-
-
-def rotate_canary_qwen(model, test_audio_file:str, rotation_path:str, device="cuda", online_hadamard: bool = True):
+def rotate_canary_qwen(model, test_audio_file:str, rotation_path:str, device="cuda"):
     device = model.device
     with torch.no_grad():
         orig_transcription = transcribe(model, test_audio_file)
@@ -947,7 +987,7 @@ def rotate_canary_qwen(model, test_audio_file:str, rotation_path:str, device="cu
     Qe = rotations["Qe"]
     Qd = rotations["Qd"]
     Q2s = rotations["Q2s"]
-    fuse_canaryqwen_layers_with_rotations(model, Qe, Qd, Q2s, device=device, online_hadamard=online_hadamard)  # fuse rotations into weights
+    fuse_canaryqwen_layers_with_rotations(model, Qe, Qd, Q2s, device=device)  # fuse rotations into weights
     monkey_patch_canaryqwen_for_train(model, Qe.to(device), Qd.to(device))
 
     with torch.no_grad():

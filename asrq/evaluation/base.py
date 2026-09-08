@@ -9,16 +9,17 @@ from asrq.quantizers.activation import modify_linears_with_activation_quantizati
 # third_party/open_asr_leaderboard/transformers/run_whisper.sh. The leaderboard now
 # scores the cleaned variants of ami/gigaspeech/voxpopuli, and tedlium was dropped.
 DATASET_SPLITS = [
-    # ("ami_cleaned", "test"),
-    ("ami", "test"),
-    # ("gigaspeech_cleaned", "test"),
+    ("ami_cleaned", "test"),
+    # ("ami", "test"),
     ("earnings22", "test"),
-    ("gigaspeech", "test"),
-    # ("voxpopuli_cleaned_aa", "test"),
+    # "earnings22_cleaned_aa_chunked test ArtificialAnalysis/Earnings22-Cleaned-AA-chunked",
+    # ("gigaspeech", "test"),
+    ("gigaspeech_cleaned", "test"),
     ("librispeech", "test.clean"),
     ("librispeech", "test.other"),
     ("spgispeech", "test"),
-    ("voxpopuli", "test"),
+    # ("voxpopuli", "test"),
+    ("voxpopuli_cleaned_aa", "test"),
 ]
 
 
@@ -36,12 +37,18 @@ def evaluate_openasr(modelQ, cfg, generate_fn, evaluation_results_file, create_a
         linears_to_quantize = modelQ.for_activation_quantization()
         modify_linears_with_activation_quantization(model, linears_to_quantize, bits=cfg.activation_bits)
 
+    if cfg.debug:
+        print(f"Debug mode enabled: evaluating only {cfg.debug_eval_batches} batches per dataset/split")
+        batches_to_eval = cfg.debug_eval_batches
+    else:
+        batches_to_eval = None
+        
     for dataset, split in DATASET_SPLITS:
         print(f"Evaluating dataset {dataset} split {split}...")
         result = evaluate_model(
             model, batch_size=cfg.model.eval_batch_size, dataset_path=DATASET_PATH, dataset=dataset,
             split=split, cache_dir="", eval_id="whisper", save_results_manifest=False, save_results_metrics=False, processor=modelQ.processor, generate_fn=generate_fn,
-            batches_to_eval=10, create_audio_files=create_audio_files
+            batches_to_eval=batches_to_eval, create_audio_files=create_audio_files
         )
         with open(evaluation_results_file, "a") as f:
             f.write(f"{cfg.model.name},{cfg.method},{cfg.quantizer.name},{cfg.transform.name},{cfg.quantizer.bits},{cfg.activation_bits},{dataset},{split},{result['wer']}\n")

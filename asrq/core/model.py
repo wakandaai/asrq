@@ -102,7 +102,7 @@ class ModelQ(ABC):
         self.calibration_samples = []
         num_samples = self.calib_cfg.num_samples
         if num_samples is not None:
-            ds = load_dataset("librispeech_asr", "all", split="train.clean.360")
+            ds = load_dataset("openslr/librispeech_asr", "all", split="train.clean.360")
             ds = ds.shuffle(seed=42)
             subset = list(islice(ds, num_samples))
             for sample in tqdm(subset, desc="Loading calibration samples"):

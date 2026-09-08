@@ -9,26 +9,11 @@ import types
 from asrq.transforms.rotation.utils import (
     RMSNormFusedM,
     STEQuantize,
-    ste_quantize_weight,
-    modify_linear_with_rotation_param,
-    fuse_rotation_param_into_linear,
     convert_model_layernorms_to_rmsnorms,
-    fuse_hadamard_into_linear,
     fuse_normalization_weights_and_bias_into_adjacent_linears,
     get_orthogonal_matrix,
-    matches_layer_suffix,
-    apply_to_rotated_layers,
-)
-from asrq.transforms.rotation.hadamard_utils import matmul_hadU_auto
-from asrq.transforms.rotation.hadamard_search import (
-    HadamardSearchConfig,
-    check_search_is_meaningful,
-    evolutionary_sign_search,
-    make_batch_evaluator,
-    write_rotations_,
 )
 from asrq.transforms.rotation.cayley_sgd import SGDG
-from functools import partial
 
 try:
     from nemo.collections.asr.modules.conformer_encoder import (
@@ -39,17 +24,17 @@ except ImportError:
 from datasets import load_dataset
 from itertools import islice
 
-from typing import Any, List, Tuple, Optional, Union, Dict
+from typing import List, Tuple, Optional, Union, Dict
 
 
 
 
 class ParakeetCalibrationDataset(torch.utils.data.Dataset):
-    """LibriSpeech train-clean-100 samples formatted for Parakeet CTC rotation training."""
+    """LibriSpeech train-clean-100 samples formatted for CanaryQwen rotation training."""
 
     def __init__(self, model, num_samples=128, seed=42):
         super().__init__()
-        ds = load_dataset("librispeech_asr", "all", split="train.clean.100")
+        ds = load_dataset("openslr/librispeech_asr", "all", split="train.clean.100")
         ds = ds.shuffle(seed=seed)
         self.samples = list(islice(ds, num_samples))
         self.model = model
@@ -63,10 +48,10 @@ class ParakeetCalibrationDataset(torch.utils.data.Dataset):
         audio_len = torch.tensor(audio.shape[0], dtype=torch.long)
         text = sample["text"]
 
-        # CTC targets are just the label sequence - no EOS/BOS (unlike the autoregressive
-        # Canary-Qwen decoder). parakeet's tokenizer.eos is -1 (NeMo's "unset" sentinel for
-        # CTC tokenizers), so appending it would feed CTCLoss an out-of-range target id.
+        # Append transcription tokens and EOS
         tokens = torch.tensor(self.model.tokenizer.text_to_ids(text), dtype=torch.long)
+        eos = torch.tensor([self.model.tokenizer.eos], dtype=torch.long)
+        tokens = torch.cat([tokens, eos])
         tokens_len = torch.tensor(tokens.shape[0], dtype=torch.long)
 
         return audio, audio_len, tokens, tokens_len
@@ -109,6 +94,136 @@ def parakeet_ctc_loss_fn(model, batch):
 
     return loss
 
+
+def modify_linear_with_rotation_param(
+        linear: Union[nn.Linear, RMSNormFusedM],
+        Q: nn.Parameter,
+        Q2: Optional[nn.Parameter] = None,
+        for_rotated_input: bool = True,
+        for_norm_out: bool = True,
+        bit: int = 4,
+        include_activation_quant: bool = True,
+) -> None:
+    """Modify the given linear layer to include the rotation parameter Q in its forward pass."""
+
+    def modified_forward(self, x: torch.Tensor) -> torch.Tensor:
+        # quantize the input activations with STE quantization
+        if include_activation_quant:
+            x = STEQuantize.apply(x, bit=8) # type: ignore
+        # Apply the rotation to the weight
+        rotated_bias = self.bias
+        rotated_weight = self.weight
+        dtype = self.weight.dtype
+        orig_shape = self.weight.shape
+
+        if for_norm_out:
+            # W_rotated = Q^T @ diag(weight) @ Q  (full D×D matrix when weight is 1-D)
+            w = linear.weight.double()
+            if w.dim() == 1:
+                w = torch.diag(w)
+            rotated_weight = (Q.t().double() @ w) @ Q.double()
+            if rotated_bias is not None:  
+                rotated_bias = (rotated_bias.unsqueeze(0).double() @ Q.double())
+
+        elif for_rotated_input:
+            if Q is not None:
+                rotated_weight = self.weight.to(Q.dtype).flatten(1) @ Q
+            if Q2 is not None:
+                hdim = Q2.shape[0]
+                w_ = rotated_weight.t()
+                org_shape = w_.shape
+                temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
+                temp = (temp.to(Q2.dtype) @ Q2)
+                rotated_weight = temp.reshape(org_shape).t()
+                if self.bias is not None:
+                    org_shape = self.bias.shape
+                    temp = self.bias.reshape(-1, org_shape[-1]//hdim, hdim)
+                    temp = (temp.to(Q2.dtype) @ Q2)
+                    rotated_bias = temp.reshape(org_shape).to(self.bias.dtype)
+
+        else:
+            if Q is not None:
+                rotated_weight = Q.T @ self.weight.to(Q.dtype).flatten(1)
+                if self.bias is not None:
+                    rotated_bias = (self.bias.data.to(Q.dtype) @ Q).to(x.dtype)
+            if Q2 is not None:
+                hdim = Q2.shape[0]
+                org_shape = rotated_weight.shape
+                temp = rotated_weight.reshape(-1, org_shape[-1]//hdim, hdim)
+                temp = temp.to(Q2.dtype) @ Q2
+                rotated_weight = temp.reshape(org_shape)
+        
+        
+        # Perform RTN quantization of weights   
+        if for_norm_out and rotated_weight.shape != orig_shape:
+            w = rotated_weight
+            if rotated_bias is not None: rotated_bias = rotated_bias.squeeze(0).to(x.dtype)
+        else:
+            w = rotated_weight.reshape(orig_shape)
+            if rotated_bias is not None: rotated_bias = rotated_bias.reshape(self.bias.shape).to(x.dtype)
+        # continue with the normal linear forward using the rotated weight
+        if isinstance(linear, nn.Linear):
+            return F.linear(x, w.to(x.dtype), rotated_bias)
+        elif isinstance(linear, nn.Conv1d):
+            return F.conv1d(
+                x, w.to(x.dtype), rotated_bias, self.stride, self.padding, self.dilation, self.groups
+            )
+        elif isinstance(linear, RMSNormFusedM):
+            return F.rms_norm(x, normalized_shape=self.normalized_shape, eps=self.eps) @  w.to(x.dtype) + (rotated_bias if self.bias is not None else 0.0)
+        else:
+            raise Exception()
+        
+
+    linear.forward = types.MethodType(modified_forward, linear)
+
+
+def fuse_rotation_param_into_linear(
+        linear: nn.Linear,
+        Q: torch.Tensor,
+        Q2: Optional[torch.Tensor] = None,
+        for_rotated_input: bool = True,
+) -> None:
+    """Fuse the rotation parameter Q into the given linear layer's weights (and bias if for_rotated_input=False)."""
+    dtype = linear.weight.data.dtype
+    device = linear.weight.data.device
+    if isinstance(linear, RMSNormFusedM):
+        w = linear.weight.data.double()
+        if w.dim() == 1:
+            w = torch.diag(w)
+        linear.weight.data = (Q.double().t() @ w @ Q.double()).to(linear.weight.dtype)
+        if linear.bias is not None:
+            linear.bias.data = (linear.bias.data.unsqueeze(0).double() @ Q.double()).to(linear.bias.dtype)
+    elif for_rotated_input: 
+        if Q is not None:
+            Q_d = Q.double().to(device)
+            linear.weight.data = (linear.weight.data.double().flatten(1) @ Q_d).to(dtype=dtype, device=device).reshape(linear.weight.shape)
+        if Q2 is not None:
+            hdim = Q2.shape[0]
+            w_ = linear.weight.data.double().t()
+            org_shape = w_.shape
+            temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
+            temp = (temp.double() @ Q2.double())
+            linear.weight.data = temp.reshape(org_shape).t().to(dtype=dtype, device=device)
+            if linear.bias is not None:
+                org_shape = linear.bias.shape
+                temp = linear.bias.data.double().reshape(-1, org_shape[-1]//hdim, hdim)
+                temp = (temp.double() @ Q2.double())
+                linear.bias.data = temp.reshape(org_shape).to(dtype=linear.bias.data.dtype, device=linear.bias.data.device)
+    else:
+        if Q is not None:
+            Q_d = Q.double().to(device)
+            linear.weight.data = (Q_d.T @ linear.weight.data.double().flatten(1)).to(dtype=dtype, device=device).reshape(linear.weight.shape)
+            if linear.bias is not None:
+                linear.bias.data = (linear.bias.data.double().unsqueeze(0) @ Q_d).to(dtype=dtype, device=device).reshape(linear.bias.shape)
+        if Q2 is not None:
+            hdim = Q2.shape[0]
+            # No transpose here: Q2 rotates within heads of the INPUT dimension
+            # (last dim of weight shape (out, in)), matching the on-the-fly version.
+            w_ = linear.weight.data.double()
+            org_shape = w_.shape
+            temp = w_.reshape(-1, org_shape[-1]//hdim, hdim)
+            temp = (temp.double() @ Q2.double())
+            linear.weight.data = temp.reshape(org_shape).to(dtype=dtype, device=device)
 
 # =====================================================================================================================
 # =====================================================================================================================
@@ -440,74 +555,66 @@ def prepare_parakeet_ctc_for_rotation(model: nn.Module) -> None:
     fuse_normalization_weights_and_bias_into_adjacent_linears(model, norm_fusion_cfg) # type: ignore
 
 
-# The Conformer's two feed-forward down-projections: the layers whose input is the MLP
-# intermediate rather than the Q-rotated residual stream, so they are where the online
-# Hadamard goes.
-DOWN_PROJ_SUFFIXES: Tuple[str, ...] = (
-    "feed_forward1.linear2",
-    "feed_forward2.linear2",
-    # Fed by the conv module's activation, so a down-projection in all but name.
-    "conv.pointwise_conv2",
-)
-
-
-def resolve_parakeet_ctc_rotations(layer_name: str, Qe, Q2s: Dict[str, Any]):
-    """Which rotations this layer needs: ``(Q, Q2, for_norm_out)``.
-
-    The Conformer encoder has a single residual stream, so every layer takes Qe. Q2 is the
-    head-wise rotation, taken only by linear_v/linear_out. norm_out is the one layer whose
-    weight becomes ``Q^T diag(w) Q`` rather than a one-sided rotation.
-    """
-    stem_name, leaf_name = layer_name.rsplit(".", 1)
-    Q2, for_norm_out = None, False
-    if leaf_name in ("linear_v", "linear_out"):
-        Q2 = Q2s.get(stem_name)
-        assert Q2 is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
-    elif leaf_name == "norm_out":
-        for_norm_out = True
-    return Qe, Q2, for_norm_out
-
-
-def _parakeet_ctc_layers(model):
-    return get_parakeet_ctc_layers_to_rotate(len(model.encoder.layers))  # type: ignore
-
-
 def modify_parakeet_ctc_layers_with_rotation_params(
-    model: nn.Module, Qe: nn.Parameter, Q2s: Dict[str, nn.Parameter],
-    activation_bits: int = 16, online_hadamard: bool = True,
-    quantize_weights: bool = False, weight_bits: int = 4, weight_group_size=None,
+    model: nn.Module, Qe: nn.Parameter, Q2s: Dict[str, nn.Parameter], 
+    include_activation_quant: bool = False,
 ) -> None:
-    """Rotate the Conformer encoder's layers on the fly (training / search path)."""
-    def resolve(layer_name):
-        Q, Q2, for_norm_out = resolve_parakeet_ctc_rotations(layer_name, Qe, Q2s)
-        return Q, Q2, dict(
-            for_norm_out=for_norm_out, bit=weight_bits, activation_bits=activation_bits,
-            quantize_weights=quantize_weights, weight_group_size=weight_group_size,
-            online_hadamard=online_hadamard and matches_layer_suffix(layer_name, DOWN_PROJ_SUFFIXES),
-        )
+    """Modify linear layers to include rotation parameters Qe (encoder) and Qd (decoder) in their forward pass."""
+    num_encoder_layers = len(model.encoder.layers) # type: ignore
+    layers_to_rotate = get_parakeet_ctc_layers_to_rotate(num_encoder_layers)
+    named_modules = dict(model.named_modules())
+    for layer_name, for_rotated_input in layers_to_rotate:
+        layer = named_modules.get(layer_name)
+        if layer is None:
+            raise ValueError(f"Layer '{layer_name}' not found in model.")
+        stem_name, leaf_name = layer_name.rsplit(".", 1)
+        Q_layer = Qe
+        Q2_layer = None
 
-    apply_to_rotated_layers(model, _parakeet_ctc_layers(model), resolve, modify_linear_with_rotation_param)
+        for_norm_out = False
+        if leaf_name in ["linear2"]:
+            include_activation_quant = False
+
+        elif leaf_name in ["linear_v", "linear_out"]:
+            Q2_layer = Q2s.get(stem_name, None)
+            assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
+        # norm out
+        elif leaf_name == "norm_out":
+            # norm out has a linear layer multiplied on the left by Q^T and by Q
+            # layer(XQ^T)Q
+            for_norm_out = True
+
+        modify_linear_with_rotation_param(
+            layer, Q_layer, Q2=Q2_layer, for_rotated_input=for_rotated_input, # type: ignore
+            for_norm_out=for_norm_out, bit=4, include_activation_quant=include_activation_quant
+        )
 
 
 def fuse_parakeet_ctc_layers_with_rotations(
     model: nn.Module, Qe: torch.Tensor, Q2s: Dict[str, torch.Tensor],
-    device = "cuda", online_hadamard: bool = True,
-    hadamard_block_size: Optional[int] = None,
+    device = "cuda"
 ) -> None:
-    """Bake the Conformer encoder's rotations into the weights (inference path).
+    """Fuse rotation matrices Q (and Q2) into the model's linear layer weights."""
+    named_modules = dict(model.named_modules())
+    num_encoder_layers = len(model.encoder.layers) # type: ignore
+    layers_to_rotate = get_parakeet_ctc_layers_to_rotate(num_encoder_layers)
+    for layer_name, for_rotated_input in layers_to_rotate:
+        layer = named_modules.get(layer_name)
+        if layer is None:
+            raise ValueError(f"Layer '{layer_name}' not found in model.")
+        stem_name, leaf_name = layer_name.rsplit(".", 1)  # per-layer copy; never overwrite the outer Q
+        Q_layer = Qe 
+        Q2_layer = None
 
-    ``online_hadamard=True`` additionally fuses a Hadamard into each down-projection's
-    weight and leaves a fast Hadamard transform on its input.
-    """
-    def resolve(layer_name):
-        # for_norm_out is not passed here: the fuse path detects RMSNormFusedM by type.
-        Q, Q2, _ = resolve_parakeet_ctc_rotations(layer_name, Qe, Q2s)
-        return Q.to(device), (Q2.to(device) if Q2 is not None else None), dict(
-            online_hadamard=online_hadamard and matches_layer_suffix(layer_name, DOWN_PROJ_SUFFIXES),
-            hadamard_block_size=hadamard_block_size,
-        )
+        # For Encoder
+        if leaf_name in ["linear_v", "linear_out"]:
+            Q2_layer = Q2s.get(stem_name, None)
+            assert Q2_layer is not None, f"Q2 for layer '{stem_name}' not found in Q2s dictionary."
 
-    apply_to_rotated_layers(model, _parakeet_ctc_layers(model), resolve, fuse_rotation_param_into_linear)
+        if Q_layer is not None: Q_layer = Q_layer.to(device)
+        if Q2_layer is not None: Q2_layer = Q2_layer.to(device)
+
+        fuse_rotation_param_into_linear(layer, Q_layer, Q2=Q2_layer, for_rotated_input=for_rotated_input) # type: ignore
 
 
 def transcribe(model, filepath):
@@ -518,8 +625,7 @@ def transcribe(model, filepath):
     return transcriptions
 
 
-def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int, epochs:int, batch_size:int, lr:float, save_path:str, device="cuda",
-                                  activation_bits: int = 16, online_hadamard: bool = True):
+def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int, epochs:int, batch_size:int, lr:float, save_path:str, device="cuda"):
     
     # load parakeet_ctc model
     model.to(device)
@@ -561,7 +667,7 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
 
     # Modify linear layers to include rotation in their forward pass
     modify_parakeet_ctc_layers_with_rotation_params(
-        model, Qe, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard,
+        model, Qe, Q2s, include_activation_quant=False
     )
     # Monkey-patch the Qwen3Model forward to rotate residual stream
     monkey_patch_parakeet_ctc_for_train(model, Qe)
@@ -631,64 +737,7 @@ def obtain_rotations_for_parakeet(model, text_audio_path:str, calib_samples:int,
     torch.save(to_save, save_path)
 
 
-def search_rotations_for_parakeet(
-        model, calib_samples: int, batch_size: int, save_path: str, activation_bits: int,
-        search_cfg: HadamardSearchConfig = HadamardSearchConfig(),
-        online_hadamard: bool = True, device: str = "cuda",
-        quantize_weights: bool = False, weight_bits: int = 4, weight_group_size=None,
-        rotation_block_size=None,
-    ) -> None:
-    """Pick Qe/Q2s by searching the sign vectors of randomized Hadamard rotations.
-
-    Saves in the same format as :func:`obtain_rotations_for_parakeet`, so the result is
-    applied by the usual :func:`rotate_parakeet` path.
-    """
-    check_search_is_meaningful(activation_bits, quantize_weights)
-    model.to(device)
-    with torch.no_grad():
-        prepare_parakeet_ctc_for_rotation(model)
-
-    num_encoder_layers = len(model.encoder.layers)
-    sign_sizes = {"Qe": model.encoder.layers[0].conv.d_model}
-    for i in range(num_encoder_layers):
-        sign_sizes[f"encoder.layers.{i}.self_attn"] = model.encoder.layers[i].self_attn.d_k
-
-    params = {
-        name: nn.Parameter(torch.eye(size, device=device, dtype=torch.float32), requires_grad=False)
-        for name, size in sign_sizes.items()
-    }
-    Qe = params["Qe"]
-    Q2s = {name: p for name, p in params.items() if name != "Qe"}
-
-    modify_parakeet_ctc_layers_with_rotation_params(
-        model, Qe, Q2s, activation_bits=activation_bits, online_hadamard=online_hadamard
-    )
-    monkey_patch_parakeet_ctc_for_train(model, Qe)
-
-    pad_id = model.tokenizer.pad_id if hasattr(model.tokenizer, "pad_id") and model.tokenizer.pad_id > 0 else 0
-    calib_ds = ParakeetCalibrationDataset(model, num_samples=calib_samples)
-    loader = torch.utils.data.DataLoader(
-        calib_ds, batch_size=batch_size, shuffle=False, num_workers=0,
-        collate_fn=partial(parakeet_ctc_collate_fn, pad_id=pad_id),
-    )
-    batches = [b for _, b in zip(range(search_cfg.batches_per_eval), loader)]
-    model.eval()
-
-    # Only the residual-stream rotations are block diagonal; Q2 stays a full head_dim
-    # rotation, since a head is already smaller than a weight quantization group.
-    block_sizes = {name: (rotation_block_size if name in ("Qe", "Qd") else None) for name in sign_sizes}
-    evaluate = make_batch_evaluator(model, parakeet_ctc_loss_fn, batches, params, block_sizes)
-    best_signs, best_loss, history = evolutionary_sign_search(sign_sizes, evaluate, search_cfg)
-    print(f"[hadamard-search] parakeet best loss {best_loss:.6f} (from {history[0]:.6f})")
-
-    write_rotations_(params, best_signs, block_sizes)
-    torch.save(
-        {"Qe": Qe.data.detach().cpu(), "Q2s": {k: v.data.detach().cpu() for k, v in Q2s.items()}},
-        save_path,
-    )
-
-
-def rotate_parakeet(model, test_audio_file:str, rotation_path:str, device="cuda", online_hadamard: bool = True):
+def rotate_parakeet(model, test_audio_file:str, rotation_path:str, device="cuda"):
     with torch.no_grad():
         orig_transcription = transcribe(model, test_audio_file)
 
@@ -696,7 +745,7 @@ def rotate_parakeet(model, test_audio_file:str, rotation_path:str, device="cuda"
     rotations = torch.load(rotation_path)  # load learned rotations
     Qe = rotations["Qe"]
     Q2s = rotations["Q2s"]
-    fuse_parakeet_ctc_layers_with_rotations(model, Qe, Q2s, device=device, online_hadamard=online_hadamard)  # fuse rotations into weights
+    fuse_parakeet_ctc_layers_with_rotations(model, Qe, Q2s, device=device)  # fuse rotations into weights
     monkey_patch_parakeet_ctc_for_train(model, Qe.to(device))
 
     with torch.no_grad():

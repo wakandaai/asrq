@@ -5,7 +5,7 @@ import json
 from typing import Any, Dict
 import torch
 from datasets import load_dataset, Audio
-from asrq.evaluation.english_text_normalizer import normalizer
+# from asrq.evaluation.english_text_normalizer import normalizer
 import numpy as np
 import io
 import soundfile as sf
@@ -13,6 +13,7 @@ from tqdm import tqdm
 import lhotse
 import evaluate
 import time
+import normalizer.data_utils as open_asr_data_utils
 
 # Nemo SALM model
 from nemo.collections.speechlm2.models.salm import SALM
@@ -313,7 +314,7 @@ def generate_whisper(model, processor, all_data, batch_size, max_new_tokens=None
 def generate_canary(model, processor, all_data, batch_size):
     transcriptions = [
         val.text for val in
-        model.transcribe([f for f in all_data["audio_files"]], batch_size=batch_size, verbose=False, pnc="nopnc", num_workers=1)
+        model.transcribe([np.asarray(a, dtype=np.float32) for a in all_data["audio"]], batch_size=batch_size, verbose=False, pnc="nopnc", num_workers=1)
     ]
     return transcriptions
 
@@ -327,8 +328,10 @@ def generate_parakeet(model, processor, all_data, batch_size):
     # model.decoding.decoding.decoding_computer.disable_cuda_graphs()
     transcriptions = [
         val.text for val in
-        model.transcribe([f for f in all_data["audio_files"]], batch_size=batch_size, verbose=False, num_workers=1)
+        model.transcribe([np.asarray(a, dtype=np.float32) for a in all_data["audio"]], batch_size=batch_size, verbose=False, num_workers=1)
+        # model.transcribe([f for f in all_data["audio_files"]], batch_size=batch_size, verbose=False, num_workers=1)
     ]
+
 
     return transcriptions
 
@@ -376,7 +379,7 @@ def evaluate_model(
      batches_to_eval=None, create_audio_files=False
 ):
     eval_start_time = time.time()
-    cache_dir = "/ephemeral"#cache_dir or os.getcwd()
+    cache_dir = cache_dir or os.getcwd()
     DATA_CACHE_DIR = os.path.join(cache_dir, "audio_cache")
     DATASET_NAME = dataset
     SPLIT_NAME = split
@@ -385,22 +388,24 @@ def evaluate_model(
     CACHE_DIR = os.path.join(DATA_CACHE_DIR, DATASET_NAME, SPLIT_NAME)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    torch.set_float32_matmul_precision("medium")
+    model.to(torch.bfloat16).eval()
+
 
     ds = load_dataset(
         dataset_path,
         dataset,
         split=split,
-        # streaming=True,
-        # token=True
+        streaming=False,
+        token=True
     )
     if batches_to_eval is not None:
         # Dataset.take is select(range(n)) and raises if n exceeds the split size, so
         # clamp it - some configs are small (voxpopuli_cleaned_aa has 628 examples).
         ds = ds.take(min(batches_to_eval * batch_size, len(ds))) # type: ignore
-    ds = ds.cast_column("audio", Audio(sampling_rate=16_000))
-    ds = ds.map(normalize)
-    ds = ds.filter(is_target_text_in_range, input_columns=["norm_text"])
+    # ds = ds.cast_column("audio", Audio(sampling_rate=16_000))
+    # ds = ds.map(normalize)
+    # ds = ds.filter(is_target_text_in_range, input_columns=["norm_text"])
+    ds = open_asr_data_utils.prepare_data(ds)
 
     # ===
     all_data = {
@@ -418,7 +423,7 @@ def evaluate_model(
         duration = audio_len / sample_rate
 
         all_data["audio"].append(audio)
-        all_data["references"].append(sample["norm_text"]) # type: ignore
+        all_data["references"].append(sample["original_text"]) # type: ignore
         all_data["durations"].append(duration)
         all_data["audio_len"].append(audio_len)
 
@@ -430,11 +435,13 @@ def evaluate_model(
         sample_file_id += 1
 
     sorted_indices = sorted(range(len(all_data["durations"])), key=lambda k: all_data["durations"][k], reverse=True)
-    all_data["audio"] = [all_data["audio"][i] for i in sorted_indices]
-    all_data["references"] = [all_data["references"][i] for i in sorted_indices]
-    all_data["durations"] = [all_data["durations"][i] for i in sorted_indices]
-    all_data["audio_len"] = [all_data["audio_len"][i] for i in sorted_indices]
-    all_data["audio_files"] = [all_data["audio_files"][i] for i in sorted_indices]
+    for key, values in all_data.items():
+        all_data[key] = [values[i] for i in sorted_indices]
+    # all_data["audio"] = [all_data["audio"][i] for i in sorted_indices]
+    # all_data["references"] = [all_data["references"][i] for i in sorted_indices]
+    # all_data["durations"] = [all_data["durations"][i] for i in sorted_indices]
+    # all_data["audio_len"] = [all_data["audio_len"][i] for i in sorted_indices]
+    # all_data["audio_files"] = [all_data["audio_files"][i] for i in sorted_indices]
 
     total_time = 0
     for i in range(2): # warmup first, then evaluate
@@ -443,7 +450,7 @@ def evaluate_model(
         else:
             data = all_data
             
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.no_grad():
             start_time = time.time()
             transcriptions = generate_fn(model, processor, data, batch_size=batch_size) # type: ignore
             end_time = time.time()
@@ -454,7 +461,7 @@ def evaluate_model(
     
     if isinstance(transcriptions, tuple) and len(transcriptions) == 2: # type: ignore
         transcriptions = transcriptions[0] # type: ignore
-    predictions = [normalizer(pred) for pred in transcriptions] # type: ignore
+    predictions = [pred for pred in transcriptions] # type: ignore
     avg_time = total_time / len(all_data["audio"])
 
     # for i in range(min(4, len(predictions))):
@@ -476,14 +483,18 @@ def evaluate_model(
 
         print("Results saved at path:", os.path.abspath(manifest_path))
 
-    refs, preds = [], []
-    for ref, pred in zip(all_data["references"], predictions):
-        # if len(pred) > len(ref)*3:
-        #     pred = pred[:len(ref)]
-        refs.append(ref)
-        preds.append(pred)
-    wer = wer_metric.compute(references=refs, predictions=preds)
+    # refs, preds = [], []
+    # for ref, pred in zip(all_data["references"], predictions):
+    #     # if len(pred) > len(ref)*3:
+    #     #     pred = pred[:len(ref)]
+    #     refs.append(ref)
+    #     preds.append(pred)
+    references = all_data["references"]
+    norm_references = [open_asr_data_utils.normalizer(ref) for ref in references]
+    norm_predictions = [open_asr_data_utils.normalizer(pred) for pred in predictions]
+    wer = wer_metric.compute(references=norm_references, predictions=norm_predictions)
     wer = round(100*wer, 2) # type: ignore
+    # breakpoint()
 
     audio_length = sum(all_data["durations"])
     rtfx = audio_length / total_time

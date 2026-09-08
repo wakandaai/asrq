@@ -616,7 +616,7 @@ class CanaryQwenQ(ModelQ):
             def __init__(self, module):
                 super().__init__()
                 self.module = module
-                self.attention_type = module.attention_type
+                # self.attention_type = module.attention_type
 
             def forward(self, *args, **kwargs):
                 nonlocal inps, inp_kwargs

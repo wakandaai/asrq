@@ -10,6 +10,8 @@ calibration:
   num_samples: 2048
 
 evaluate: True
-method: "asrq"
+method: "gptq"
 activation_bits: 16
-create_audio_files: False
+create_audio_files: True
+debug: False
+debug_eval_batches: 10

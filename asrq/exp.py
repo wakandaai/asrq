@@ -2,6 +2,7 @@
 
 import random
 import datetime
+import os
 import hydra
 import numpy as np
 import torch
@@ -77,6 +78,7 @@ def main(cfg: DictConfig) -> None:
         evaluation_results_file_name_stem = f"results/evaluations/{cfg.model.name.replace('/','-')}_{cfg.method}_{cfg.quantizer.name}_{cfg.transform.name}_{cfg.quantizer.bits}_{cfg.activation_bits}-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
         evaluation_results_file = f"{evaluation_results_file_name_stem}_results.csv"
         evaluation_results_config_file = f"{evaluation_results_file_name_stem}_config.yaml"
+        os.makedirs(os.path.dirname(evaluation_results_file_name_stem), exist_ok=True)
         with open(evaluation_results_config_file, "w") as f:
             f.write(OmegaConf.to_yaml(cfg))
         evaluate_openasr(modelQ=modelQ, cfg=cfg, generate_fn=getattr(openasr, cfg.model.generate_fn), evaluation_results_file=evaluation_results_file, create_audio_files=cfg.create_audio_files)

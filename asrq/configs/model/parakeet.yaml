@@ -4,5 +4,5 @@ name: nvidia/parakeet-ctc-1.1b
 exclude_modules: []
 
 # evaluation
-eval_batch_size: 192
+eval_batch_size: 128
 generate_fn: generate_parakeet
