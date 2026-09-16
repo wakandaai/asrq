@@ -5,4 +5,42 @@ learning_rate: 1.5
 batch_size: 4
 path: ""
 learn_rotation: False
+hadamard_block_size: 128
+# random +-1 signs before the fc2 online Hadamard (X @ D @ H); a plain Hadamard spikes GELU outputs
+hadamard_random_signs: True
+# learn a head-wise R2 per attention module (False: R1 only, attn_out input unrotated)
+learn_r2: True
+# online Hadamard on every fc2 input (False: fc2 input unrotated)
+fc2_online_hadamard: True
+objective: kl
+# 0: full-width R1; otherwise block-diagonal R1 with this block width (use the group size)
+r1_block_size: 0
 use: True
+# How rot-exp.py searches the rotation. cayley: R1 and a head-wise R2 per attention module, from random
+# Hadamard matrices, with Cayley SGD (epochs, learning_rate, batch_size, num_samples). evolution: R1 as
+# diag(s1) @ H @ diag(s2), a (1 + lambda) evolutionary search over the sign vectors with three-stage
+# selection; R2 stays a random Hadamard. Fitness is the KL objective on num_samples calibration samples, in
+# batches of batch_size. See asrq/transforms/rotation/hadamard_search.py.
+search: cayley
+# Weight-only quantization: search R1 (search: evolution only) against the quantizer's rounded weights instead of
+# quantized activations. Each candidate is folded into the weights, which are rounded with RTN at the quantizer's
+# bits, group size and symmetry; activations stay in full precision and activation_bits is ignored by the search.
+weight_only: False
+# How the weight-only search quantizes each candidate's weights: rtn, gptq (on Hessians collected once; the
+# residual-stream layers' Hessians are rotated per candidate), or null for the experiment's quantizer.
+weight_only_quantizer: null
+evolution:
+  # whisper-large-v3, 64 samples, float32: ~150 s per generation, so 8 generations ~ Cayley SGD's 200 steps (~19 min)
+  generations: 8
+  # children per generation, and how many survive stage 1 and stage 2 (stage 3 scores the rest on all samples)
+  offspring: 16
+  survivors: [4, 2]
+  # samples scored in stages 1, 2, 3; null: 8/16/N for N <= 64, 8/64/N for N <= 256, 16/64/N above
+  stage_samples: null
+  # sign positions flipped per child. mutate: s1_s2 draws them from both sign vectors, s1 from s1 only, auto
+  # picks s1 when activation_symmetric (s2 then does not change the fitness) and s1_s2 when asymmetric
+  flips: 2
+  mutate: auto
+  seed: 0
+  # keep the full-precision logits of every batch on the CPU instead of recomputing them per candidate
+  cache_teacher: True

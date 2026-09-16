@@ -6,6 +6,7 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from asrq.core.registry import QuantizerNames, register_quantizer, register_quantizer_config
 from asrq.quantizers.base import LinearQuantConfig, LinearQuantizer
+from asrq.quantizers.weight_rounding import round_weight
 from typing import Tuple, Any
 
 
@@ -32,15 +33,8 @@ class RTNQuantizer(LinearQuantizer):
     def __call__(self)-> Tuple[Any, Any]:
         """Quantize the module using RTN."""
         # weight_2d/set_weight_2d keep this identical for nn.Linear and pointwise Conv1d.
-        W = self.weight_2d().clone()
-        scales, zeros = self.find_quant_params(W)
-        group_size = self.quant_config.group_size
-        if group_size == -1:
-            group_size = W.shape[1]
-        W = W.reshape(W.shape[0], W.shape[1] // group_size, group_size)
-        if self.quant_config.symmetric:
-            q = torch.round(W / scales).clamp(self.minq, self.maxq) * scales
-        else:
-            q = torch.round((W - zeros) / scales).clamp(self.minq, self.maxq) * scales + zeros
+        q, scales, zeros = round_weight(
+            self.weight_2d().clone(), self.quant_config.bits, self.quant_config.group_size, self.quant_config.symmetric
+        )
         self.set_weight_2d(q)
         return scales, zeros

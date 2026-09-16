@@ -36,10 +36,8 @@ class BaseTransform(ABC):
         sample = ds[0] # type: ignore
         self.audio = np.array(sample["audio"]["array"], dtype=np.float32) # type: ignore
         self.sr = sample["audio"]["sampling_rate"] # type: ignore
+        os.makedirs(f"outputs/{self.cfg.name}", exist_ok=True)
         sf.write("outputs/rotation_test_audio.wav", self.audio, self.sr)
-
-        if not os.path.exists(f"outputs/{self.cfg.name}"):
-            os.makedirs(f"outputs/{self.cfg.name}")
         if not self.cfg.path: # type: ignore
             if hasattr(self.cfg, "wbits") and hasattr(self.cfg, "abits"):
                 self.cfg.path = f"outputs/{self.cfg.name}/{self.cfg.model_name.replace('/','-')}_{self.cfg.name}_w{self.cfg.wbits}a{self.cfg.abits}_{self.cfg.type}.pt" # type: ignore

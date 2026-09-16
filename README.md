@@ -32,6 +32,12 @@ Transforms improve weight and activation distributions before quantization:
 
 ## Installation
 
+Install the package in editable mode so `python asrq/exp.py` can import `asrq`:
+
+```bash
+pip install -e .
+```
+
 The English text normalizer used for WER is pulled from the
 [Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) as a pinned
 submodule, so fetch it after cloning:

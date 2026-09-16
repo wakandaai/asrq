@@ -30,14 +30,14 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
     INF_VAL,
 )
 
-from asrq.core.linear import LinearQ
+from asrq.core.linear import ASRQLinear
 
 
 class MultiHeadAttentionQ(MultiHeadAttention):
     """Quantized multi-head attention for the conformer encoder.
 
     Replaces the four dense projections (Q, K, V, output) with
-    :class:`LinearQ` layers while preserving the KV-cache interface.
+    :class:`ASRQLinear` layers while preserving the KV-cache interface.
     """
 
     def __init__(
@@ -70,10 +70,10 @@ class MultiHeadAttentionQ(MultiHeadAttention):
         self.d_k = n_feat // n_head
         self.s_d_k = math.sqrt(self.d_k)
         self.h = n_head
-        self.linear_q = LinearQ(n_feat, n_feat, bits, bias=use_bias)
-        self.linear_k = LinearQ(n_feat, n_feat, bits, bias=use_bias)
-        self.linear_v = LinearQ(n_feat, n_feat, bits, bias=use_bias)
-        self.linear_out = LinearQ(n_feat, n_feat, bits, bias=use_bias)
+        self.linear_q = ASRQLinear(n_feat, n_feat, weight_bits=bits, bias=use_bias)
+        self.linear_k = ASRQLinear(n_feat, n_feat, weight_bits=bits, bias=use_bias)
+        self.linear_v = ASRQLinear(n_feat, n_feat, weight_bits=bits, bias=use_bias)
+        self.linear_out = ASRQLinear(n_feat, n_feat, weight_bits=bits, bias=use_bias)
         self.dropout = nn.Dropout(p=dropout_rate)
 
         self._max_cache_len = max_cache_len
@@ -111,7 +111,7 @@ class RelPositionMultiHeadAttentionQ(MultiHeadAttentionQ):
             bits=bits,
         )
         # linear transformation for positional encoding
-        self.linear_pos = LinearQ(n_feat, n_feat, bits, bias=False)
+        self.linear_pos = ASRQLinear(n_feat, n_feat, weight_bits=bits, bias=False)
         # these two learnable biases are used in matrix c and matrix d
         # as described in https://arxiv.org/abs/1901.02860 Section 3.3
         if pos_bias_u is None or pos_bias_v is None:
@@ -239,7 +239,7 @@ class RelPositionMultiHeadAttentionQ(MultiHeadAttentionQ):
 class ConformerFeedForwardQ(ConformerFeedForward):
     """Quantized conformer feed-forward module.
 
-    Replaces both dense layers with :class:`LinearQ` while keeping the
+    Replaces both dense layers with :class:`ASRQLinear` while keeping the
     activation and dropout unchanged.
     """
 
@@ -256,10 +256,10 @@ class ConformerFeedForwardQ(ConformerFeedForward):
         self.d_model = d_model
         self.d_ff = d_ff
         self.use_bias = use_bias
-        self.linear1 = LinearQ(d_model, d_ff, bits, bias=self.use_bias)
+        self.linear1 = ASRQLinear(d_model, d_ff, weight_bits=bits, bias=self.use_bias)
         self.activation = activation
         self.dropout = nn.Dropout(p=dropout)
-        self.linear2 = LinearQ(d_ff, d_model, bits, bias=self.use_bias)
+        self.linear2 = ASRQLinear(d_ff, d_model, weight_bits=bits, bias=self.use_bias)
 
 
 class ConformerLayerQ(ConformerLayer):

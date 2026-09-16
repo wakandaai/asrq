@@ -8,6 +8,10 @@ from typing import Dict, List, Tuple, Any
 from asrq.core.types import InpArgs, InpKwargs, Processor
 
 from asrq.core.registry import ModelNames, register_model
+from asrq.transforms.rotation.whisper_utils import (
+    get_whisper_activation_roles,
+    get_whisper_online_hadamard_layers,
+)
 from asrq.core.model import ModelQ
 from asrq.core.linear import ASRQLinear
 import transformers
@@ -91,10 +95,10 @@ class WhisperAttentionQ(WhisperAttention):
             )
         self.layer_idx = layer_idx
 
-        self.k_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=False)
-        self.v_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=bias)
-        self.q_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=bias)
-        self.out_proj = ASRQLinear(embed_dim, embed_dim, wbits=bits, abits=16, bias=bias)
+        self.k_proj = ASRQLinear(embed_dim, embed_dim, weight_bits=bits, bias=False)
+        self.v_proj = ASRQLinear(embed_dim, embed_dim, weight_bits=bits, bias=bias)
+        self.q_proj = ASRQLinear(embed_dim, embed_dim, weight_bits=bits, bias=bias)
+        self.out_proj = ASRQLinear(embed_dim, embed_dim, weight_bits=bits, bias=bias)
 
 
 class WhisperEncoderLayerQ(WhisperEncoderLayer):
@@ -121,8 +125,8 @@ class WhisperEncoderLayerQ(WhisperEncoderLayer):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        self.fc1 = ASRQLinear(self.embed_dim, config.encoder_ffn_dim, wbits=bits, abits=16)
-        self.fc2 = ASRQLinear(config.encoder_ffn_dim, self.embed_dim, wbits=bits, abits=16)
+        self.fc1 = ASRQLinear(self.embed_dim, config.encoder_ffn_dim, weight_bits=bits)
+        self.fc2 = ASRQLinear(config.encoder_ffn_dim, self.embed_dim, weight_bits=bits)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
 
@@ -199,8 +203,8 @@ class WhisperDecoderLayerQ(WhisperDecoderLayer):
             bits=bits,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.fc1 = ASRQLinear(self.embed_dim, config.decoder_ffn_dim, wbits=bits, abits=16)
-        self.fc2 = ASRQLinear(config.decoder_ffn_dim, self.embed_dim, wbits=bits, abits=16)
+        self.fc1 = ASRQLinear(self.embed_dim, config.decoder_ffn_dim, weight_bits=bits)
+        self.fc2 = ASRQLinear(config.decoder_ffn_dim, self.embed_dim, weight_bits=bits)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
 
@@ -289,9 +293,13 @@ class WhisperQ(ModelQ):
             Tuple[nn.Module, Processor]: The pretrained model (eval mode)
                 and its associated processor.
         """
+        # float32 explicitly: transformers 5 otherwise loads the checkpoint's fp16, while
+        # calibration, rotation folding and GPTQ all assume full precision. Evaluation casts the
+        # model to half precision itself.
         model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
             ModelNames.OPENAI_WHISPER_LARGE_V3,
-            attn_implementation="sdpa"
+            attn_implementation="sdpa",
+            dtype=torch.float32,
         ).eval()
         processor = transformers.AutoProcessor.from_pretrained(ModelNames.OPENAI_WHISPER_LARGE_V3)
         return model, processor
@@ -307,6 +315,7 @@ class WhisperQ(ModelQ):
         model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
             ModelNames.OPENAI_WHISPER_LARGE_V3,
             attn_implementation="eager",
+            dtype=torch.float32,
         ).eval()
         processor = transformers.AutoProcessor.from_pretrained(ModelNames.OPENAI_WHISPER_LARGE_V3)
         return model, processor
@@ -394,7 +403,8 @@ class WhisperQ(ModelQ):
         """
         device = model.device
         input_features = processor(audio, return_tensors="pt", sampling_rate=sr).input_features
-        enc = model.model.encoder(input_features.to(device)) # type: ignore
+        input_features = input_features.to(device=device, dtype=model.dtype)
+        enc = model.model.encoder(input_features) # type: ignore
 
         prefix = [50258, 50259, 50360, 50364]
         text_ids = processor.tokenizer.encode(text, add_special_tokens=False)
@@ -568,7 +578,11 @@ class WhisperQ(ModelQ):
         for i in range(num_samples):
             with torch.no_grad():
                 out = block(*inp_args[i], **inp_kwargs[i])
-                inp_args[i] = out # type: ignore
+                # transformers 5 layers return the hidden states as a bare tensor rather than a
+                # tuple; replace only the hidden states and keep the remaining positional
+                # arguments, such as the encoder layer's required attention_mask.
+                hidden = out[0] if isinstance(out, tuple) else out
+                inp_args[i] = (hidden, *inp_args[i][1:]) # type: ignore
 
     def quantize_text_decoder(self) -> None:
         """Quantize the text decoder block-by-block.
@@ -736,76 +750,16 @@ class WhisperQ(ModelQ):
         for i in range(num_samples):
             with torch.no_grad():
                 out = block(*inp_args[i], **inp_kwargs[i])
-                inp_args[i] = out
+                hidden = out[0] if isinstance(out, tuple) else out
+                inp_args[i] = (hidden, *inp_args[i][1:])
 
 
-    def for_activation_quantization(self) -> List[str]:
-        linears = []
-        num_encoder_blocks: int = self.model.config.encoder_layers # type: ignore
-        num_decoder_blocks: int = self.model.config.decoder_layers # type: ignore
-        for i in range(num_encoder_blocks):
-            stem = f"model.encoder.layers.{i}"
-            linears += [
-                f"{stem}.self_attn.q_proj",
-                f"{stem}.self_attn.k_proj",
-                f"{stem}.self_attn.v_proj",
-                f"{stem}.self_attn.out_proj",
-                f"{stem}.fc1",
-            ]
+    def online_hadamard_layers(self) -> Dict[str, str]:
+        """Each fc2 and the activation feeding it; the online Hadamard exists only once a rotation
+        with one has been applied, and to_asrq_linear ignores activations without it."""
+        return {fc2: act for act, fc2 in get_whisper_online_hadamard_layers(self.model)}
 
-        for i in range(num_decoder_blocks):
-            stem = f"model.decoder.layers.{i}"
-            linears += [
-                f"{stem}.self_attn.q_proj",
-                f"{stem}.self_attn.k_proj",
-                f"{stem}.self_attn.v_proj",
-                f"{stem}.self_attn.out_proj",
-                f"{stem}.encoder_attn.q_proj",
-                f"{stem}.encoder_attn.k_proj",
-                f"{stem}.encoder_attn.v_proj",
-                f"{stem}.encoder_attn.out_proj",
-                f"{stem}.fc1",
-            ]
-
-        return linears
-
-    # (wbits, abits) applied to every attention-projection / feed-forward
-    # linear named by get_asrq_linear_targets() below. Weight-only by
-    # default (abits=16, matching WhisperAttentionQ/WhisperEncoderLayerQ/
-    # WhisperDecoderLayerQ's own ASRQLinear construction) -- override on a
-    # subclass or reassign on an instance before calling to_asrq_linear()
-    # to quantize activations too (e.g. (4, 8) for W4A8).
-    asrq_attn_bits: Tuple[int, int] = (4, 16)
-    asrq_ffn_bits: Tuple[int, int] = (4, 16)
-
-    def get_asrq_linear_targets(self) -> Dict[str, Tuple[int, int]]:
-        """Map every attention-projection / feed-forward nn.Linear in the
-        encoder and decoder to (wbits, abits), for ModelQ.to_asrq_linear().
-        Same name-building pattern as for_activation_quantization() above,
-        but covers every linear in a block (including fc2 and the decoder's
-        cross-attention projections, which for_activation_quantization()
-        omits) since to_asrq_linear() is a full weight-replacement pass,
-        not a "which layers also get activation quantization" selection.
-        """
-        targets: Dict[str, Tuple[int, int]] = {}
-        num_encoder_blocks: int = self.model.config.encoder_layers # type: ignore
-        num_decoder_blocks: int = self.model.config.decoder_layers # type: ignore
-
-        for i in range(num_encoder_blocks):
-            stem = f"model.encoder.layers.{i}"
-            for suffix in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj"):
-                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
-            for suffix in ("fc1", "fc2"):
-                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
-
-        for i in range(num_decoder_blocks):
-            stem = f"model.decoder.layers.{i}"
-            for suffix in (
-                "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj",
-                "encoder_attn.q_proj", "encoder_attn.k_proj", "encoder_attn.v_proj", "encoder_attn.out_proj",
-            ):
-                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
-            for suffix in ("fc1", "fc2"):
-                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
-
-        return targets
+    def activation_quantization_roles(self) -> Dict[str, str]:
+        """Every attention projection and both feed-forward layers, fc2 included; the same
+        mapping the rotation search quantizes."""
+        return get_whisper_activation_roles(self.model)

@@ -6,4 +6,10 @@ exclude_modules:
 
 # evaluation
 eval_batch_size: 192
+# Function in asrq/evaluation/openasr.py that transcribes during evaluation:
+#   generate_whisper              Hugging Face generate, eager
+#   generate_whisper_cuda_graphs  the same greedy transcription replayed from CUDA graphs (static KV
+#                                 cache, graphs captured once per batch size). Much faster at small batch
+#                                 and for humming ASRQLinear models; pair it with eval_dtype: float16,
+#                                 since in bfloat16 every humming layer casts to float16 and back.
 generate_fn: generate_whisper

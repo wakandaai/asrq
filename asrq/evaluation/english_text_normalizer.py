@@ -54,6 +54,37 @@ def _load_upstream_normalizer():
     return module
 
 
+def load_upstream_data_utils():
+    """Load the leaderboard's normalizer/data_utils.py, without putting `normalizer` on sys.path.
+
+    data_utils imports its package by the absolute name (`from normalizer import ...`) and its
+    siblings relatively, so it is loaded as a submodule of the privately named package above,
+    with `normalizer` aliased to that package only while the import runs. Evaluation then works
+    without adding the submodule to PYTHONPATH.
+    """
+    name = f"{_MODULE_NAME}.data_utils"
+    if name in sys.modules:
+        return sys.modules[name]
+    package = _load_upstream_normalizer()
+    spec = importlib.util.spec_from_file_location(name, _NORMALIZER_PKG / "data_utils.py")
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load data_utils.py from {_NORMALIZER_PKG}")
+    module = importlib.util.module_from_spec(spec)
+    aliased = "normalizer" not in sys.modules
+    if aliased:
+        sys.modules["normalizer"] = package
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        del sys.modules[name]
+        raise
+    finally:
+        if aliased:
+            del sys.modules["normalizer"]
+    return module
+
+
 _upstream = _load_upstream_normalizer()
 _impl = sys.modules[f"{_MODULE_NAME}.normalizer"]
 
@@ -73,6 +104,7 @@ __all__ = [
     "EnglishNumberNormalizer",
     "EnglishSpellingNormalizer",
     "EnglishTextNormalizer",
+    "load_upstream_data_utils",
     "normalizer",
     "remove_symbols",
     "remove_symbols_and_diacritics",

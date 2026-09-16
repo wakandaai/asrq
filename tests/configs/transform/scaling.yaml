@@ -2,4 +2,4 @@ name: scaling
 path: ""
 obtain_scales: True
 use: True
-alpha: 0.5
+type: smoothquant # or awq

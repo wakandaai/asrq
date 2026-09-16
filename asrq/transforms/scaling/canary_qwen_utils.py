@@ -36,20 +36,13 @@ def get_canary_qwen_layers_to_scale(model):
                 f"perception.encoder.layers.{i}.norm_feed_forward2"
             )
         )
-        # The two feed-forward down-projections are fed by their activation, which has no
-        # weight to absorb the reciprocal scale, so prev is None and each linear2 divides
-        # its own input (see ScaledInputLinear).
         for ff in ("feed_forward1", "feed_forward2"):
             layers_to_scale.append(
                 (
                     [f"perception.encoder.layers.{i}.{ff}.linear2"],
-                    None
+                    f"perception.encoder.layers.{i}.{ff}.activation"
                 )
             )
-
-        # Conv module. pointwise_conv1 is fed by the norm before the block; pointwise_conv2
-        # is fed by an activation (conv1 -> GLU -> depthwise -> norm -> activation ->
-        # conv2), so it is a down-projection in all but name and scales its own input.
         layers_to_scale.append(
             (
                 [f"perception.encoder.layers.{i}.conv.pointwise_conv1"],
@@ -59,50 +52,38 @@ def get_canary_qwen_layers_to_scale(model):
         layers_to_scale.append(
             (
                 [f"perception.encoder.layers.{i}.conv.pointwise_conv2"],
-                None
+                f"perception.encoder.layers.{i}.conv.activation"
             )
         )
-
 
     for i in range(num_decoder_layers):
         layers_to_scale.append(
             (
-                [
-                    f"llm.base_model.model.model.layers.{i}.self_attn.q_proj.base_layer",
-                    f"llm.base_model.model.model.layers.{i}.self_attn.k_proj",
-                    f"llm.base_model.model.model.layers.{i}.self_attn.v_proj.base_layer",
-                    f"llm.base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.default",
-                    f"llm.base_model.model.model.layers.{i}.self_attn.v_proj.lora_A.default"
-                ],
-                f"llm.base_model.model.model.layers.{i}.input_layernorm"
+                [f"llm.model.layers.{i}.self_attn.q_proj", f"llm.model.layers.{i}.self_attn.k_proj", f"llm.model.layers.{i}.self_attn.v_proj"],
+                f"llm.model.layers.{i}.input_layernorm"
             )
         )
 
         layers_to_scale.append(
             (
-                [f"llm.base_model.model.model.layers.{i}.self_attn.o_proj"],
-                [f"llm.base_model.model.model.layers.{i}.self_attn.v_proj.base_layer", f"llm.base_model.model.model.layers.{i}.self_attn.v_proj.lora_B.default"]
+                [f"llm.model.layers.{i}.self_attn.o_proj"],
+                f"llm.model.layers.{i}.self_attn.v_proj"
             )
         )
 
         layers_to_scale.append(
             (
-                [f"llm.base_model.model.model.layers.{i}.mlp.gate_proj", f"llm.base_model.model.model.layers.{i}.mlp.up_proj"],
-                f"llm.base_model.model.model.layers.{i}.post_attention_layernorm"
+                [f"llm.model.layers.{i}.mlp.gate_proj", f"llm.model.layers.{i}.mlp.up_proj"],
+                f"llm.model.layers.{i}.post_attention_layernorm"
             )
         )
 
-        # Qwen3MLP is down_proj(act_fn(gate_proj(x)) * up_proj(x)), so the input to
-        # down_proj is a gated product with no single producer to divide - down_proj
-        # divides its own input instead (see ScaledInputLinear).
         layers_to_scale.append(
             (
-                [f"llm.base_model.model.model.layers.{i}.mlp.down_proj"],
-                None
+                [f"llm.model.layers.{i}.mlp.down_proj"],
+                f"llm.model.layers.{i}.mlp.up_proj"
             )
         )
-
-
 
     return layers_to_scale
     

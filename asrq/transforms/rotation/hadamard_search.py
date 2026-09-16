@@ -1,243 +1,248 @@
-# pyright: reportMissingImports=false
+"""A (1 + lambda) evolutionary search over the sign vectors of a randomized Hadamard R1.
 
-"""Evolutionary search over the sign vectors of randomized Hadamard rotations.
+The residual-stream rotation is searched within the family
 
-A randomized Hadamard rotation here is ``Q = diag(s1) @ H @ diag(s2)`` for a pair of
-sign vectors ``s1``, ``s2`` in {-1, +1}^n, a two-sided generalization of the single-sided
-``diag(d) @ H`` that :func:`random_hadamard_matrix` builds. Every such ``Q`` is orthogonal,
-so the *unquantized* model is invariant to the choice: the search is only meaningful when
-the forward pass quantizes something, because then ``(s1, s2)`` decides how the outliers
-land relative to the quantization grid. The second sign vector doubles the candidate space
-(``4^n`` instead of ``2^n`` sign combinations per rotation) without changing the orthogonality
-guarantee, giving the search more room to find a favorable outlier layout.
+    R1 = diag(s1) @ H @ diag(s2),    s1, s2 in {-1, +1}^n,
 
-The search is derivative-free by construction (a sign vector has no useful gradient), so
-this is a plain evolutionary loop: evaluate a population, keep the best, mutate them by
-flipping signs, repeat. Only forward passes are needed.
+with H a fixed Hadamard matrix of the stream's width (block-diagonal when R1 is), while each attention
+module's R2 stays the random Hadamard the rotation search starts from. Every member is orthogonal, so the
+full-precision model is the same function for every candidate and only the quantization error differs; the
+fitness is the KL divergence from the full-precision model to the model with fake-quantized activations,
+the objective the Cayley SGD search minimises.
 
-Candidates are evaluated through the on-the-fly rotation path
-(``modify_*_layers_with_rotation_params``), not by fusing rotations into the weights: the
-patched forwards close over the rotation Parameters, so writing new values into them
-swaps the rotation for the whole model at once, with no weight surgery to undo between
-candidates.
+The stream is rotated as ``x @ R1 = x @ diag(s1) @ H @ diag(s2)``: s1 flips input channels before H mixes
+them, and decides where each outlier lands, while s2 flips the signs of the rotated coordinates. A
+symmetric quantizer commutes with a per-coordinate sign flip -- a group's largest magnitude is unchanged
+and rounding is odd -- and every layer reading the stream quantizes its input symmetrically and folds s2
+into its weight, so with symmetric activation quantization s2 does not change the fitness. With asymmetric
+quantization it does: a flip moves a group's minimum and maximum. ``mutate="auto"``, the default, therefore
+flips only s1 when activations are quantized symmetrically and both vectors when asymmetrically.
+
+A weight-only search (see learn_rotations) folds R1 into the weights and rounds them in groups along each
+row. On the output side, ``R1.T @ W``, s2 negates whole rows, which the weight grid commutes with. On the input
+side, ``W @ R1``, it negates single entries within a group, and neither weight grid commutes with that: the
+asymmetric one offsets by the group minimum, and the symmetric one (Humming's) has one more negative code than
+positive ones, placed on whichever extreme dominates. For a weight-only search ``mutate="auto"`` therefore
+flips both vectors.
+
+One generation, as in EvoPress's multi-step selection:
+
+1. The parent is mutated into ``offspring`` children, each by flipping ``flips`` positions drawn uniformly
+   from the mutated sign vectors (of every stream).
+2. Stage 1 scores every child on a random subset of ``stage_samples[0]`` calibration samples, and the best
+   ``survivors[0]`` go on.
+3. Stage 2 scores those on a new random subset of ``stage_samples[1]`` samples, and the best
+   ``survivors[1]`` go on.
+4. Stage 3 scores the remaining children on the full evaluation set, the first ``stage_samples[2]``
+   samples, the same set the parent was scored on. The best child replaces the parent only if its fitness
+   is lower, so the parent's fitness never increases.
+
+The subsets are drawn anew each generation and shared by all children within a stage, so children are
+compared on the same data while no small subset is selected against repeatedly. Few flips keep a child
+close to its parent, which is what lets a small subset rank children that differ by little.
 """
 
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+import time
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
 from asrq.transforms.rotation.hadamard_utils import matmul_hadU
 
-# One rotation's candidate: a pair of sign vectors (s1, s2) with Q = diag(s1) @ H @ diag(s2).
-SignPair = Tuple[torch.Tensor, torch.Tensor]
-# A full candidate: one SignPair per named rotation, all mutated/scored jointly.
-Candidate = Dict[str, SignPair]
+SignVectors = Dict[Optional[str], Tuple[torch.Tensor, torch.Tensor]]
 
 
 @dataclass
-class HadamardSearchConfig:
-    """Hyperparameters for :func:`evolutionary_sign_search`.
-
-    Each generation costs ``population - survivors`` evaluations (survivors keep their
-    score), and each evaluation is ``batches_per_eval`` forward passes over the whole
-    model, so the total is roughly
-    ``(population + generations * (population - survivors)) * batches_per_eval`` forwards.
-    """
-
-    population: int = 16
-    generations: int = 8
-    survivors: int = 3
-    mutation_prob: float = 0.9     # per-sign flip probability when mutating
-    batches_per_eval: int = 4       # calibration batches per candidate
-    crossover: bool = True          # breed from two survivors instead of one
-    seed: Optional[int] = None
-    verbose: bool = True
-
-
-def hadamard_from_signs(s1: torch.Tensor, s2: torch.Tensor, device=None, dtype=torch.float32,
-                        block_size: Optional[int] = None) -> torch.Tensor:
-    """Build the randomized Hadamard rotation ``Q = diag(s1) @ H @ diag(s2)``.
-
-    With ``block_size=None`` this is the full-width two-sided construction; with a single
-    sign vector (``s2`` all ones) it reduces to the one-sided ``diag(s1) @ H`` that
-    :func:`random_hadamard_matrix` builds.
-
-    With ``block_size=b`` it is block diagonal - ``diag(blocks)`` of ``b x b`` randomized
-    Hadamards, one per contiguous run of ``b`` channels. Set ``b`` to the weight
-    quantization group size and the rotation mixes channels only *within* a quantization
-    group, so each group's scale still covers exactly the channels the rotation touched.
-    A full-width rotation would spread each group's outliers over the whole hidden dim and
-    across group boundaries.
-
-    Built in float64 and cast down, as the rest of the rotation code does.
-    """
-    d1 = s1.to(torch.float64)
-    d2 = s2.to(torch.float64)
-    if block_size is None:
-        Q = matmul_hadU(torch.diag(d1)) @ torch.diag(d2)
-    else:
-        n = d1.numel()
-        if n % block_size != 0:
-            raise ValueError(f"rotation size ({n}) must be a multiple of block_size ({block_size})")
-        H_block = matmul_hadU(torch.eye(block_size, dtype=torch.float64))
-        Q = torch.block_diag(*[
-            torch.diag(d1[i:i + block_size]) @ H_block @ torch.diag(d2[i:i + block_size])
-            for i in range(0, n, block_size)
-        ])
-    return Q.to(device=device if device is not None else s1.device, dtype=dtype)
-
-
-def random_signs(size: int, generator: torch.Generator, device="cpu") -> torch.Tensor:
-    return (torch.randint(0, 2, (size,), generator=generator, device=device) * 2 - 1).to(torch.float64)
-
-
-def random_sign_pair(size: int, generator: torch.Generator, device="cpu") -> SignPair:
-    return random_signs(size, generator, device), random_signs(size, generator, device)
-
-
-def write_rotations_(params: Dict[str, torch.Tensor], signs: Candidate,
-                     block_sizes: Optional[Dict[str, Optional[int]]] = None) -> None:
-    """Write the rotations for ``signs`` into the live rotation Parameters, in place.
-
-    In place is the point: the modified forwards and the monkey-patched residual stream
-    close over these tensors, so this swaps the rotation everywhere at once.
-
-    ``block_sizes`` optionally makes individual rotations block diagonal (see
-    :func:`hadamard_from_signs`); names absent from it stay full width.
-    """
-    block_sizes = block_sizes or {}
-    for name, param in params.items():
-        s1, s2 = signs[name]
-        Q = hadamard_from_signs(
-            s1, s2, device=param.device, dtype=param.dtype,
-            block_size=block_sizes.get(name),
-        )
-        param.data.copy_(Q)
-
-
-def _mutate(signs: torch.Tensor, mutation_prob: float, generator: torch.Generator) -> torch.Tensor:
-    flips = torch.rand(signs.shape, generator=generator, device=signs.device) < mutation_prob
-    out = signs.clone()
-    out[flips] *= -1
-    return out
-
-
-def _mutate_pair(pair: SignPair, mutation_prob: float, generator: torch.Generator) -> SignPair:
-    s1, s2 = pair
-    return _mutate(s1, mutation_prob, generator), _mutate(s2, mutation_prob, generator)
-
-
-def _crossover(a: torch.Tensor, b: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
-    take_a = torch.rand(a.shape, generator=generator, device=a.device) < 0.5
-    return torch.where(take_a, a, b)
-
-
-def _crossover_pair(a: SignPair, b: SignPair, generator: torch.Generator) -> SignPair:
-    return _crossover(a[0], b[0], generator), _crossover(a[1], b[1], generator)
-
-
-def evolutionary_sign_search(
-    sign_sizes: Dict[str, int],
-    evaluate: Callable[[Candidate], float],
-    cfg: HadamardSearchConfig = HadamardSearchConfig(),
-) -> Tuple[Candidate, float, List[float]]:
-    """Search sign-vector pairs for the rotations named in ``sign_sizes``.
+class EvolutionConfig:
+    """Settings of evolve_signs; see the module docstring.
 
     Args:
-        sign_sizes: rotation name -> dimension, e.g. ``{"Qe": 1280, "<layer>": 64}``.
-            One ``(s1, s2)`` sign-vector pair is searched per entry (``Q = diag(s1) @ H @
-            diag(s2)``), all mutated jointly since they are scored by a single end-to-end
-            loss.
-        evaluate: takes a ``{name: (s1, s2)}`` candidate and returns its loss (lower
-            is better). Must be deterministic across calls - use the same calibration
-            batches every time, or candidates cannot be compared.
-        cfg: search hyperparameters.
-
-    Returns:
-        ``(best_signs, best_loss, history)``, where history is the best loss per
-        generation, starting with the initial population.
+        generations: Number of generations.
+        offspring: Children per generation (lambda).
+        survivors: Children kept after stage 1 and after stage 2.
+        stage_samples: Calibration samples scored in stages 1, 2 and 3; None chooses them from the
+            calibration set's size with default_stage_samples.
+        flips: Sign positions flipped per mutation.
+        mutate: ``"s1_s2"`` flips positions of both sign vectors, ``"s1"`` only of s1, and ``"auto"`` chooses
+            ``"s1"`` for symmetric activation quantization and ``"s1_s2"`` for asymmetric; see resolve_mutate.
+        seed: Seed of the initial signs, the mutations and the stage subsets.
+        cache_teacher: Keep the full-precision logits of every calibration batch on the CPU, instead of
+            recomputing them for every candidate. They do not depend on the rotation.
     """
-    if cfg.survivors < 1 or cfg.survivors > cfg.population:
-        raise ValueError(f"survivors must be in [1, population]; got {cfg.survivors}/{cfg.population}")
 
-    generator = torch.Generator()
-    generator.manual_seed(cfg.seed if cfg.seed is not None else torch.initial_seed() & 0xFFFFFFFF)
+    generations: int = 8
+    offspring: int = 16
+    survivors: Tuple[int, int] = (4, 2)
+    stage_samples: Optional[Tuple[int, int, int]] = None
+    flips: int = 2
+    mutate: str = "auto"
+    seed: int = 0
+    cache_teacher: bool = True
+    history: List[dict] = field(default_factory=list, repr=False)
 
-    # The all-ones candidate is the plain (unrandomized) Hadamard - a meaningful baseline
-    # and a guarantee the search never returns something worse than it.
-    population: List[Candidate] = [
-        {name: (torch.ones(size, dtype=torch.float64), torch.ones(size, dtype=torch.float64))
-         for name, size in sign_sizes.items()}
-    ]
-    while len(population) < cfg.population:
-        population.append({name: random_sign_pair(size, generator) for name, size in sign_sizes.items()})
+    def __post_init__(self):
+        self.survivors = tuple(self.survivors)
+        if self.stage_samples is not None:
+            self.stage_samples = tuple(self.stage_samples)
+        if self.mutate not in ("auto", "s1_s2", "s1"):
+            raise ValueError(f"mutate must be 'auto', 's1_s2' or 's1', got {self.mutate!r}")
+        if len(self.survivors) != 2 or not self.offspring >= self.survivors[0] >= self.survivors[1] >= 1:
+            raise ValueError(
+                f"need offspring >= survivors[0] >= survivors[1] >= 1, got {self.offspring} and {self.survivors}"
+            )
+        if self.stage_samples is not None and len(self.stage_samples) != 3:
+            raise ValueError(f"stage_samples needs three sizes, got {self.stage_samples}")
+        if self.flips < 1:
+            raise ValueError(f"flips must be at least 1, got {self.flips}")
 
-    scored: List[Tuple[float, Candidate]] = []
-    history: List[float] = []
+    @classmethod
+    def from_mapping(cls, settings: Optional[Mapping]) -> "EvolutionConfig":
+        return cls(**dict(settings or {}))
 
-    for generation in range(cfg.generations + 1):
-        # Survivors carry their score over; only the new candidates are evaluated.
-        for candidate in population:
-            loss = evaluate(candidate)
-            scored.append((loss, candidate))
-        scored.sort(key=lambda item: item[0])
-        scored = scored[: cfg.survivors]
-        history.append(scored[0][0])
-        if cfg.verbose:
-            gen_label = "init" if generation == 0 else f"gen {generation}"
-            print(f"[hadamard-search] {gen_label}: best={scored[0][0]:.6f} "
-                  f"top{cfg.survivors}={[round(s, 6) for s, _ in scored]}")
+    def resolve_mutate(self, activation_symmetric: bool) -> None:
+        """Replace ``mutate="auto"`` by the sign vectors that change the fitness: s1 alone for symmetric
+        activation quantization, which s2 does not affect, and both for asymmetric."""
+        if self.mutate == "auto":
+            self.mutate = "s1" if activation_symmetric else "s1_s2"
 
-        if generation == cfg.generations:
+    def settings(self) -> dict:
+        """The configuration without the run's history, as saved with the rotation."""
+        settings = asdict(self)
+        settings.pop("history")
+        return settings
+
+
+def default_stage_samples(num_samples: int) -> Tuple[int, int, int]:
+    """Stage sizes for a calibration set: 8, 16, 64 for 64 samples; 8, 64, 256 for 256; 16, 64, 768 for 768.
+
+    The last stage is the whole set; the first two are capped by it.
+    """
+    if num_samples <= 64:
+        first, second = 8, 16
+    elif num_samples <= 256:
+        first, second = 8, 64
+    else:
+        first, second = 16, 64
+    return min(first, num_samples), min(second, num_samples), num_samples
+
+
+def _hadamard(width: int) -> torch.Tensor:
+    """A normalized ``(width, width)`` Hadamard in float64, rescaled so its rows have unit norm exactly.
+
+    matmul_hadU divides by a single-precision sqrt(width), which leaves a width that is not a power of two
+    (whisper-large-v3's 1280) orthogonal only to ~3e-8.
+    """
+    H = matmul_hadU(torch.eye(width, dtype=torch.float64))
+    return H / H[0].norm()
+
+
+def hadamard_basis(width: int, block_size: Optional[int], device) -> torch.Tensor:
+    """The fixed H of R1 = diag(s1) @ H @ diag(s2): a normalized Hadamard, block-diagonal with blocks of
+    block_size when given. float64, ``(width, width)``."""
+    if block_size is None:
+        return _hadamard(width).to(device)
+    if width % block_size:
+        raise ValueError(f"block_size {block_size} does not divide width {width}")
+    return torch.block_diag(*[_hadamard(block_size)] * (width // block_size)).to(device)
+
+
+def signed_hadamard(H: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor) -> torch.Tensor:
+    """``diag(s1) @ H @ diag(s2)``, without forming the diagonal matrices."""
+    return s1.to(H).unsqueeze(1) * H * s2.to(H).unsqueeze(0)
+
+
+def random_sign_vectors(widths: Mapping[Optional[str], int], generator: torch.Generator, device) -> SignVectors:
+    """Independent random ``(s1, s2)`` per stream, float32 on device."""
+    def signs(width):
+        return (torch.randint(0, 2, (width,), generator=generator) * 2 - 1).to(device=device, dtype=torch.float32)
+    return {stream: (signs(width), signs(width)) for stream, width in widths.items()}
+
+
+def mutate_signs(parent: SignVectors, flips: int, mutate: str, generator: torch.Generator) -> SignVectors:
+    """A copy of parent with ``flips`` distinct positions flipped, drawn uniformly over the mutated vectors.
+
+    With ``mutate="s1_s2"`` the positions are drawn from every stream's s1 and s2 together, with ``"s1"``
+    from every stream's s1.
+    """
+    vectors = [(stream, which) for stream in parent for which in ((0, 1) if mutate == "s1_s2" else (0,))]
+    sizes = [parent[stream][which].numel() for stream, which in vectors]
+    total = sum(sizes)
+    if flips > total:
+        raise ValueError(f"cannot flip {flips} of {total} positions")
+    child = {stream: (s1.clone(), s2.clone()) for stream, (s1, s2) in parent.items()}
+    offsets = torch.tensor([0, *sizes]).cumsum(0)
+    for position in torch.randperm(total, generator=generator)[:flips].tolist():
+        index = int(torch.searchsorted(offsets, position, right=True)) - 1
+        stream, which = vectors[index]
+        child[stream][which][position - int(offsets[index])] *= -1
+    return child
+
+
+def _subset(sample_counts: Sequence[int], samples: int, generator: Optional[torch.Generator]) -> List[int]:
+    """Batch indices covering at least ``samples`` samples: a random subset, or the leading batches."""
+    order = range(len(sample_counts)) if generator is None else torch.randperm(len(sample_counts), generator=generator).tolist()
+    chosen, covered = [], 0
+    for index in order:
+        if covered >= samples:
             break
-
-        # Breed the next generation from the survivors.
-        population = []
-        while len(population) < cfg.population - cfg.survivors:
-            i = int(torch.randint(len(scored), (1,), generator=generator).item())
-            parent = scored[i][1]
-            if cfg.crossover and len(scored) > 1:
-                j = int(torch.randint(len(scored), (1,), generator=generator).item())
-                other = scored[j][1]
-                child = {name: _crossover_pair(parent[name], other[name], generator) for name in sign_sizes}
-            else:
-                child = {name: (parent[name][0].clone(), parent[name][1].clone()) for name in sign_sizes}
-            population.append({name: _mutate_pair(child[name], cfg.mutation_prob, generator) for name in sign_sizes})
-
-    best_loss, best_signs = scored[0]
-    return best_signs, best_loss, history
+        chosen.append(index)
+        covered += sample_counts[index]
+    return sorted(chosen)
 
 
-def make_batch_evaluator(model, loss_fn, batches, params: Dict[str, torch.Tensor],
-                         block_sizes: Optional[Dict[str, Optional[int]]] = None) -> Callable:
-    """Build the ``evaluate`` callback: install the candidate, then score it.
+def evolve_signs(
+    parent: SignVectors,
+    fitness: Callable[[SignVectors, List[int]], float],
+    sample_counts: Sequence[int],
+    config: EvolutionConfig,
+    log: Callable[[str], None] = print,
+) -> Tuple[SignVectors, float]:
+    """Run the (1 + lambda) search from parent and return the final parent and its fitness.
 
-    ``batches`` is materialized up front by the callers so every candidate sees exactly
-    the same data - otherwise the losses are not comparable and the search is noise.
+    Args:
+        parent: The initial ``{stream: (s1, s2)}``.
+        fitness: ``fn(signs, batch_indices) -> float``, the mean KL of the model rotated by signs over the
+            listed calibration batches. Lower is better.
+        sample_counts: Samples in each calibration batch.
+        config: The search settings. Each generation's record is appended to ``config.history``.
+        log: Called with one line per generation.
     """
-    @torch.no_grad()
-    def evaluate(signs: Candidate) -> float:
-        write_rotations_(params, signs, block_sizes)
-        total = 0.0
-        for batch in batches:
-            total += float(loss_fn(model, batch))
-        return total / max(len(batches), 1)
+    if config.mutate == "auto":
+        raise ValueError("resolve mutate='auto' with EvolutionConfig.resolve_mutate before the search")
+    total = sum(sample_counts)
+    stages = config.stage_samples or default_stage_samples(total)
+    generator = torch.Generator().manual_seed(config.seed)
+    evaluation_set = _subset(sample_counts, min(stages[2], total), None)
+    parent_fitness = fitness(parent, evaluation_set)
+    log(f"evolution: initial fitness {parent_fitness:.6f} on {sum(sample_counts[i] for i in evaluation_set)} samples; "
+        f"stages {stages}, {config.offspring} offspring, survivors {config.survivors}, {config.flips} flips of {config.mutate}")
+    config.history.append({"generation": 0, "fitness": parent_fitness, "accepted": True})
+    for generation in range(1, config.generations + 1):
+        start = time.time()
+        children = [mutate_signs(parent, config.flips, config.mutate, generator) for _ in range(config.offspring)]
+        for stage, keep in ((0, config.survivors[0]), (1, config.survivors[1])):
+            subset = _subset([sample_counts[i] for i in evaluation_set], stages[stage], generator)
+            batches = [evaluation_set[i] for i in subset]
+            scores = [fitness(child, batches) for child in children]
+            ranked = sorted(range(len(children)), key=scores.__getitem__)
+            children = [children[i] for i in ranked[:keep]]
+        scores = [fitness(child, evaluation_set) for child in children]
+        best = min(range(len(children)), key=scores.__getitem__)
+        accepted = scores[best] < parent_fitness
+        if accepted:
+            parent, parent_fitness = children[best], scores[best]
+        config.history.append({
+            "generation": generation, "fitness": parent_fitness, "best_child": scores[best], "accepted": accepted,
+        })
+        log(f"  generation {generation}/{config.generations}: parent {parent_fitness:.6f}, best child "
+            f"{scores[best]:.6f}{' (accepted)' if accepted else ''}, {time.time() - start:.1f}s")
+    return parent, parent_fitness
 
-    return evaluate
 
+def stage_cost(config: EvolutionConfig, num_samples: int) -> int:
+    """Calibration samples scored per generation, a measure of a generation's cost."""
+    stages = config.stage_samples or default_stage_samples(num_samples)
+    return (config.offspring * stages[0] + config.survivors[0] * stages[1]
+            + config.survivors[1] * min(stages[2], num_samples))
 
-def check_search_is_meaningful(activation_bits: int, quantize_weights: bool = False) -> None:
-    """Guard against searching a model whose forward has nothing to quantize.
-
-    Rotations are exactly output-preserving in full precision, so unless the forward fake
-    quantizes *something* - the activations, the weights, or both - every candidate scores
-    identically and the search just returns its first entry.
-    """
-    if activation_bits >= 16 and not quantize_weights:
-        raise ValueError(
-            "Hadamard search needs a quantized forward pass to have anything to optimize, "
-            f"but activation_bits={activation_bits} and weight quantization is off. Every "
-            "orthogonal rotation gives the same loss at full precision. Set activation_bits "
-            "to 4 or 8, or enable weight quantization for a weight-only search."
-        )

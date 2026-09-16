@@ -8,6 +8,10 @@ from typing import Dict, List, Tuple, Optional
 
 from asrq.core.model import ModelQ
 from asrq.core.registry import ModelNames, register_model
+from asrq.transforms.rotation.parakeet_ctc_utils import (
+    get_parakeet_activation_roles,
+    get_parakeet_online_hadamard_layers,
+)
 import torch
 import torch.nn as nn
 
@@ -43,7 +47,7 @@ from nemo.collections.asr.parts.submodules.ctc_decoding import (
 )
 from nemo.utils import model_utils
 from asrq.models.nemo.conformerq import ConformerEncoderQ
-from asrq.quantizers.base import QuantConfig
+from asrq.quantizers.base import QuantConfig, is_pointwise_conv1d
 from asrq.calibration.base import CalibConfig
 from tqdm import tqdm
 
@@ -205,12 +209,6 @@ class ParakeetCTCQ(ModelQ):
     (``quantize_text_decoder`` is a no-op).
     """
     model: EncDecCTCModelQ
-
-    # (wbits, abits) applied to every attention-projection / feed-forward
-    # linear named by get_asrq_linear_targets() below -- same role as
-    # WhisperQ.asrq_attn_bits/asrq_ffn_bits (asrq/models/transformers/whisper.py).
-    asrq_attn_bits: Tuple[int, int] = (4, 16)
-    asrq_ffn_bits: Tuple[int, int] = (4, 16)
 
     @classmethod
     def load_model(cls) -> Tuple[nn.Module, Processor]:
@@ -408,46 +406,35 @@ class ParakeetCTCQ(ModelQ):
 
             block.to("cpu")
 
+    def should_quantize_module(self, name, module) -> bool:
+        """Every encoder nn.Linear and pointwise Conv1d, and the block-output Linears only if configured.
+
+        The convolution module's pointwise_conv1 and pointwise_conv2 are linear maps over channels,
+        rotated and activation-quantized like the feed-forward linears, so their weights are
+        quantized with them. The identity Linear a rotation inserts after each block's norm_out
+        (``encoder.layers.{i}.norm_out.1``) carries that norm's scale and shift, which the original
+        model kept in a LayerNorm; it is quantized only with ``quantize_block_output_linear``, which
+        also gives it an activation role.
+        """
+        if name in self.quant_cfg.exclude_modules:
+            return False
+        if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
+            return False
+        return isinstance(module, nn.Linear) or is_pointwise_conv1d(module)
+
     def quantize_text_decoder(self) -> None:
         """No-op — CTC models do not have a text decoder to quantize."""
         pass
 
-    def for_activation_quantization(self) -> List[str]:
-        linears = []
-        num_encoder_blocks = len(self.model.encoder.layers)
-        for i in range(num_encoder_blocks):
-            stem = f"encoder.layers.{i}"
-            linears += [
-                f"{stem}.feed_forward1.linear1",
-                f"{stem}.self_attn.linear_q",
-                f"{stem}.self_attn.linear_k",
-                f"{stem}.self_attn.linear_v",
-                f"{stem}.self_attn.linear_out",
-                f"{stem}.feed_forward2.linear1",
-            ]
+    def online_hadamard_layers(self) -> Dict[str, str]:
+        """Each fc2-like layer and the activation feeding it.
 
-        return linears
+        See WhisperQ.online_hadamard_layers.
+        """
+        return {fc2: act for act, fc2 in get_parakeet_online_hadamard_layers(self.model)}
 
-    def get_asrq_linear_targets(self) -> Dict[str, Tuple[int, int]]:
-        """Map every attention-projection / feed-forward nn.Linear in the
-        conformer encoder to (wbits, abits), for ModelQ.to_asrq_linear().
-        Same name-building pattern as for_activation_quantization() above,
-        but covers every linear in a block (including linear_pos and the
-        feed_forward*.linear2s, which for_activation_quantization() omits)
-        since to_asrq_linear() is a full weight-replacement pass, not a
-        "which layers also get activation quantization" selection. There is
-        no text-decoder counterpart (CTC has no decoder to quantize, see
-        quantize_text_decoder()'s no-op)."""
-        targets: Dict[str, Tuple[int, int]] = {}
-        num_encoder_blocks = len(self.model.encoder.layers)
-        for i in range(num_encoder_blocks):
-            stem = f"encoder.layers.{i}"
-            for suffix in ("self_attn.linear_q", "self_attn.linear_k", "self_attn.linear_v",
-                           "self_attn.linear_out", "self_attn.linear_pos"):
-                targets[f"{stem}.{suffix}"] = self.asrq_attn_bits
-            for suffix in ("feed_forward1.linear1", "feed_forward1.linear2",
-                           "feed_forward2.linear1", "feed_forward2.linear2"):
-                targets[f"{stem}.{suffix}"] = self.asrq_ffn_bits
-
-        return targets
+    def activation_quantization_roles(self) -> Dict[str, str]:
+        """Attention projections, feed-forward linears and pointwise convs, fc2-like layers
+        included; the same mapping the rotation search quantizes."""
+        return get_parakeet_activation_roles(self.model, self.quant_cfg.quantize_block_output_linear)
 

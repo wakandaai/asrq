@@ -13,13 +13,18 @@ from tqdm import tqdm
 import lhotse
 import evaluate
 import time
-import normalizer.data_utils as open_asr_data_utils
+from asrq.evaluation.english_text_normalizer import load_upstream_data_utils
+from asrq.evaluation.canary_qwen_cuda_graphs import canary_qwen_graphs
+from asrq.evaluation.parakeet_cuda_graphs import parakeet_graphs
+from asrq.evaluation.whisper_cuda_graphs import whisper_graphs
 
 # Nemo SALM model
 from nemo.collections.speechlm2.models.salm import SALM
 
 # transformers
 from transformers import GenerationConfig
+
+open_asr_data_utils = load_upstream_data_utils()
 
 # metric - WER
 wer_metric = evaluate.load("wer")
@@ -289,6 +294,16 @@ def generate_canaryqwen(model, processor, all_data, batch_size, max_new_tokens=N
     return predictions
 
 
+
+def generate_canaryqwen_cuda_graphs(model, processor, all_data, batch_size, max_new_tokens=None):
+    """generate_canaryqwen's greedy transcription, replayed from CUDA graphs.
+
+    See asrq.evaluation.canary_qwen_cuda_graphs. Batches are padded to batch_size and audio to 5 s
+    buckets, so graphs are captured once per batch size and bucket.
+    """
+    return canary_qwen_graphs(model).transcribe(model, all_data["audio"], batch_size)
+
+
 # for whisper
 from torch.nn.attention import sdpa_kernel, SDPBackend
 def generate_whisper(model, processor, all_data, batch_size, max_new_tokens=None):
@@ -308,6 +323,22 @@ def generate_whisper(model, processor, all_data, batch_size, max_new_tokens=None
             pred_ids = model.generate(**inputs, **gkwargs)
         pred_text = processor.batch_decode(pred_ids, skip_special_tokens=True)
         predictions.extend(pred_text)
+    return predictions
+
+
+def generate_whisper_cuda_graphs(model, processor, all_data, batch_size, max_new_tokens=None):
+    """generate_whisper's greedy transcription, replayed from CUDA graphs captured per batch size.
+
+    See asrq.evaluation.whisper_cuda_graphs. Batches are padded to batch_size, so only one set of
+    graphs is captured per evaluation.
+    """
+    graphs = whisper_graphs(model, batch_size)
+    predictions = []
+    for batch_start in range(0, len(all_data["audio"]), batch_size):
+        batch_audios = all_data["audio"][batch_start:batch_start + batch_size]
+        features = processor(batch_audios, sampling_rate=16000, return_tensors="pt").input_features
+        tokens = graphs.generate(features.to(device=model.device, dtype=model.dtype), max_new_tokens)
+        predictions.extend(processor.batch_decode(tokens.cpu(), skip_special_tokens=True))
     return predictions
 
 
@@ -334,6 +365,15 @@ def generate_parakeet(model, processor, all_data, batch_size):
 
 
     return transcriptions
+
+def generate_parakeet_cuda_graphs(model, processor, all_data, batch_size):
+    """generate_parakeet's greedy CTC transcription, with the encoder and CTC head replayed from CUDA graphs.
+
+    See asrq.evaluation.parakeet_cuda_graphs. Batches are padded to batch_size and to a length bucket,
+    so graphs are captured once per bucket.
+    """
+    return parakeet_graphs(model).transcribe(model, all_data["audio"], batch_size)
+
 
 def generate_granite(model, processor, all_data, batch_size):
     chat = [
@@ -376,7 +416,7 @@ def generate_granite(model, processor, all_data, batch_size):
 def evaluate_model(
     model, batch_size=192, dataset_path=DATASET_PATH, dataset="ami_cleaned",
      split="test", cache_dir="", eval_id="", save_results_manifest=False, save_results_metrics=True, processor=None, generate_fn=None,
-     batches_to_eval=None, create_audio_files=False
+     batches_to_eval=None, create_audio_files=False, dtype=torch.bfloat16
 ):
     eval_start_time = time.time()
     cache_dir = cache_dir or os.getcwd()
@@ -388,7 +428,7 @@ def evaluate_model(
     CACHE_DIR = os.path.join(DATA_CACHE_DIR, DATASET_NAME, SPLIT_NAME)
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    model.to(torch.bfloat16).eval()
+    model.to(dtype).eval()
 
 
     ds = load_dataset(

@@ -26,12 +26,10 @@ def get_whisper_layers_to_scale(model):
                 f"model.encoder.layers.{i}.final_layer_norm"
             ),
         )
-        # fc2 is fed by the activation, which has no weight to absorb the reciprocal
-        # scale, so prev is None and fc2 divides its own input (see ScaledInputLinear).
         layers_to_scale.append(
             (
                 (f"model.encoder.layers.{i}.fc2",),
-                None
+                f"model.encoder.layers.{i}.activation_fn"
             ),
         )
 
@@ -73,7 +71,7 @@ def get_whisper_layers_to_scale(model):
         layers_to_scale.append(
             (
                 (f"model.decoder.layers.{i}.fc2",),
-                None
+                f"model.decoder.layers.{i}.activation_fn"
             ),
         )
 

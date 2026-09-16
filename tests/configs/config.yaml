@@ -9,7 +9,42 @@ seed: 42
 
 calibration:
   num_samples: 4
+  # Built with: python -m asrq.calibration.build --model <model> --calibration-dir <path>
+  path: outputs/calibration/librispeech_train_clean_360_2048
+  text_source: transcript
 
 evaluate: True
 method: "test"
+create_audio_files: False
+# Activation quantization, read by evaluation and passed to the rotation search, so a rotation is
+# searched against exactly the quantization it is evaluated with. 16 or more disables it.
 activation_bits: 16
+# Group size for the roles in activation_groupwise_roles; every other role is quantized per token.
+activation_group_size: 128
+activation_symmetric: True
+# Layer roles: q, k, v (attention projections), attn_out (attention output projection),
+# fc1 (first feed-forward / pointwise-conv layer), fc2 (second one, behind the online Hadamard).
+# q, k, v and fc1 read the R1-rotated residual stream and are quantized per token; attn_out
+# (head-wise R2 basis) and fc2 (block online Hadamard) keep one scale per group.
+activation_groupwise_roles: [attn_out, fc2]
+
+# fake: quantization is simulated in fp16 (for WER). humming: after quantization, activation-quantized
+# layers become real low-bit ASRQLinear layers running humming's kernels (for measuring speed).
+inference: fake
+# Open ASR Leaderboard (hf-audio/open-asr-leaderboard) dataset configurations and splits to evaluate.
+# Only the entries listed here are evaluated.
+eval_datasets:
+  - {dataset: ami_cleaned, split: test}
+  - {dataset: earnings22, split: test}
+  - {dataset: gigaspeech_cleaned, split: test}
+  - {dataset: librispeech, split: test.clean}
+  - {dataset: librispeech, split: test.other}
+  - {dataset: spgispeech, split: test}
+  - {dataset: voxpopuli_cleaned_aa, split: test}
+# Evaluate only the first N batches of each split, model.eval_batch_size utterances per batch.
+# null evaluates every utterance.
+eval_batches: null
+# dtype the model runs in during evaluation. humming computes in float16, so a bfloat16 model makes
+# every ASRQLinear convert its input and output, which cancelled W4A4's speedup under CUDA graphs
+# (1.19x in float16, 0.97-1.04x in bfloat16); use float16 when measuring humming speed.
+eval_dtype: bfloat16

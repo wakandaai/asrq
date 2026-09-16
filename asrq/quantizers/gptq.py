@@ -2,7 +2,6 @@
 # pyright: reportIncompatibleVariableOverride=false
 
 from typing import Any, Tuple
-import torch
 import torch.nn as nn
 from omegaconf import DictConfig
 from asrq.quantizers.base import (
@@ -16,6 +15,7 @@ from asrq.core.registry import (
     register_quantizer_config
 )
 from asrq.core.utils import cuda_empty_cache, cuda_synchronize
+from asrq.quantizers.gptq_solver import gptq_factors, gptq_quantize
 
 
 
@@ -63,61 +63,10 @@ class GPTQQuantizer(HessianAddBatchMixin, LinearQuantizer):
         """
         # weight_2d/set_weight_2d keep this identical for nn.Linear and pointwise Conv1d.
         W = self.weight_2d().clone()
-        columns = W.shape[1]
-        # initial scales and zeros
-        scales, zeros = self.find_quant_params(W)
-        scales.squeeze_(-1); zeros.squeeze_(-1)
-        H = self.H
+        config = self.quant_config
+        factors = gptq_factors(self.H, config.percdamp)
         del self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
-        # act order and static groups
-        perm = torch.argsort(torch.diag(H), descending=True)
-        inv_perm = torch.argsort(perm)
-        W = W[:, perm]
-        H = H[perm][:, perm]
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
-        damp = self.quant_config.percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(columns, device=W.device)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
-        group_size = self.quant_config.group_size
-        if group_size == -1:
-            group_size = columns
-        for i1 in range(0, columns, self.quant_config.block_size):
-            i2 = min(i1 + self.quant_config.block_size, columns)
-            count = i2 - i1
-
-            W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
-
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
-                idx = i1 + i
-                idx = perm[idx]
-                s, z = scales[:, idx// group_size], zeros[:, idx//group_size]
-                q = torch.round((w - z) / s).clamp(self.minq, self.maxq) * s + z
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
-                err1 = (w-q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
-            Q[:, i1:i2] = Q1
-            Losses[:, i1:i2] = Losses1
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
+        self.set_weight_2d(gptq_quantize(W, factors, config.bits, config.group_size, config.symmetric, config.block_size))
         cuda_synchronize()
-        Q = Q[:, inv_perm]
-        self.set_weight_2d(Q)
-
         cuda_empty_cache()
-        return (scales, zeros)
+        return tuple(t.squeeze(-1) for t in self.find_quant_params(W))

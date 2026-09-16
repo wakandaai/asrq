@@ -2,7 +2,12 @@ name: nvidia/canary-qwen-2.5b
 
 # Quantization settings
 exclude_modules: []
+# A rotation inserts an identity Linear after every Conformer block's output norm (but the last) in the
+# speech encoder; True also weight- and activation-quantizes it (role block_out). See parakeet.yaml.
+quantize_block_output_linear: False
 
 # evaluation
 eval_batch_size: 192
+# Function in asrq/evaluation/openasr.py that transcribes during evaluation (Hugging Face generate on the
+# merged LLM, greedy, "Transcribe the following: <audio>").
 generate_fn: generate_canaryqwen
