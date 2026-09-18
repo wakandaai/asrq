@@ -1,3 +1,6 @@
 [submodule "third_party/open_asr_leaderboard"]
 	path = third_party/open_asr_leaderboard
 	url = https://github.com/huggingface/open_asr_leaderboard.git
+[submodule "third_party/humming"]
+	path = third_party/humming
+	url = https://github.com/ldfrancis/humming.git
