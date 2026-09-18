@@ -46,7 +46,7 @@ def test_rot_exp_learns_and_saves_r1_r2_and_the_online_hadamard_signs(learned_ro
     assert len(checkpoint["R2s"]) == 42
     assert all(R2.shape == (128, 128) for R2 in checkpoint["R2s"].values())
     assert checkpoint["learn_r2"] and checkpoint["fc2_online_hadamard"]
-    assert set(checkpoint["hadamard_signs"]) == {1024, 4096}
+    assert checkpoint["hadamard_sign_seed"] > 0
     assert checkpoint["activation_quantization"]["bits"] == 4
 
 

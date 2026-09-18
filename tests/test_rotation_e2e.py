@@ -1009,7 +1009,7 @@ def test_evaluation_quantizes_the_same_tensors_as_the_search(batches, tmp_path, 
     utils.patch_rotations(
         searched, whisper_utils.get_whisper_layers_to_rotate(searched), R1, R2s, {},
         ACTIVATION_GROUP, {name: capturing(search_inputs, name) for name in roles},
-        {w: v.to(DEVICE) for w, v in torch.load(path)["hadamard_signs"].items()},
+        {4 * D_MODEL: utils.seeded_hadamard_signs(torch.load(path)["hadamard_sign_seed"], 4 * D_MODEL, DEVICE)},
     )
     _logits(searched, batches[0])
 
@@ -1171,12 +1171,33 @@ def test_random_signs_keep_a_non_zero_mean_from_becoming_one_spike_per_block():
         assert group_crest(randomized(x)) < 3.5
 
 
-def test_the_search_saves_signs_and_apply_uses_them(batches, tmp_path):
+def test_the_search_saves_a_sign_seed_and_apply_uses_it(batches, tmp_path):
     model = _rotated_whisper(batches, tmp_path)
-    saved = torch.load(tmp_path / "rotations.pt")["hadamard_signs"]
-    assert set(saved) == {4 * D_MODEL}
+    checkpoint = torch.load(tmp_path / "rotations.pt")
+    seed = checkpoint["hadamard_sign_seed"]
+    assert seed > 0 and "hadamard_signs" not in checkpoint
+    expected = utils.seeded_hadamard_signs(seed, 4 * D_MODEL, DEVICE)
     hadamards = [m for m in model.modules() if isinstance(m, utils.OnlineHadamard)]
-    assert hadamards and all(torch.equal(h.signs.cpu(), saved[4 * D_MODEL]) for h in hadamards)
+    assert hadamards and all(h.sign_seed == seed and torch.equal(h.signs, expected) for h in hadamards)
+
+
+def test_a_checkpoint_with_stored_sign_vectors_still_applies_exactly(batches, tmp_path):
+    """Checkpoints saved before sign seeds hold one sign vector per fc2 width; they fold and multiply as before."""
+    _rotated_whisper(batches, tmp_path)
+    path = tmp_path / "rotations.pt"
+    checkpoint = torch.load(path)
+    signs = utils.seeded_hadamard_signs(checkpoint.pop("hadamard_sign_seed"), 4 * D_MODEL, "cpu")
+    checkpoint["hadamard_signs"] = {4 * D_MODEL: signs}
+    torch.save(checkpoint, path)
+
+    fresh = _build_model()
+    before = _logits(fresh, batches[0])
+    utils.apply_rotations(fresh, str(path), hadamard_block_size=HADAMARD_BLOCK_SIZE,
+                          **whisper_utils.get_whisper_rotation_layers(fresh))
+    after = _logits(fresh, batches[0])
+    hadamards = [m for m in fresh.modules() if isinstance(m, utils.OnlineHadamard)]
+    assert hadamards and all(h.sign_seed == 0 and torch.equal(h.signs.cpu(), signs) for h in hadamards)
+    assert (after - before).abs().max() / before.abs().max() < TOLERANCE
 
 
 def test_a_checkpoint_without_signs_applies_the_plain_hadamard(batches, tmp_path):
@@ -1190,8 +1211,8 @@ def test_a_checkpoint_without_signs_applies_the_plain_hadamard(batches, tmp_path
         **whisper_utils.get_whisper_rotation_layers(searched),
     )
     checkpoint = torch.load(path)
-    assert checkpoint["hadamard_signs"] is None
-    del checkpoint["hadamard_signs"]
+    assert checkpoint["hadamard_sign_seed"] is None
+    del checkpoint["hadamard_sign_seed"]
     torch.save(checkpoint, path)
 
     fresh = _build_model()
@@ -1231,7 +1252,7 @@ def test_r1_only_search_optimises_nothing_but_r1(model, batches, tmp_path, monke
     assert R2s == {}
     saved = torch.load(tmp_path / "rotations.pt")
     assert saved["learn_r2"] is False and saved["fc2_online_hadamard"] is False
-    assert saved["R2s"] == {} and saved["hadamard_signs"] is None
+    assert saved["R2s"] == {} and saved["hadamard_sign_seed"] is None
 
 
 def test_r1_only_apply_leaves_out_proj_and_fc2_inputs_unrotated(batches, tmp_path):
@@ -1775,3 +1796,23 @@ def test_the_gptq_weight_only_search_scores_gptq_on_the_rotated_hessians(batches
             logits, mask = whisper_utils.whisper_logits_fn(rotated, batch)
             kls.append(float(utils.masked_kl_divergence(logits, reference, mask)))
     assert abs(sum(kls) / len(kls) - trajectory[-1]) < 0.02 * trajectory[-1]
+
+
+@pytest.mark.parametrize("channels_first", [False, True])
+def test_a_seeded_online_hadamard_equals_multiplying_by_its_signs(channels_first):
+    """humming generates the seeded signs inside its kernel: the same output as multiplying first, bit for bit."""
+    width, seed = 4 * D_MODEL, 12345
+    signs = utils.seeded_hadamard_signs(seed, width, DEVICE)
+    x = torch.randn(3, width, 7, device=DEVICE) if channels_first else torch.randn(5, width, device=DEVICE)
+    seeded = utils.OnlineHadamard(HADAMARD_BLOCK_SIZE, channels_first=channels_first, signs=signs, sign_seed=seed)
+    multiplied = utils.OnlineHadamard(HADAMARD_BLOCK_SIZE, channels_first=channels_first, signs=signs)
+    assert torch.equal(seeded(x), multiplied(x))
+
+
+def test_seeded_signs_are_balanced_and_differ_between_seeds():
+    first, second = (utils.seeded_hadamard_signs(seed, 4096, "cpu") for seed in (1, 2))
+    assert set(first.unique().tolist()) == {-1.0, 1.0}
+    assert abs(float(first.mean())) < 0.05 and float((first != second).float().mean()) > 0.4
+    assert torch.equal(utils.seeded_hadamard_signs(1, 64, "cpu"), first[:64])
+    with pytest.raises(ValueError):
+        utils.seeded_hadamard_signs(0, 8, "cpu")

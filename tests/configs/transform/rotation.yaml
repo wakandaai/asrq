@@ -6,7 +6,8 @@ batch_size: 4
 path: ""
 learn_rotation: False
 hadamard_block_size: 128
-# random +-1 signs before the fc2 online Hadamard (X @ D @ H); a plain Hadamard spikes GELU outputs
+# random +-1 signs before the fc2 online Hadamard (X @ D @ H); a plain Hadamard spikes GELU outputs.
+# Saved as one seed; humming (third_party/humming) generates the signs from it inside its kernel.
 hadamard_random_signs: True
 # learn a head-wise R2 per attention module (False: R1 only, attn_out input unrotated)
 learn_r2: True

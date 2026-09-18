@@ -70,7 +70,7 @@ def test_rot_exp_learns_and_saves_r1_r2_and_the_online_hadamard_signs(learned_ro
     assert sum(".encoder." in n for n in names) == 32 and sum(".decoder." in n for n in names) == 64
     assert all(R2.shape == (64, 64) for R2 in checkpoint["R2s"].values())
     assert checkpoint["learn_r2"] and checkpoint["fc2_online_hadamard"]
-    assert set(checkpoint["hadamard_signs"]) == {5120}
+    assert checkpoint["hadamard_sign_seed"] > 0
     assert checkpoint["activation_quantization"]["groupwise_roles"] == ["attn_out", "fc2"]
 
 

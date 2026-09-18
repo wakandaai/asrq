@@ -1,5 +1,6 @@
 # pyright: reportMissingImports=false
 
+import gc
 import torch
 import torch.nn as nn
 import numpy as np
@@ -19,6 +20,7 @@ from tqdm import tqdm
 from asrq.evaluation.english_text_normalizer import normalizer
 from asrq.core.types import Processor
 from asrq.core.registry import get_quant_cls
+from asrq.core.utils import cuda_empty_cache
 
 
 
@@ -159,6 +161,11 @@ class ModelQ(ABC):
             # Then quantize the text decoder
             print("Quantizing text decoder...")
             self.quantize_text_decoder()
+        # The block-wise quantizers hold one captured input per calibration sample, kept alive by the
+        # reference cycles of their hooks until the cycle collector runs: 33 GB for whisper-large-v3 on
+        # 2048 samples, which leaves evaluation without memory.
+        gc.collect()
+        cuda_empty_cache()
         print("Quantization complete.")
 
     def should_quantize_module(self, name, module):

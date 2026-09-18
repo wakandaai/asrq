@@ -18,7 +18,7 @@ from asrq.core.linear import ASRQLinear, replace_with_asrq_linear
 from asrq.quantizers.activation import fake_quantize_activations
 from asrq.quantizers.base import QuantConfig
 from asrq.quantizers.rtn import RTNQuantizer
-from asrq.transforms.rotation.utils import OnlineHadamard, random_hadamard_signs
+from asrq.transforms.rotation.utils import OnlineHadamard, random_hadamard_signs, seeded_hadamard_signs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="humming needs CUDA")
 DEVICE = "cuda"
@@ -183,3 +183,30 @@ def test_rejects_settings_humming_cannot_run(kwargs, message):
 def test_rejects_a_convolution_that_is_not_pointwise():
     with pytest.raises(ValueError, match="pointwise"):
         ASRQLinear.from_linear(nn.Conv1d(64, 64, 3).to(DEVICE).half())
+
+
+@pytest.mark.parametrize("bits", [16, 4])
+def test_a_seeded_hadamard_matches_the_stored_signs_bit_for_bit(bits):
+    """hadamard_sign_seed lets humming generate the signs; the result equals multiplying by the same vector.
+
+    Bit for bit with quantized activations, whose batch-invariant schedule is deterministic. The A16 default
+    schedule is not: two identical calls of one layer already differ by an fp16 ulp, so there the outputs are
+    held to that.
+    """
+    torch.manual_seed(0)
+    layer = nn.Linear(5120, 1280).to(DEVICE)
+    seed = 99
+    signs = seeded_hadamard_signs(seed, 5120, DEVICE)
+    group = 128 if bits < 16 else 0
+    stored = ASRQLinear.from_linear(layer, 4, 128, bits, group, hadamard_block_size=128, hadamard_signs=signs)
+    seeded = ASRQLinear.from_linear(layer, 4, 128, bits, group, hadamard_block_size=128, hadamard_sign_seed=seed)
+    x = torch.randn(3, 37, 5120, device=DEVICE, dtype=torch.float16)
+    with torch.no_grad():
+        expected, got = stored(x), seeded(x)
+    if bits < 16:
+        assert torch.equal(expected, got)
+    else:
+        assert (expected - got).abs().max() <= 2e-3 * expected.abs().max()
+    assert "seed 99" in repr(seeded)
+    with pytest.raises(ValueError):
+        ASRQLinear(5120, 1280, hadamard_block_size=128, hadamard_signs=signs, hadamard_sign_seed=seed)

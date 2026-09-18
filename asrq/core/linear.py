@@ -283,7 +283,9 @@ class ASRQLinear(nn.Module):
     The layer an online Hadamard feeds (fc2 after a rotation) takes it here rather than as a
     separate module: humming applies the Hadamard and the input quantization in one call, which
     measured +1-3% over no Hadamard against +25-40% as a module in front. The random signs of a
-    randomized Hadamard are applied just before that call. The Hadamard must already be absorbed
+    randomized Hadamard come from a seed that humming's input kernel hashes per channel
+    (``hadamard_sign_seed``), so they cost nothing; a stored sign vector from an older checkpoint is
+    multiplied just before the call instead. The Hadamard, signs included, must already be absorbed
     into the weight passed in, as a folded rotation leaves it.
 
     humming runs in fp16 only. Evaluation casts a whole model to bfloat16, so the layer keeps its
@@ -312,6 +314,8 @@ class ASRQLinear(nn.Module):
         hadamard_block_size: Block size of an online Hadamard on the input, or None.
         hadamard_signs: Optional ``(in_features,)`` +-1 vector applied before that Hadamard.
         conv1d_layout: True for a pointwise Conv1d, whose input is (batch, channels, time).
+        hadamard_sign_seed: Seed of the Hadamard's signs, generated inside humming's kernel; 0 for none.
+            Takes the place of hadamard_signs, which must then be None.
     """
 
     BATCH_INVARIANT = json.dumps({"use_batch_invariant": True})
@@ -328,8 +332,11 @@ class ASRQLinear(nn.Module):
         hadamard_block_size: Optional[int] = None,
         hadamard_signs: Optional[torch.Tensor] = None,
         conv1d_layout: bool = False,
+        hadamard_sign_seed: int = 0,
     ):
         super().__init__()
+        if hadamard_sign_seed and hadamard_signs is not None:
+            raise ValueError("pass either hadamard_signs or hadamard_sign_seed, not both")
         self.in_features = in_features
         self.out_features = out_features
         self.weight_bits = weight_bits
@@ -337,6 +344,7 @@ class ASRQLinear(nn.Module):
         self.activation_bits = min(activation_bits, 16)
         self.activation_group_size = max(activation_group_size, 0)
         self.hadamard_block_size = hadamard_block_size
+        self.hadamard_sign_seed = int(hadamard_sign_seed)
         self.conv1d_layout = conv1d_layout
         self._validate()
 
@@ -387,6 +395,7 @@ class ASRQLinear(nn.Module):
         activation_group_size: int = 0,
         hadamard_block_size: Optional[int] = None,
         hadamard_signs: Optional[torch.Tensor] = None,
+        hadamard_sign_seed: int = 0,
     ) -> "ASRQLinear":
         """Quantize an nn.Linear or pointwise nn.Conv1d into an ASRQLinear on the GPU.
 
@@ -406,7 +415,7 @@ class ASRQLinear(nn.Module):
             weight_bits=weight_bits, weight_group_size=weight_group_size,
             activation_bits=activation_bits, activation_group_size=activation_group_size,
             hadamard_block_size=hadamard_block_size, hadamard_signs=hadamard_signs,
-            conv1d_layout=is_conv,
+            conv1d_layout=is_conv, hadamard_sign_seed=hadamard_sign_seed,
         ).cuda()
         with torch.no_grad():
             module.humming.load_from_unquantized(weight.to(device="cuda", dtype=torch.float16))
@@ -440,7 +449,7 @@ class ASRQLinear(nn.Module):
         if self.hadamard_signs is not None:
             x = x * self.hadamard_signs
         out = self.humming(x.contiguous(), hadamard_block_size=self.hadamard_block_size,
-                           compute_config=self.compute_config)
+                           hadamard_sign_seed=self.hadamard_sign_seed, compute_config=self.compute_config)
         out = out.reshape(*leading, self.out_features).to(dtype)
         return out.transpose(1, 2) if self.conv1d_layout else out
 
@@ -456,6 +465,7 @@ class ASRQLinear(nn.Module):
         if self.hadamard_block_size:
             hadamard = f", hadamard={self.hadamard_block_size}"
             hadamard += "+signs" if self.hadamard_signs is not None else ""
+            hadamard += f"+signs(seed {self.hadamard_sign_seed})" if self.hadamard_sign_seed else ""
         return (f"in={self.in_features}, out={self.out_features}, W{self.weight_bits} "
                 f"{weight_groups}, {activations}{hadamard}, conv1d={self.conv1d_layout}")
 
@@ -482,7 +492,8 @@ def replace_with_asrq_linear(
     unwrapped back to the bare activation. A layer carrying the Hadamard at its own input, as an
     ``input_hadamard`` child run by a pre-hook (a SwiGLU down projection), takes it the same way;
     the replaced layer's hook goes with it. The Hadamard module is recognised by its
-    ``block_size`` and ``signs`` attributes, so this module does not depend on the rotation code.
+    ``block_size`` and ``signs`` attributes, so this module does not depend on the rotation code; its
+    ``sign_seed``, when set, is passed on so humming generates the signs itself.
 
     Args:
         model: The model to modify.
@@ -498,11 +509,13 @@ def replace_with_asrq_linear(
     replaced = {}
     for name, (weight_bits, activation_bits, activation_group_size) in layers.items():
         block_size = signs = None
+        seed = 0
         if online_hadamards.get(name) is not None:
             act_parent, act_attribute = _parent_and_attribute(model, online_hadamards[name])
             activation = getattr(act_parent, act_attribute)
             if isinstance(activation, nn.Sequential) and hasattr(activation[-1], "block_size"):
                 block_size, signs = activation[-1].block_size, activation[-1].signs
+                seed = getattr(activation[-1], "sign_seed", 0)
                 unwrapped = activation[0] if len(activation) == 2 else activation[:-1]
                 setattr(act_parent, act_attribute, unwrapped)
         parent, attribute = _parent_and_attribute(model, name)
@@ -510,9 +523,10 @@ def replace_with_asrq_linear(
         input_hadamard = getattr(layer, "input_hadamard", None)
         if hasattr(input_hadamard, "block_size"):
             block_size, signs = input_hadamard.block_size, input_hadamard.signs
+            seed = getattr(input_hadamard, "sign_seed", 0)
         new = ASRQLinear.from_linear(
             layer, weight_bits, weight_group_size, activation_bits, activation_group_size,
-            hadamard_block_size=block_size, hadamard_signs=signs,
+            hadamard_block_size=block_size, hadamard_signs=None if seed else signs, hadamard_sign_seed=seed,
         )
         if attribute.isdigit():
             parent[int(attribute)] = new

@@ -28,7 +28,9 @@
 - [x] Whisper end to end (rotation, GPTQ W4, WER): W4A4 matches full precision, both all per-token and with attn_out/fc2 group-wise, on 256-utterance runs.
 - [x] Residual-stream rotations of an applied rotation are modules (the rotation is a buffer, the hook is the module's own method), so the rotated model saves and loads with torch.save / torch.load, and its state_dict holds R1. The search still uses plain hooks on the live R1.
 - [x] attach_rotation_hooks is a required argument of learn_rotations and apply_rotations; leaving it out silently gave a wrong model for Whisper and Parakeet. Pass None explicitly only for a model whose residual stream needs no transform.
-- [ ] Confirm the chosen configuration at full scale for Whisper, Parakeet and Canary-Qwen: 2048 calibration utterances and the full evaluation sets.
+- [x] Whisper at full scale (learned rotation on 2048 calibration utterances, GPTQ W4 on 2048, fake A4 with attn_out/fc2 in groups of 128, bfloat16, batch 64): all of LibriSpeech test-clean 2.11 and test-other 4.44, against 1.94 and 3.88 unquantized (2620 and 2939 utterances). Rotation search 512 steps, average KL 0.0197 from 0.0274 at the random Hadamard start.
+- [ ] Parakeet and Canary-Qwen at full scale; the other leaderboard splits for all three (ami, earnings22, gigaspeech, spgispeech, voxpopuli; ~19.5 GB to download).
+- [x] ModelQ.quantize collects reference cycles and frees the CUDA cache when it finishes: the block-wise quantizers keep one captured input per calibration sample alive through their hooks, 33 GB for whisper-large-v3 on 2048 samples, which left evaluation without memory. Whisper needs eval_batch_size 64, not the model config's 192.
 - [ ] Learned rotations are not yet shown to beat a random hadamard (Whisper, Parakeet and Canary-Qwen, 256 utterances). Try starting from the identity, longer searches, and compare on more data.
 - [ ] The residual-stream hooks still break torch.compile graphs (humming itself also fails under compile).
 
@@ -91,7 +93,10 @@
 - [x] `eval_dtype` config: in bfloat16 every ASRQLinear casts to fp16 and back, which cancelled the speedup. Use float16 for speed.
 - [x] Whisper: CUDA-graph generation (`generate_whisper_cuda_graphs`), matching generate's transcripts. W4A4 is 1.22x fp16 at batch 1 and 1.15x at batch 64 (both graphed, float16); eager generate is slower than fp16 (humming's per-call Python overhead).
 - [x] Profiles: quantized layers are ~56% of Whisper's encoder time and 9-47% of a decoder step (cross-attention dominates at large batch); ~51% of Parakeet's acoustic model (relative-position attention is 24%).
-- [ ] fc2's random signs are a separate multiply (~20% of fc2 at large batch); humming's kernel cannot take them.
+- [x] Prototype (outputs/humming_seeded, a patched copy of humming): process_input takes hadamard_sign_seed and multiplies each loaded value by a lowbias32-hashed sign of its column before the Hadamard. Bitwise equal to multiplying by the same signs first (Hadamard alone, W4A16, W4A4 g128); Whisper fc2 1.14-1.27x faster at A16 and 1.14-1.48x at A4 (up to 1.45x at 96k tokens) than the separate multiply. A constant input's crest factor is 3.5 with the seeded signs against 11.3 with the plain Hadamard.
+- [x] humming fork (github.com/ldfrancis/humming) as submodule third_party/humming, branch hadamard-sign-seed from e5829681 (the commit previously installed) with the seeded-sign patch; installed editable. Seeded kernel bitwise equal to the signs multiply; fast suite passes.
+- [ ] Commit and push the patch on the fork's branch, and record that commit in the superproject (git add third_party/humming).
+- [x] Seeded signs adopted: rotation checkpoints save `hadamard_sign_seed` (one per model, drawn from torch's generator) instead of sign vectors; the fold uses seeded_hadamard_signs; OnlineHadamard and ASRQLinear pass the seed to humming instead of multiplying (bit-identical at A4; within the A16 GEMM's own run-to-run ulp). Checkpoints with stored sign vectors still apply through the multiply path.
 - [ ] Optional: quantize the shared q/k/v input once; quantize the cross-attention KV cache, which dominates Whisper decoding at large batch.
 - [ ] Saving and loading a model converted to ASRQLinear is untested.
 

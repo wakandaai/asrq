@@ -2,6 +2,7 @@ import types
 from contextlib import contextmanager
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1014,6 +1015,39 @@ def random_hadamard_signs(width: int, device, generator: Optional[torch.Generato
     return (bits.to(torch.float32) * 2 - 1).to(device)
 
 
+def random_sign_seed(generator: Optional[torch.Generator] = None) -> int:
+    """A seed for seeded_hadamard_signs, drawn from torch's generator; never 0, which means no signs."""
+    return int(torch.randint(1, 2**31, (1,), generator=generator))
+
+
+def seeded_hadamard_signs(seed: int, width: int, device) -> torch.Tensor:
+    """The +-1 vector humming applies before its Hadamard when called with ``hadamard_sign_seed=seed``.
+
+    Channel j gets -1 when bit 0 of lowbias32(j + seed * 0x9E3779B9 mod 2**32) is set, the hash the input
+    kernel computes (third_party/humming, branch hadamard-sign-seed). The signs are what
+    random_hadamard_signs draws -- see there for why an FC2's Hadamard needs them -- but a single integer
+    reproduces them for every width, so the online transform generates them itself instead of reading and
+    multiplying a stored vector.
+
+    Args:
+        seed: A positive seed, as random_sign_seed returns.
+        width: Number of channels.
+        device: Device of the returned vector.
+
+    Returns:
+        A float32 ``(width,)`` tensor of +-1.
+    """
+    if seed <= 0:
+        raise ValueError(f"the sign seed must be positive, got {seed}")
+    x = (np.arange(width, dtype=np.uint64) + np.uint64(seed * 0x9E3779B9 & 0xFFFFFFFF)) & np.uint64(0xFFFFFFFF)
+    x ^= x >> np.uint64(16)
+    x = (x * np.uint64(0x7FEB352D)) & np.uint64(0xFFFFFFFF)
+    x ^= x >> np.uint64(15)
+    x = (x * np.uint64(0x846CA68B)) & np.uint64(0xFFFFFFFF)
+    x ^= x >> np.uint64(16)
+    return torch.from_numpy(np.where(x & np.uint64(1), -1.0, 1.0).astype(np.float32)).to(device)
+
+
 class OnlineHadamard(nn.Module):
     """Apply humming's block-diagonal Hadamard to the feature axis: X <- X @ H.
 
@@ -1040,14 +1074,19 @@ class OnlineHadamard(nn.Module):
             D = diag(signs), the randomized Hadamard. See random_hadamard_signs.
         channels_first: True for (batch, channels, time) inputs, as a pointwise Conv1d reads;
             the Hadamard is then applied to the channel axis.
+        sign_seed: The seed signs came from (seeded_hadamard_signs), or 0. With a seed humming generates
+            the signs inside its Hadamard kernel instead of this module multiplying by them; signs is
+            then kept for inspection and must equal ``seeded_hadamard_signs(sign_seed, width)``.
     """
 
     def __init__(
-        self, block_size: int, channels_first: bool = False, signs: Optional[torch.Tensor] = None
+        self, block_size: int, channels_first: bool = False, signs: Optional[torch.Tensor] = None,
+        sign_seed: int = 0,
     ):
         super().__init__()
         self.block_size = block_size
         self.channels_first = channels_first
+        self.sign_seed = int(sign_seed)
         self.register_buffer("signs", None if signs is None else signs.detach().clone())
 
     def pre_hook(self, _module, args):
@@ -1056,19 +1095,21 @@ class OnlineHadamard(nn.Module):
     def forward(self, x):
         if self.channels_first:
             x = x.transpose(1, 2)
-        if self.signs is not None:
+        if self.signs is not None and not self.sign_seed:
             x = x * self.signs.to(dtype=x.dtype)
-        rotated, _, _ = ops.process_input(x.contiguous(), hadamard_block_size=self.block_size)
+        rotated, _, _ = ops.process_input(
+            x.contiguous(), hadamard_block_size=self.block_size, hadamard_sign_seed=self.sign_seed
+        )
         return rotated.transpose(1, 2) if self.channels_first else rotated
 
     def extra_repr(self) -> str:
-        return (f"block_size={self.block_size}, channels_first={self.channels_first}, "
-                f"random_signs={self.signs is not None}")
+        signs = f"sign_seed={self.sign_seed}" if self.sign_seed else f"random_signs={self.signs is not None}"
+        return f"block_size={self.block_size}, channels_first={self.channels_first}, {signs}"
 
 
 def insert_online_hadamard_after_activation(
     model, activation_name: str, fc2_name: str, block_size: int,
-    signs: Optional[torch.Tensor] = None,
+    signs: Optional[torch.Tensor] = None, sign_seed: int = 0,
 ) -> str:
     """Wrap an activation as nn.Sequential(activation, OnlineHadamard), in place.
 
@@ -1090,6 +1131,7 @@ def insert_online_hadamard_after_activation(
             to be. Its type decides the layout: a Conv1d reads (batch, channels, time).
         block_size: Hadamard block size, matching the value absorbed into the FC2 layer.
         signs: The random signs absorbed into the FC2 layer, if any.
+        sign_seed: The seed they came from, if any; see OnlineHadamard.
 
     Returns:
         The dotted name of the inserted OnlineHadamard.
@@ -1107,13 +1149,13 @@ def insert_online_hadamard_after_activation(
     if isinstance(activation, nn.Sequential) and isinstance(activation[-1], OnlineHadamard):
         return f"{activation_name}.{len(activation) - 1}"
 
-    hadamard = OnlineHadamard(block_size, channels_first=isinstance(fc2, nn.Conv1d), signs=signs)
+    hadamard = OnlineHadamard(block_size, channels_first=isinstance(fc2, nn.Conv1d), signs=signs, sign_seed=sign_seed)
     setattr(parent, attribute, nn.Sequential(activation, hadamard))
     return f"{activation_name}.1"
 
 
 def insert_online_hadamard_before_layer(
-    model, fc2_name: str, block_size: int, signs: Optional[torch.Tensor] = None,
+    model, fc2_name: str, block_size: int, signs: Optional[torch.Tensor] = None, sign_seed: int = 0,
 ) -> str:
     """Apply X @ H to an FC2 layer's own input, as an OnlineHadamard child run by a forward pre-hook.
 
@@ -1131,6 +1173,7 @@ def insert_online_hadamard_before_layer(
         fc2_name: Dotted name of the FC2 layer, whose H.T must already be absorbed or be about to be.
         block_size: Hadamard block size, matching the value absorbed into the layer.
         signs: The random signs absorbed into the layer, if any.
+        sign_seed: The seed they came from, if any; see OnlineHadamard.
 
     Returns:
         The dotted name of the inserted OnlineHadamard.
@@ -1142,7 +1185,9 @@ def insert_online_hadamard_before_layer(
             f"{fc2_name} has in_features={in_features}, not divisible by block_size={block_size}"
         )
     if not hasattr(fc2, "input_hadamard"):
-        hadamard = OnlineHadamard(block_size, channels_first=isinstance(fc2, nn.Conv1d), signs=signs)
+        hadamard = OnlineHadamard(
+            block_size, channels_first=isinstance(fc2, nn.Conv1d), signs=signs, sign_seed=sign_seed
+        )
         fc2.add_module("input_hadamard", hadamard)
         fc2.register_forward_pre_hook(hadamard.pre_hook)
     return f"{fc2_name}.input_hadamard"
@@ -1430,7 +1475,7 @@ def patch_rotations(
 
 def fold_rotations(
     model, layers_to_rotate, R1, R2s, hadamard_block_size, online_hadamard_layers,
-    hadamard_signs=None, use_r2=True, fc2_online_hadamard=True,
+    hadamard_signs=None, use_r2=True, fc2_online_hadamard=True, hadamard_sign_seed=0,
 ) -> None:
     """Fold a finished rotation into the weights of every layer in layers_to_rotate.
 
@@ -1458,6 +1503,8 @@ def fold_rotations(
         hadamard_signs: Optional ``{fc2_input_width: signs}`` for the randomized Hadamard.
         use_r2: Fold R2 into the V and attention output projections; see patch_rotations.
         fc2_online_hadamard: Absorb and insert FC2's online Hadamard; see patch_rotations.
+        hadamard_sign_seed: The seed hadamard_signs came from, if any; the inserted OnlineHadamards
+            then let humming generate the signs; see seeded_hadamard_signs.
     """
     if fc2_online_hadamard:
         _check_online_hadamard_layers(layers_to_rotate, online_hadamard_layers)
@@ -1493,16 +1540,17 @@ def fold_rotations(
         signs = None
         if hadamard_signs is not None:
             signs = hadamard_signs[_weight_2d(get_module(model, fc2_name)).shape[1]]
+        seed = hadamard_sign_seed if signs is not None else 0
         if activation_name is None:
-            insert_online_hadamard_before_layer(model, fc2_name, hadamard_block_size, signs)
+            insert_online_hadamard_before_layer(model, fc2_name, hadamard_block_size, signs, seed)
         else:
             insert_online_hadamard_after_activation(
-                model, activation_name, fc2_name, hadamard_block_size, signs
+                model, activation_name, fc2_name, hadamard_block_size, signs, seed
             )
 
 
 def _save_rotations(
-    path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_signs,
+    path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
     r1_block_size, objective, activation_bits, activation_group_size, activation_symmetric, groupwise_roles,
     search,
 ) -> None:
@@ -1517,10 +1565,7 @@ def _save_rotations(
             "hadamard_block_size": hadamard_block_size,
             "learn_r2": learn_r2,
             "fc2_online_hadamard": fc2_online_hadamard,
-            "hadamard_signs": (
-                None if hadamard_signs is None
-                else {w: v.cpu() for w, v in hadamard_signs.items()}
-            ),
+            "hadamard_sign_seed": hadamard_sign_seed or None,
             "r1_block_size": r1_block_size,
             "objective": objective,
             "activation_quantization": {
@@ -1590,7 +1635,7 @@ def _collect_hessians(model, batches, compute_logits, quantized, reads_r1, fold,
 def _search_r1_for_weight_quantization(
     model, path, layers_to_rotate, compute_logits, train_loader, reference_batch, reference_logits, tolerance,
     R1, R2s, r1_signs, write_r1, multi_stream, hadamard_block_size, online_hadamard_layers, hadamard_signs,
-    learn_r2, fc2_online_hadamard, r1_block_size, objective, evolution, weight_quantization,
+    hadamard_sign_seed, learn_r2, fc2_online_hadamard, r1_block_size, objective, evolution, weight_quantization,
 ):
     """The evolutionary R1 search of learn_rotations for weight-only quantization.
 
@@ -1652,7 +1697,7 @@ def _search_r1_for_weight_quantization(
                     moduledict[name].bias.copy_(bias, non_blocking=True)
             fold_rotations(
                 model, layers_to_rotate, R1, R2s, hadamard_block_size, online_hadamard_layers, hadamard_signs,
-                use_r2=learn_r2, fc2_online_hadamard=fc2_online_hadamard,
+                use_r2=learn_r2, fc2_online_hadamard=fc2_online_hadamard, hadamard_sign_seed=hadamard_sign_seed,
             )
             if quantize:
                 if method == "rtn":
@@ -1706,7 +1751,7 @@ def _search_r1_for_weight_quantization(
     r1_signs, _ = evolve_signs(r1_signs, fitness, sample_counts, evolution)
     write_r1(r1_signs)
     _save_rotations(
-        path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_signs,
+        path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
         r1_block_size, objective, None, -1, True, None,
         search={
             "name": "evolution",
@@ -1845,9 +1890,9 @@ def learn_rotations(
         objective: ``"kl"`` or ``"ce"``; see above.
         compute_loss: ``fn(model, batch) -> scalar tensor``, the model's training loss on the
             batch's labels. Required for ``objective="ce"``, unused for ``"kl"``.
-        hadamard_random_signs: Use the randomized online Hadamard X @ D @ H for every FC2, with
-            one random +-1 vector per FC2 input width, saved with the rotations. See
-            random_hadamard_signs for why a plain Hadamard hurts FC2.
+        hadamard_random_signs: Use the randomized online Hadamard X @ D @ H for every FC2, with the
+            signs generated from one random seed (seeded_hadamard_signs), saved with the rotations as
+            ``hadamard_sign_seed``. See random_hadamard_signs for why a plain Hadamard hurts FC2.
         learn_r2: Learn one head-wise R2 per attention module alongside R1. If False there is no
             R2 at all: it is neither trained nor applied, and the attention output projection's
             input stays unrotated.
@@ -1972,6 +2017,7 @@ def learn_rotations(
             groupwise_roles,
         )
     hadamard_signs = None
+    hadamard_sign_seed = 0
     if fc2_online_hadamard and hadamard_random_signs:
         moduledict = dict(model.named_modules())
         fc2_widths = {
@@ -1980,12 +2026,16 @@ def learn_rotations(
             for name, rot_type in group[2]
             if rot_type == 4
         }
-        hadamard_signs = {width: random_hadamard_signs(width, device) for width in sorted(fc2_widths)}
+        hadamard_sign_seed = random_sign_seed()
+        hadamard_signs = {
+            width: seeded_hadamard_signs(hadamard_sign_seed, width, device) for width in sorted(fc2_widths)
+        }
     if weight_quantization is not None:
         return _search_r1_for_weight_quantization(
             model, path, layers_to_rotate, compute_logits, train_loader, reference_batch, reference_logits,
             tolerance, R1, R2s, r1_signs, write_r1, multi_stream, hadamard_block_size, online_hadamard_layers,
-            hadamard_signs, learn_r2, fc2_online_hadamard, r1_block_size, objective, evolution, weight_quantization,
+            hadamard_signs, hadamard_sign_seed, learn_r2, fc2_online_hadamard, r1_block_size, objective, evolution,
+            weight_quantization,
         )
     patch_rotations(
         model, layers_to_rotate, R1, R2s, {}, hadamard_block_size, quantizers, hadamard_signs,
@@ -2050,7 +2100,7 @@ def learn_rotations(
         r1_signs, _ = evolve_signs(r1_signs, fitness, sample_counts, evolution)
         write_r1(r1_signs)
         _save_rotations(
-            path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_signs,
+            path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
             r1_block_size, objective, activation_bits, activation_group_size, activation_symmetric,
             groupwise_roles,
             search={
@@ -2107,7 +2157,7 @@ def learn_rotations(
         )
 
     _save_rotations(
-        path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_signs,
+        path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
         r1_block_size, objective, activation_bits, activation_group_size, activation_symmetric, groupwise_roles,
         search={"name": "cayley"},
     )
@@ -2180,9 +2230,17 @@ def apply_rotations(
     else:
         R1 = saved_r1.to(device)
     R2s = {name: R2.to(device) for name, R2 in checkpoint["R2s"].items()}
+    hadamard_sign_seed = checkpoint.get("hadamard_sign_seed") or 0
     saved_signs = checkpoint.get("hadamard_signs")
     hadamard_signs = None
-    if saved_signs is not None:
+    if hadamard_sign_seed:
+        moduledict = dict(model.named_modules())
+        widths = {
+            _weight_2d(moduledict[name]).shape[1]
+            for group in layers_to_rotate for name, rot_type in group[2] if rot_type == 4
+        }
+        hadamard_signs = {width: seeded_hadamard_signs(hadamard_sign_seed, width, device) for width in widths}
+    elif saved_signs is not None:
         hadamard_signs = {int(w): v.to(device) for w, v in saved_signs.items()}
 
     fold_norms(model, norm_layers)
@@ -2192,5 +2250,6 @@ def apply_rotations(
     fold_rotations(
         model, layers_to_rotate, R1, R2s, hadamard_block_size, online_hadamard_layers,
         hadamard_signs, use_r2=use_r2, fc2_online_hadamard=fc2_online_hadamard,
+        hadamard_sign_seed=hadamard_sign_seed,
     )
     return handles

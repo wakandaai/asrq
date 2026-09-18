@@ -68,7 +68,7 @@ def test_rot_exp_learns_one_r1_per_stream_r2s_and_the_online_hadamard_signs(lear
         assert (R1.T @ R1 - torch.eye(R1.shape[0], dtype=torch.float64)).abs().max() < 1e-4
     names = set(checkpoint["R2s"])
     assert sum(n.startswith("perception.") for n in names) == 32 and sum(n.startswith("llm.") for n in names) == 28
-    assert set(checkpoint["hadamard_signs"]) == {1024, 4096, 6144}
+    assert checkpoint["hadamard_sign_seed"] > 0
 
 
 def test_exp_rotates_merges_quantizes_with_gptq_and_evaluates(learned_rotation, unquantized_wer, tmp_path):

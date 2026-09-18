@@ -103,7 +103,7 @@ def test_the_search_saves_one_r1_per_stream_and_r2s_for_both(learned):
     assert {name: tuple(r.shape) for name, r in checkpoint["R2s"].items() if name.startswith("llm")} == {
         "llm.model.layers.0.self_attn": (16, 16), "llm.model.layers.1.self_attn": (16, 16),
     }
-    assert set(checkpoint["hadamard_signs"]) == {64, 128}
+    assert checkpoint["hadamard_sign_seed"] > 0
 
 
 def test_the_applied_rotation_reproduces_the_original_logits(learned):
@@ -158,7 +158,7 @@ def test_humming_takes_the_down_projection_hadamard_into_its_asrq_linear(learned
     names = [f"llm.model.layers.{i}.mlp.down_proj" for i in range(2)]
     replaced = replace_with_asrq_linear(rotated, {n: (8, 16, 0) for n in names}, BLOCK, {n: None for n in names})
     assert all(isinstance(m, ASRQLinear) and m.hadamard_block_size == BLOCK for m in replaced.values())
-    assert all(m.hadamard_signs is not None for m in replaced.values())
+    assert all(m.hadamard_sign_seed > 0 and m.hadamard_signs is None for m in replaced.values())
     with torch.no_grad():
         got, _ = _logits(rotated, {**batch, "features": batch["features"].half()})
     assert (got.float() - expected.float()).abs().max() / expected.float().abs().max() < 5e-2
