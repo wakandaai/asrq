@@ -42,6 +42,17 @@
 - [x] exp.py with transform=scaling for Whisper, Parakeet and Canary-Qwen, fake and humming (W4A8, 64 utterances): humming matches fake within 0.12 WER. tests/test_scaling.py (exactness on tiny models, hooks see the scaled input, same layers as rotation) and scaling cases in the model integration tests.
 - [ ] Compare no transform, scaling and rotation at W4A4 (256 utterances); scales searched at A4.
 
+# Norm tweaking
+- [x] Closed-form norm tweaking in the GPTQ block loops (`quantizer.norm_tweak`, asrq/quantizers/norm_tweak.py): after each block's GPTQ, every norm feeding its quantized layers is scaled per channel by s solving (H * sum Q^T Q + lambda I) s = diag(H sum W^T Q) + lambda, from the Hessian GPTQ collected; weight error only.
+- [x] W2 asymmetric g128 GPTQ, 256 utterances test-clean / test-other, without -> with norm tweaking:
+  - Whisper, random Hadamard: 2.44 / 7.62 -> 3.03 / 5.59; no rotation: 3.36 / 9.36 -> 3.22 / 7.30.
+  - Parakeet, random Hadamard: 2.96 / 4.80 -> 2.54 / 4.42; no rotation: 4.38 / 6.32 -> 3.47 / 5.40.
+  - Canary-Qwen, random Hadamard: 52.6 / 36.0 -> 5.55 / 7.74 (the looping collapse is gone); no rotation: 103 / 109 -> 102 / 103.
+- [x] W4A4 (learned rotation, GPTQ W4, A4 mixed 128), 256 utterances test-clean / test-other, none -> closed form: Whisper 2.39 / 4.15 -> 2.24 / 4.41; Parakeet 2.08 / 3.12 -> 1.84 / 3.00; Canary-Qwen 1.71 / 2.72 -> 1.56 / 2.65 (full precision 1.47 / 2.46).
+- [x] A gradient variant (Adam on the norm scales with fake-quantized activations, from the closed form) was tried and removed: Canary-Qwen 1.54 / 2.57, Whisper and Parakeet within noise of the closed form, and hard to tune. Only the closed form is kept.
+- [ ] Optional: an activation-aware closed form, G = (Xq^T Xq) * sum Q^T Q, b = diag(Xq^T X sum W^T Q) with Xq = Qa(X), for W4A4.
+- [ ] Norm tweaking at full scale and with the GPTQ-fitness rotation search; the Whisper test-clean regression with the Hadamard (+0.6).
+
 # Hadamard Rotation Search
 - [x] `transform.search: evolution`: R1 = diag(s1) @ H @ diag(s2) searched by a (1 + lambda) evolutionary algorithm over the signs (2 flips per child), three-stage selection (8/16/64, 8/64/256 or 16/64/N samples, random subsets per generation), KL fitness with cached full-precision logits; R2 stays a random Hadamard. Shares learn_rotations' verification and checkpoint format; the checkpoint records the signs and per-generation history.
 - [x] With symmetric activation quantization s2 does not change the KL (it flips already-rotated coordinates); with asymmetric it does. `evolution.mutate: auto` (default) flips s1 only for symmetric and both for asymmetric; `s1` and `s1_s2` force either.

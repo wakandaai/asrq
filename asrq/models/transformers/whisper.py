@@ -558,6 +558,7 @@ class WhisperQ(ModelQ):
         # remove hooks
         for h in hooks:
             h.remove()
+        tweaks = self.capture_norm_tweaks(quant_methods)
         # quantize layers
         for name in quant_methods.keys():
             qresult = quant_methods[name]()
@@ -573,6 +574,7 @@ class WhisperQ(ModelQ):
             if isinstance(module, ASRQLinear):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
+        self.apply_norm_tweaks(tweaks)
 
         # get input into the next block
         for i in range(num_samples):
@@ -730,6 +732,7 @@ class WhisperQ(ModelQ):
         # remove hooks
         for h in hooks:
             h.remove()
+        tweaks = self.capture_norm_tweaks(quant_methods)
         # quantize layers
         for name in quant_methods.keys():
             qresult = quant_methods[name]()
@@ -745,6 +748,7 @@ class WhisperQ(ModelQ):
             if isinstance(module, ASRQLinear):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
+        self.apply_norm_tweaks(tweaks)
 
         # get input into the next block
         for i in range(num_samples):
@@ -763,3 +767,19 @@ class WhisperQ(ModelQ):
         """Every attention projection and both feed-forward layers, fc2 included; the same
         mapping the rotation search quantizes."""
         return get_whisper_activation_roles(self.model)
+
+    def norm_tweak_targets(self) -> Dict[str, List[str]]:
+        """The norms in front of each block's attention projections and fc1; the decoder's cross-attention norm
+        feeds only its q_proj, since k_proj and v_proj read the encoder output."""
+        config = self.model.config
+        targets = {}
+        for i in range(config.encoder_layers):
+            p = f"model.encoder.layers.{i}"
+            targets[f"{p}.self_attn_layer_norm"] = [f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")]
+            targets[f"{p}.final_layer_norm"] = [f"{p}.fc1"]
+        for i in range(config.decoder_layers):
+            p = f"model.decoder.layers.{i}"
+            targets[f"{p}.self_attn_layer_norm"] = [f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")]
+            targets[f"{p}.encoder_attn_layer_norm"] = [f"{p}.encoder_attn.q_proj"]
+            targets[f"{p}.final_layer_norm"] = [f"{p}.fc1"]
+        return targets

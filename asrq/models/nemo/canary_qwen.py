@@ -21,6 +21,7 @@ from asrq.calibration.base import CalibConfig
 from asrq.core.model import ModelQ
 from asrq.core.registry import ModelNames, register_model
 from asrq.core.utils import cuda_empty_cache
+from asrq.models.nemo.parakeet_ctc import conformer_norm_tweak_targets
 from asrq.quantizers.base import QuantConfig, is_pointwise_conv1d
 from asrq.transforms.rotation.canary_qwen_utils import (
     TRANSCRIBE_PROMPT,
@@ -159,9 +160,11 @@ class CanaryQwenQ(ModelQ):
                 block(*args, **kwargs)
             for hook in hooks:
                 hook.remove()
+            tweaks = self.capture_norm_tweaks(quantizers)
             for name, quantizer in quantizers.items():
                 self.qparams[name] = quantizer()
                 tqdm.write(f"Quantized {name}")
+            self.apply_norm_tweaks(tweaks)
             for j, (args, kwargs) in enumerate(zip(args_list, kwargs_list)):
                 output = block(*args, **kwargs)
                 output = output[0] if isinstance(output, tuple) else output
@@ -191,6 +194,16 @@ class CanaryQwenQ(ModelQ):
 
         args_list, kwargs_list = self._capture_block_inputs(layers, run_sample)
         self._quantize_blocks(layers, "llm.model.layers", args_list, kwargs_list, "hidden_states")
+
+    def norm_tweak_targets(self) -> Dict[str, List[str]]:
+        """The speech encoder's Conformer norms (see conformer_norm_tweak_targets) and each LLM layer's input
+        norm, in front of q/k/v_proj, and post-attention norm, in front of gate/up_proj."""
+        targets = conformer_norm_tweak_targets("perception.encoder.layers", len(self.model.perception.encoder.layers))
+        for i in range(len(self.model.llm.model.layers)):
+            p = f"llm.model.layers.{i}"
+            targets[f"{p}.input_layernorm"] = [f"{p}.self_attn.{n}_proj" for n in ("q", "k", "v")]
+            targets[f"{p}.post_attention_layernorm"] = [f"{p}.mlp.gate_proj", f"{p}.mlp.up_proj"]
+        return targets
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Encoder attention, feed-forward and pointwise-conv layers and every LLM projection; the same

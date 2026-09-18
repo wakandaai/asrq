@@ -21,6 +21,7 @@ from asrq.evaluation.english_text_normalizer import normalizer
 from asrq.core.types import Processor
 from asrq.core.registry import get_quant_cls
 from asrq.core.utils import cuda_empty_cache
+from asrq.quantizers.norm_tweak import apply_norm_tweaks, capture_norm_tweaks
 
 
 
@@ -182,6 +183,29 @@ class ModelQ(ABC):
         """Quantize the text decoder."""
         raise NotImplementedError("Text decoder quantization not implemented.")
     
+    def norm_tweak_targets(self) -> Dict[str, List[str]]:
+        """``{norm_name: [layer names]}``: each norm whose output feeds only those layers, in one block.
+
+        Norm tweaking scales these norms' outputs after the layers are quantized; models without it return
+        nothing.
+        """
+        return {}
+
+    def capture_norm_tweaks(self, quantizers: Dict[str, Any]) -> list:
+        """Before a block's layers are quantized, keep what norm tweaking needs; empty when it is off."""
+        if not getattr(self.quant_cfg, "norm_tweak", False):
+            return []
+        return capture_norm_tweaks(self.norm_tweak_targets(), quantizers, dict(self.model.named_modules()))
+
+    def apply_norm_tweaks(self, captured: list) -> None:
+        """After a block's layers are quantized, scale its norms; see asrq.quantizers.norm_tweak."""
+        if not captured:
+            return
+        results = apply_norm_tweaks(captured, dict(self.model.named_modules()), self.quant_cfg.norm_tweak_ridge)
+        for name, (s, ratio) in results.items():
+            tqdm.write(f"Tweaked {name}: s in [{float(s.min()):.3f}, {float(s.max()):.3f}], "
+                       f"output error x{ratio:.3f}")
+
     def online_hadamard_layers(self) -> Dict[str, str]:
         """``{layer_name: activation_name}`` for layers fed by an online Hadamard module.
 

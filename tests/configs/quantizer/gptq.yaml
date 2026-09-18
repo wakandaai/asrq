@@ -4,3 +4,7 @@ group_size: 128
 block_size: 128
 symmetric: True
 percdamp: 0.01
+# After each block's GPTQ, scale the output of every norm feeding its quantized layers by the closed-form
+# least-squares s of asrq/quantizers/norm_tweak.py (weight error only); norm_tweak_ridge pulls s toward 1.
+norm_tweak: False
+norm_tweak_ridge: 0.01

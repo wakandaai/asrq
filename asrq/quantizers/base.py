@@ -25,6 +25,8 @@ class QuantConfig(ABC):
         # Conformer models: also quantize the Linear a rotation inserts after each block's output
         # norm. Set from the model config, like exclude_modules; see ParakeetCTCQ.
         self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
+        self.norm_tweak = bool(cfg.get("norm_tweak", False))
+        self.norm_tweak_ridge = float(cfg.get("norm_tweak_ridge", 0.01))
 
 
 class LinearQuantConfig(QuantConfig):

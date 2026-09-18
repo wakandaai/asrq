@@ -181,6 +181,9 @@ class _rmsnorm(nn.Module):
     A norm with no next layers cannot be converted: the scale has nowhere to go and must stay
     in the norm, so leave it as an _RMSNorm rather than calling this.
 
+    Norm tweaking (asrq.quantizers.norm_tweak) can give it a per-channel ``weight`` buffer again, after the
+    next layers are quantized; the output is then multiplied by it.
+
     Args:
         rms_norm: The RMSNorm instance to convert.
         next_layers: Layers that consume this RMSNorm's output. Must not be empty.
@@ -211,9 +214,11 @@ class _rmsnorm(nn.Module):
             _weight_2d(nxt).mul_(gamma)
 
     def forward(self, x):
+        weight = getattr(self, "weight", None)
         if getattr(self, "upcast", False):
-            return F.rms_norm(x.float(), self.normalized_shape, None, self.eps).to(x.dtype)
-        return F.rms_norm(x, self.normalized_shape, None, self.eps)
+            weight = None if weight is None else weight.float()
+            return F.rms_norm(x.float(), self.normalized_shape, weight, self.eps).to(x.dtype)
+        return F.rms_norm(x, self.normalized_shape, None if weight is None else weight.to(x.dtype), self.eps)
 
 
 def fold_rotation_into_Q_K_FC1(linear: Union[nn.Linear, nn.Conv1d], R1: torch.Tensor):
