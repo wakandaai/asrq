@@ -27,6 +27,9 @@ class QuantConfig(ABC):
         self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
         self.norm_tweak = bool(cfg.get("norm_tweak", False))
         self.norm_tweak_ridge = float(cfg.get("norm_tweak_ridge", 0.01))
+        self.block_output_refit = bool(cfg.get("block_output_refit", False))
+        self.block_output_refit_ridge = float(cfg.get("block_output_refit_ridge", 0.01))
+        self.block_output_refit_insert = bool(cfg.get("block_output_refit_insert", False))
 
 
 class LinearQuantConfig(QuantConfig):

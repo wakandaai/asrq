@@ -5,6 +5,8 @@ functions exercises exactly what the scripts do.
 """
 
 import datetime
+import hashlib
+import json
 import os
 from typing import Callable, Optional, Tuple
 
@@ -52,8 +54,51 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
             cfg.transform.learn_rotation = learn_rotation
 
 
+def quantized_model_fingerprint(cfg: DictConfig) -> str:
+    """A hash of every setting that determines the quantized weights, for reusing a saved quantized model.
+
+    Covers the model, the whole quantizer config (norm tweaking and block output refitting included), the calibration
+    set and size, the transform config and the contents of the transform's saved file (a rotation checkpoint or
+    scales), so a changed setting or a re-run search never loads stale weights. Evaluation and inference settings are
+    left out. Call it after the transform is obtained, when its file exists.
+    """
+    transform = OmegaConf.to_container(cfg.transform, resolve=True)
+    transform_file = transform.get("path") or ""
+    file_hash = None
+    if transform_file and os.path.isfile(transform_file):
+        with open(transform_file, "rb") as handle:
+            file_hash = hashlib.sha1(handle.read()).hexdigest()
+    payload = {
+        "format": ModelQ.QUANTIZED_FORMAT,
+        "model": cfg.model.name,
+        "quantizer": OmegaConf.to_container(cfg.quantizer, resolve=True),
+        "calibration": OmegaConf.to_container(cfg.calibration, resolve=True),
+        "transform": transform,
+        "transform_file": file_hash,
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def quantized_model_path(cfg: DictConfig) -> Tuple[Optional[str], str]:
+    """Where exp.py saves the quantized model and loads it from, and the settings' fingerprint.
+
+    ``quantized_path: auto`` names the file ``outputs/quantized/<model>-<fingerprint>.pt``; an explicit path is used as
+    given and checked against the fingerprint when loaded; null or an empty string disables saving and loading.
+    """
+    fingerprint = quantized_model_fingerprint(cfg)
+    setting = cfg.get("quantized_path", None)
+    if not setting:
+        return None, fingerprint
+    if setting == "auto":
+        return os.path.join("outputs", "quantized", f"{cfg.model.name.replace('/', '-')}-{fingerprint}.pt"), fingerprint
+    return str(setting), fingerprint
+
+
 def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") -> Tuple[ModelQ, Optional[str]]:
     """exp.py: load the model, apply the transform, quantize, optionally convert to humming, evaluate.
+
+    With ``quantized_path`` set, the quantized model is saved after quantization and, on a later run with the same
+    settings, loaded instead of quantizing again; see quantized_model_path.
 
     Args:
         cfg: The composed experiment config; prepared in place.
@@ -77,7 +122,18 @@ def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") ->
         if cfg.transform.use:
             transform.apply_transform(modelQ)
 
-    modelQ.quantize()
+    quantized_path, fingerprint = quantized_model_path(cfg)
+    if quantized_path is not None and os.path.isfile(quantized_path):
+        print(f"Loading the quantized model from {quantized_path} instead of quantizing")
+        modelQ.load_quantized(quantized_path, fingerprint)
+    else:
+        modelQ.quantize()
+        if quantized_path is not None:
+            try:
+                modelQ.save_quantized(quantized_path, fingerprint)
+                print(f"Saved the quantized model to {quantized_path}")
+            except Exception as error:
+                print(f"WARNING: could not save the quantized model to {quantized_path}: {error}")
     if cfg.get("inference", "fake") == "humming":
         # real low-bit layers, for measuring speed; evaluation then skips its fake quantization
         replaced = modelQ.to_asrq_linear(cfg)

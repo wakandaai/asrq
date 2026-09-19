@@ -15,6 +15,7 @@ import torch
 
 from _pipeline import EVALUATE_8_UTTERANCES, SCALING_SMALL, SMALL, WER_CEILING, config, requirements, results
 from asrq.core.linear import ASRQLinear
+from asrq.core.model import ModelQ
 from asrq.experiment import learn_rotation_experiment, run_experiment
 from asrq.transforms.rotation.utils import OnlineHadamard, ResidualStreamRotation
 from asrq.transforms.scaling.base import InputScale
@@ -133,3 +134,22 @@ def test_exp_with_scaling_humming_layers_and_cuda_graphs(scaled_experiment, tmp_
     finally:
         del modelQ
         _free()
+
+
+
+def test_exp_saves_the_quantized_model_and_loads_it_instead_of_quantizing(learned_rotation, tmp_path, monkeypatch):
+    path = tmp_path / "quantized.pt"
+    overrides = [*SMALL, *EVALUATE_8_UTTERANCES, f"transform.path={learned_rotation}", f"quantized_path={path}"]
+    modelQ, first = run_experiment(config("parakeet", overrides), results_dir=str(tmp_path / "first"))
+    del modelQ
+    _free()
+    assert path.is_file()
+
+    def refuse(self):
+        raise AssertionError("quantize ran although a saved quantized model exists")
+
+    monkeypatch.setattr(ModelQ, "quantize", refuse)
+    modelQ, second = run_experiment(config("parakeet", overrides), results_dir=str(tmp_path / "second"))
+    del modelQ
+    _free()
+    assert results(first)[0]["wer"] == results(second)[0]["wer"]

@@ -107,7 +107,7 @@ class CanaryQwenQ(ModelQ):
     def should_quantize_module(self, name, module) -> bool:
         """Every nn.Linear and pointwise Conv1d in the quantized blocks; see ParakeetCTCQ for the
         block-output Linears a rotation inserts into the encoder."""
-        if name in self.quant_cfg.exclude_modules:
+        if name in self.quant_cfg.exclude_modules or name.endswith(".output_linear"):
             return False
         if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
             return False
@@ -156,8 +156,12 @@ class CanaryQwenQ(ModelQ):
                 def hook(_module, inputs, output, _name=full_name):
                     quantizers[_name].add_batch((inputs[0], output))
                 hooks.append(module.register_forward_hook(hook))
+            block_name = f"{prefix}.{index}"
+            refit_targets = self.capture_refit_targets(block_name)
             for args, kwargs in zip(args_list, kwargs_list):
-                block(*args, **kwargs)
+                output = block(*args, **kwargs)
+                if refit_targets is not None:
+                    refit_targets.append((output[0] if isinstance(output, tuple) else output).detach().cpu())
             for hook in hooks:
                 hook.remove()
             tweaks = self.capture_norm_tweaks(quantizers)
@@ -165,6 +169,11 @@ class CanaryQwenQ(ModelQ):
                 self.qparams[name] = quantizer()
                 tqdm.write(f"Quantized {name}")
             self.apply_norm_tweaks(tweaks)
+
+            def run(i, block=block):
+                return block(*args_list[i], **kwargs_list[i])
+
+            self.refit_block_output(block_name, quantizers, run, refit_targets)
             for j, (args, kwargs) in enumerate(zip(args_list, kwargs_list)):
                 output = block(*args, **kwargs)
                 output = output[0] if isinstance(output, tuple) else output
@@ -204,6 +213,11 @@ class CanaryQwenQ(ModelQ):
             targets[f"{p}.input_layernorm"] = [f"{p}.self_attn.{n}_proj" for n in ("q", "k", "v")]
             targets[f"{p}.post_attention_layernorm"] = [f"{p}.mlp.gate_proj", f"{p}.mlp.up_proj"]
         return targets
+
+    def transformer_block_widths(self) -> Dict[str, int]:
+        """The Qwen3 LLM's decoder layers, which end in a residual sum."""
+        width = self.model.llm.config.hidden_size
+        return {f"llm.model.layers.{i}": width for i in range(len(self.model.llm.model.layers))}
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Encoder attention, feed-forward and pointwise-conv layers and every LLM projection; the same

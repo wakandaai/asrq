@@ -532,6 +532,7 @@ class WhisperQ(ModelQ):
             inp_kwargs: Per-sample keyword inputs.
         """
         num_samples = len(self.calibration_samples)
+        block_name = f"model.encoder.layers.{block_idx}"
         # register hooks to capture inputs and outputs of attention and fc layers
         quant_methods = {}
         submodules = {}
@@ -552,9 +553,12 @@ class WhisperQ(ModelQ):
             hooks.append(layer.register_forward_hook(get_hook(name)))
 
         # forward pass through the block
+        refit_targets = self.capture_refit_targets(block_name)
         for i in range(num_samples):
             with torch.no_grad():
-                block(*inp_args[i], **inp_kwargs[i])
+                out = block(*inp_args[i], **inp_kwargs[i])
+            if refit_targets is not None:
+                refit_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
         # remove hooks
         for h in hooks:
             h.remove()
@@ -575,6 +579,7 @@ class WhisperQ(ModelQ):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
         self.apply_norm_tweaks(tweaks)
+        self.refit_block_output(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), refit_targets)
 
         # get input into the next block
         for i in range(num_samples):
@@ -706,6 +711,7 @@ class WhisperQ(ModelQ):
             inp_kwargs: Per-sample keyword inputs.
         """
         num_samples = len(self.calibration_samples)
+        block_name = f"model.decoder.layers.{block_idx}"
         # register hooks to capture inputs and outputs of attention and fc layers
         quant_methods = {}
         submodules = {}
@@ -726,9 +732,12 @@ class WhisperQ(ModelQ):
             hooks.append(layer.register_forward_hook(get_hook(name)))
 
         # forward pass through the block
+        refit_targets = self.capture_refit_targets(block_name)
         for i in range(num_samples):
             with torch.no_grad():
-                block(*inp_args[i], **inp_kwargs[i])
+                out = block(*inp_args[i], **inp_kwargs[i])
+            if refit_targets is not None:
+                refit_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
         # remove hooks
         for h in hooks:
             h.remove()
@@ -749,6 +758,7 @@ class WhisperQ(ModelQ):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
         self.apply_norm_tweaks(tweaks)
+        self.refit_block_output(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), refit_targets)
 
         # get input into the next block
         for i in range(num_samples):
@@ -767,6 +777,13 @@ class WhisperQ(ModelQ):
         """Every attention projection and both feed-forward layers, fc2 included; the same
         mapping the rotation search quantizes."""
         return get_whisper_activation_roles(self.model)
+
+    def transformer_block_widths(self) -> Dict[str, int]:
+        """Every encoder and decoder layer, each ending in a residual sum."""
+        config = self.model.config
+        widths = {f"model.encoder.layers.{i}": config.d_model for i in range(config.encoder_layers)}
+        widths.update({f"model.decoder.layers.{i}": config.d_model for i in range(config.decoder_layers)})
+        return widths
 
     def norm_tweak_targets(self) -> Dict[str, List[str]]:
         """The norms in front of each block's attention projections and fc1; the decoder's cross-attention norm

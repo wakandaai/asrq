@@ -27,6 +27,10 @@ activation_symmetric: True
 # (head-wise R2 basis) and fc2 (block online Hadamard) keep one scale per group.
 activation_groupwise_roles: [attn_out, fc2]
 create_audio_files: True
+# Reuse quantized weights: exp.py saves the quantized model here after quantizing, and loads it instead of quantizing
+# again when the file exists. auto names it outputs/quantized/<model>-<hash of every setting that determines the
+# weights>.pt; null disables saving and loading. Files are state dicts at the model's own dtype.
+quantized_path: auto
 # fake: quantization is simulated in fp16 (for WER). humming: after quantization, activation-quantized
 # layers become real low-bit ASRQLinear layers running humming's kernels (for measuring speed).
 inference: fake

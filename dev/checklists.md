@@ -31,6 +31,7 @@
 - [x] Whisper at full scale (learned rotation on 2048 calibration utterances, GPTQ W4 on 2048, fake A4 with attn_out/fc2 in groups of 128, bfloat16, batch 64): all of LibriSpeech test-clean 2.11 and test-other 4.44, against 1.94 and 3.88 unquantized (2620 and 2939 utterances). Rotation search 512 steps, average KL 0.0197 from 0.0274 at the random Hadamard start.
 - [ ] Parakeet and Canary-Qwen at full scale; the other leaderboard splits for all three (ami, earnings22, gigaspeech, spgispeech, voxpopuli; ~19.5 GB to download).
 - [x] ModelQ.quantize collects reference cycles and frees the CUDA cache when it finishes: the block-wise quantizers keep one captured input per calibration sample alive through their hooks, 33 GB for whisper-large-v3 on 2048 samples, which left evaluation without memory. Whisper needs eval_batch_size 64, not the model config's 192.
+- [x] exp.py saves the quantized model (`quantized_path: auto` -> outputs/quantized/<model>-<settings hash>.pt) and loads it on a re-run instead of quantizing. Saved at the tensors' own dtype: a float16 save changed the WER of the reloaded bfloat16 model (Parakeet 8 utt 2.61 -> 2.44).
 - [ ] Learned rotations are not yet shown to beat a random hadamard (Whisper, Parakeet and Canary-Qwen, 256 utterances). Try starting from the identity, longer searches, and compare on more data.
 - [ ] The residual-stream hooks still break torch.compile graphs (humming itself also fails under compile).
 
@@ -52,6 +53,21 @@
 - [x] A gradient variant (Adam on the norm scales with fake-quantized activations, from the closed form) was tried and removed: Canary-Qwen 1.54 / 2.57, Whisper and Parakeet within noise of the closed form, and hard to tune. Only the closed form is kept.
 - [ ] Optional: an activation-aware closed form, G = (Xq^T Xq) * sum Q^T Q, b = diag(Xq^T X sum W^T Q) with Xq = Qa(X), for W4A4.
 - [ ] Norm tweaking at full scale and with the GPTQ-fitness rotation search; the Whisper test-clean regression with the Hadamard (+0.6).
+
+# Block output refitting
+- [x] `quantizer.block_output_refit` (asrq/quantizers/output_refit.py), independent of norm tweaking: after each block's GPTQ, the block's output Linear (the identity a rotation inserts after a Conformer block's norm_out) is refit, weight and bias, in closed form to the full-precision block output, ridge toward the current weights. Output layers that are quantized are skipped.
+- [x] 256 utterances test-clean / test-other, none / norm tweak / refit:
+  - Parakeet W2 (random Hadamard): 2.96 / 4.80, 2.54 / 4.42, 2.65 / 4.47 (block error x0.65).
+  - Parakeet W4A4 (learned rotation): 2.08 / 3.12, 1.84 / 3.00, 1.86 / 2.97 (x0.70).
+  - Canary-Qwen W2: 52.6 / 36.0, 5.55 / 7.74, 55.7 / 41.6 (only the encoder has output layers; the LLM is where W2 breaks).
+  - Canary-Qwen W4A4: 1.71 / 2.72, 1.56 / 2.65, 1.63 / 2.66.
+- [x] `quantizer.block_output_refit_insert`: an identity `output_linear` (forward hook on the block, not quantized) is inserted into every transformer block (Whisper encoder/decoder, the Qwen LLM) and refit the same way. None / norm tweak / refit + inserted, 256 utterances:
+  - Whisper W2: 2.44 / 7.62, 3.03 / 5.59, 3.10 / 5.10 (block error x0.48).
+  - Whisper W4A4: 2.39 / 4.15, 2.24 / 4.41, 2.26 / 4.35 (x0.52).
+  - Canary-Qwen W2: 52.6 / 36.0, 5.55 / 7.74, 5.17 / 5.83 (LLM x0.56, encoder x0.63).
+  - Canary-Qwen W4A4: 1.71 / 2.72, 1.56 / 2.65, 1.56 / 2.62.
+- [ ] Measure the inference cost of the inserted fp16 d x d layer per block (Whisper, Canary-Qwen), and whether it can run quantized.
+- [ ] Refit and norm tweaking together; the Whisper test-clean regression at W2 (both methods).
 
 # Hadamard Rotation Search
 - [x] `transform.search: evolution`: R1 = diag(s1) @ H @ diag(s2) searched by a (1 + lambda) evolutionary algorithm over the signs (2 flips per child), three-stage selection (8/16/64, 8/64/256 or 16/64/N samples, random subsets per generation), KL fitness with cached full-precision logits; R2 stays a random Hadamard. Shares learn_rotations' verification and checkpoint format; the checkpoint records the signs and per-generation history.

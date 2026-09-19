@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
 
 import gc
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -22,6 +23,7 @@ from asrq.core.types import Processor
 from asrq.core.registry import get_quant_cls
 from asrq.core.utils import cuda_empty_cache
 from asrq.quantizers.norm_tweak import apply_norm_tweaks, capture_norm_tweaks
+from asrq.quantizers.output_refit import OutputRefit, insert_block_output_linear
 
 
 
@@ -151,8 +153,73 @@ class ModelQ(ABC):
         self.quant_cfg = quant_config
         self.quant_cls = get_quant_cls(self.quant_cfg.name)
 
+    QUANTIZED_FORMAT = 2
+
+    def save_quantized(self, path: str, fingerprint: str) -> None:
+        """Save the quantized model so load_quantized can restore it without quantizing again.
+
+        The state dict is stored at each tensor's own dtype, together with what a freshly loaded and transformed model
+        lacks: the output Linears block_output_refit_insert added (``{block name: width}``) and the norm weights norm tweaking gave scale-free norms (module names whose
+        ``weight`` is a buffer). The rotation is not stored; load_quantized expects it applied, as exp.py does
+        before quantizing. Written to a temporary file and renamed, so an interrupted save leaves no file behind.
+
+        Tensors are not narrowed to float16: evaluation casts the model to ``eval_dtype`` (bfloat16 by default), and
+        rounding to float16 first changes some bfloat16 values, which changed the WER of a loaded model.
+        """
+        output_linears = {
+            name: module.output_linear.in_features
+            for name, module in self.model.named_modules()
+            if isinstance(getattr(module, "output_linear", None), nn.Linear)
+        }
+        weight_buffers = [name for name, module in self.model.named_modules() if "weight" in module._buffers]
+        state = {
+            key: (value.detach().cpu())
+            for key, value in self.model.state_dict().items()
+        }
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = f"{path}.tmp"
+        torch.save({
+            "format": self.QUANTIZED_FORMAT, "fingerprint": fingerprint, "state_dict": state,
+            "output_linears": output_linears, "weight_buffers": weight_buffers,
+        }, temporary)
+        os.replace(temporary, path)
+
+    def load_quantized(self, path: str, fingerprint: Optional[str] = None) -> None:
+        """Restore a model saved by save_quantized into this (transformed, unquantized) model, in place.
+
+        The inserted output Linears and norm weight buffers are recreated first, then every tensor is loaded; a
+        missing or unexpected key is an error, as is a fingerprint other than the given one.
+        """
+        saved = torch.load(path, map_location="cpu", weights_only=False)
+        if saved.get("format") != self.QUANTIZED_FORMAT:
+            raise ValueError(f"{path} has quantized-model format {saved.get('format')}, expected {self.QUANTIZED_FORMAT}")
+        if fingerprint is not None and saved["fingerprint"] != fingerprint:
+            raise ValueError(
+                f"{path} was saved with different settings (fingerprint {saved['fingerprint']}, these give "
+                f"{fingerprint}); delete it or point quantized_path elsewhere"
+            )
+        state = saved["state_dict"]
+        for block_name, width in saved["output_linears"].items():
+            insert_block_output_linear(self.model.get_submodule(block_name), width)
+        for name in saved["weight_buffers"]:
+            module = self.model.get_submodule(name)
+            if "weight" not in module._buffers:
+                reference = next(iter(module.buffers()), None)
+                device = reference.device if reference is not None else next(self.model.parameters()).device
+                module.register_buffer("weight", state[f"{name}.weight"].to(device))
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            raise ValueError(
+                f"{path} does not match the model: missing {list(missing)[:5]}, unexpected {list(unexpected)[:5]}"
+            )
+
     def quantize(self):
         """Quantize the model to the desired bitwidth using the specified method."""
+        if getattr(self.quant_cfg, "block_output_refit", False) and getattr(self.quant_cfg, "block_output_refit_insert", False):
+            for name, width in self.transformer_block_widths().items():
+                insert_block_output_linear(self.model.get_submodule(name), width)
         # Implement the quantization logic here. Weights should be saved to disk.
         with torch.inference_mode():
             # First quantize the speech encoder
@@ -171,7 +238,7 @@ class ModelQ(ABC):
 
     def should_quantize_module(self, name, module):
         """Check if a module should be quantized based on its name and type."""
-        if name in self.quant_cfg.exclude_modules:
+        if name in self.quant_cfg.exclude_modules or name.endswith(".output_linear"):
             return False
         return isinstance(module, nn.Linear)
 
@@ -205,6 +272,57 @@ class ModelQ(ABC):
         for name, (s, ratio) in results.items():
             tqdm.write(f"Tweaked {name}: s in [{float(s.min()):.3f}, {float(s.max()):.3f}], "
                        f"output error x{ratio:.3f}")
+
+    def transformer_block_widths(self) -> Dict[str, int]:
+        """``{block_name: residual width}`` of the blocks block_output_refit_insert gives an output Linear: those
+        that end in a residual sum rather than a linear layer. None by default."""
+        return {}
+
+    def block_output_layer(self, block_name: str) -> Optional[str]:
+        """The linear layer a block's output comes from, when it ends in one: the identity Linear a rotation
+        inserts after a Conformer block's output norm (``<block>.norm_out.1``), or the ``output_linear`` of
+        insert_block_output_linear. None for other blocks."""
+        for suffix in ("norm_out.1", "output_linear"):
+            try:
+                layer = self.model.get_submodule(f"{block_name}.{suffix}")
+            except AttributeError:
+                continue
+            if isinstance(layer, nn.Linear):
+                return f"{block_name}.{suffix}"
+        return None
+
+    def capture_refit_targets(self, block_name: str) -> Optional[list]:
+        """A list to collect the full-precision block's outputs in before its layers are quantized, when the block's
+        output layer is to be refit; None otherwise."""
+        if not getattr(self.quant_cfg, "block_output_refit", False) or self.block_output_layer(block_name) is None:
+            return None
+        return []
+
+    def refit_block_output(self, block_name: str, quantizers: Dict[str, Any], run, targets: Optional[list]) -> None:
+        """After a block's layers are quantized, refit its output layer to the full-precision outputs in targets;
+        see asrq.quantizers.output_refit. ``run(i)`` runs the block on calibration sample i. An output layer that is
+        quantized itself is left alone, since the refit would replace its quantized weights."""
+        if not targets:
+            return
+        name = self.block_output_layer(block_name)
+        if name in quantizers:
+            tqdm.write(f"Not refitting {name}: it is quantized")
+            return
+        layer = self.model.get_submodule(name)
+        refit = OutputRefit(layer)
+        current = {}
+        handle = layer.register_forward_hook(
+            lambda _m, inputs, _output: refit.add(inputs[0], current["target"].to(inputs[0].device))
+        )
+        try:
+            with torch.no_grad():
+                for index, target in enumerate(targets):
+                    current["target"] = target
+                    run(index)
+        finally:
+            handle.remove()
+        before, after = refit.solve(self.quant_cfg.block_output_refit_ridge)
+        tqdm.write(f"Refit {name}: block output error {before:.3e} -> {after:.3e} (relative to its energy)")
 
     def online_hadamard_layers(self) -> Dict[str, str]:
         """``{layer_name: activation_name}`` for layers fed by an online Hadamard module.

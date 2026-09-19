@@ -397,10 +397,14 @@ class ParakeetCTCQ(ModelQ):
                 hooks.append(module.register_forward_hook(add_hook(name)))
             
             # run calibration samples through the model to collect stats
+            block_name = f"encoder.layers.{idx}"
+            refit_targets = self.capture_refit_targets(block_name)
             for i in range(len(self.calibration_samples)):  # type: ignore[arg-type]
                 audio_signal = block(
                     **inp_kwargs[i],
                 )
+                if refit_targets is not None:
+                    refit_targets.append(audio_signal.detach().cpu())
 
             # remove hooks
             for hook in hooks:
@@ -412,6 +416,7 @@ class ParakeetCTCQ(ModelQ):
                 self.qparams[name] = quantizer()
                 tqdm.write(f"Quantized {name}")
             self.apply_norm_tweaks(tweaks)
+            self.refit_block_output(block_name, quantizers, lambda i, block=block: block(**inp_kwargs[i]), refit_targets)
 
             # get the output of the block and use it as input for the next block
             for i in range(len(self.calibration_samples)):  # type: ignore[arg-type]
@@ -432,7 +437,7 @@ class ParakeetCTCQ(ModelQ):
         model kept in a LayerNorm; it is quantized only with ``quantize_block_output_linear``, which
         also gives it an activation role.
         """
-        if name in self.quant_cfg.exclude_modules:
+        if name in self.quant_cfg.exclude_modules or name.endswith(".output_linear"):
             return False
         if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
             return False

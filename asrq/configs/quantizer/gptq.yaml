@@ -8,3 +8,12 @@ percdamp: 0.01
 # least-squares s of asrq/quantizers/norm_tweak.py (weight error only); norm_tweak_ridge pulls s toward 1.
 norm_tweak: False
 norm_tweak_ridge: 0.01
+# After each block's GPTQ, refit the block's output linear layer (the identity Linear a rotation inserts after a
+# Conformer block's output norm) in closed form so the quantized block reproduces the full-precision block's output;
+# see asrq/quantizers/output_refit.py. Independent of norm_tweak. block_output_refit_ridge pulls toward the current
+# weights.
+block_output_refit: False
+block_output_refit_ridge: 0.01
+# With block_output_refit, also give every transformer block (Whisper encoder/decoder, the Qwen LLM) an identity output
+# Linear to refit; it stays unquantized, one dense d x d matmul per block.
+block_output_refit_insert: False
