@@ -29,6 +29,8 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from asrq.calibration.data import length_sorted_batches
 from nemo.collections.common.prompts.formatter import PromptFormatter
 from peft import PeftModel
 
@@ -250,15 +252,16 @@ def canary_qwen_loss_fn(model, batch):
 
 
 def build_canary_qwen_dataloader(
-    model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42
+    model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42, sort_by_length: bool = False,
 ) -> torch.utils.data.DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.DataLoader(
         CanaryQwenCalibrationDataset(model, samples),
-        batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
+        **(
+            {"batch_sampler": length_sorted_batches(samples, batch_size, seed)} if sort_by_length
+            else {"batch_size": batch_size, "shuffle": True, "generator": generator}
+        ),
         collate_fn=partial(canary_qwen_collate_fn, pad_id=model.text_pad_id),
         num_workers=0,
     )

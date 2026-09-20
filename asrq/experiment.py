@@ -5,6 +5,9 @@ functions exercises exactly what the scripts do.
 """
 
 import datetime
+import time
+
+import torch
 import hashlib
 import json
 import os
@@ -18,6 +21,7 @@ from asrq.core.model import ModelQ
 from asrq.evaluation.base import evaluate_openasr
 from asrq.quantizers.base import QuantConfig
 from asrq.transforms.base import BaseTransform, TransformConfig
+from asrq import tracking
 
 
 def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
@@ -94,6 +98,39 @@ def quantized_model_path(cfg: DictConfig) -> Tuple[Optional[str], str]:
     return str(setting), fingerprint
 
 
+def transform_record(cfg: DictConfig) -> dict:
+    """What the applied rotation checkpoint records about its own search, for the run's config."""
+    path = cfg.transform.get("path", "")
+    if not path or not os.path.isfile(path):
+        return {}
+    checkpoint = torch.load(path, map_location="cpu")
+    search = checkpoint.get("search") or {}
+    return {
+        "rotation_file": path,
+        "rotation_model": checkpoint.get("model"),
+        "rotation_search": search.get("name"),
+        "rotation_search_settings": search.get("settings"),
+        "rotation_activation_quantization": checkpoint.get("activation_quantization"),
+    }
+
+
+def experiment_run_name(cfg: DictConfig) -> str:
+    """The directory name of one evaluation run: the settings it used and when it started.
+
+    ``<model>_<method>_<quantizer>_w<bits>g<group size><sym|asym>_a<activation bits>_<transform>_<DD-MM-YY-SS-MM-HH>``,
+    with the group size left out when the weights are quantized per row.
+    """
+    group = cfg.quantizer.get("group_size", -1)
+    weights = f"w{cfg.quantizer.bits}" + (f"g{group}" if group and group > 0 else "")
+    weights += "sym" if cfg.quantizer.get("symmetric", True) else "asym"
+    parts = [
+        cfg.model.name.replace("/", "-"), str(cfg.method), cfg.quantizer.name, weights,
+        f"a{cfg.activation_bits}", cfg.transform.name,
+        datetime.datetime.now().strftime("%d-%m-%y-%S-%M-%H"),
+    ]
+    return "_".join(parts)
+
+
 def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") -> Tuple[ModelQ, Optional[str]]:
     """exp.py: load the model, apply the transform, quantize, optionally convert to humming, evaluate.
 
@@ -102,12 +139,19 @@ def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") ->
 
     Args:
         cfg: The composed experiment config; prepared in place.
-        results_dir: Directory for the results CSV and a copy of the config.
+        results_dir: Directory the run's own directory is created in, holding results.csv and config.yaml;
+            see experiment_run_name.
 
     Returns:
         ``(modelQ, results_file)``; results_file is None when ``cfg.evaluate`` is off.
     """
     prepare_experiment_config(cfg, learn_rotation=False)
+    with tracking.start(cfg, "quantize"):
+        return _run_experiment(cfg, results_dir)
+
+
+def _run_experiment(cfg: DictConfig, results_dir: str) -> Tuple[ModelQ, Optional[str]]:
+    """run_experiment's body, inside the tracking run."""
     modelQ = ModelQ.from_pretrained(
         cfg.model.name, QuantConfig.from_dictconfig(cfg.quantizer), CalibConfig.from_dictconfig(cfg.calibration)
     )
@@ -121,13 +165,17 @@ def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") ->
         transform.obtain_transform(modelQ)
         if cfg.transform.use:
             transform.apply_transform(modelQ)
+            tracking.config_update(transform_record(cfg))
 
     quantized_path, fingerprint = quantized_model_path(cfg)
     if quantized_path is not None and os.path.isfile(quantized_path):
         print(f"Loading the quantized model from {quantized_path} instead of quantizing")
         modelQ.load_quantized(quantized_path, fingerprint)
+        tracking.summary({"quantize/loaded_from_cache": True})
     else:
+        started = time.time()
         modelQ.quantize()
+        tracking.summary({"quantize/loaded_from_cache": False, "quantize/seconds": time.time() - started})
         if quantized_path is not None:
             try:
                 modelQ.save_quantized(quantized_path, fingerprint)
@@ -141,14 +189,10 @@ def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") ->
 
     if not cfg.evaluate:
         return modelQ, None
-    stem = os.path.join(
-        results_dir,
-        f"{cfg.model.name.replace('/', '-')}_{cfg.method}_{cfg.quantizer.name}_{cfg.transform.name}_"
-        f"{cfg.quantizer.bits}_{cfg.activation_bits}-{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}",
-    )
-    results_file = f"{stem}_results.csv"
-    os.makedirs(results_dir, exist_ok=True)
-    with open(f"{stem}_config.yaml", "w") as f:
+    run_dir = os.path.join(results_dir, experiment_run_name(cfg))
+    results_file = os.path.join(run_dir, "results.csv")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "config.yaml"), "w") as f:
         f.write(OmegaConf.to_yaml(cfg))
     evaluate_openasr(modelQ=modelQ, cfg=cfg, generate_fn=getattr(openasr, cfg.model.generate_fn),
                      evaluation_results_file=results_file, create_audio_files=cfg.create_audio_files)
@@ -170,6 +214,12 @@ def learn_rotation_experiment(cfg: DictConfig, reseed: Optional[Callable[[], Non
         raise ValueError(f"rotation learning needs the rotation transform, got '{cfg.transform.name}'")
     prepare_experiment_config(cfg, learn_rotation=True)
     print(OmegaConf.to_yaml(cfg))
+    with tracking.start(cfg, "rotation"):
+        return _learn_rotation_experiment(cfg, reseed)
+
+
+def _learn_rotation_experiment(cfg: DictConfig, reseed: Optional[Callable[[], None]]) -> ModelQ:
+    """learn_rotation_experiment's body, inside the tracking run."""
     transform = BaseTransform.from_config(TransformConfig.from_dictconfig(cfg.transform))
     modelQ = ModelQ.from_pretrained(
         cfg.model.name, QuantConfig.from_dictconfig(cfg.quantizer), CalibConfig.from_dictconfig(cfg.calibration)
@@ -177,6 +227,8 @@ def learn_rotation_experiment(cfg: DictConfig, reseed: Optional[Callable[[], Non
     modelQ.model.to("cuda")
     if reseed is not None:
         reseed()
+    started = time.time()
     transform.obtain_transform(modelQ)
+    tracking.summary({"rotation/seconds": time.time() - started, "rotation/path": cfg.transform.path})
     print("Done with obtaining rotations")
     return modelQ

@@ -26,6 +26,14 @@ search: cayley
 # Weight-only quantization: search R1 (search: evolution only) against the quantizer's rounded weights instead of
 # quantized activations. Each candidate is folded into the weights, which are rounded with RTN at the quantizer's
 # bits, group size and symmetry; activations stay in full precision and activation_bits is ignored by the search.
+# Refuse to apply a rotation whose checkpoint records other quantization settings than this run uses (the
+# activation bits, group size, symmetry and group-wise roles it was searched against, and the weight grid of a
+# weight-only search). false applies it anyway.
+check_settings: True
+# Autocast dtype of the evolutionary search's forward passes, teacher and student alike, so the KL sees only
+# quantization error: float32, bfloat16 or float16. The search's batches are also grouped by audio length, which
+# cuts the padding the model computes on; the verification passes stay in float32.
+fitness_dtype: float32
 weight_only: False
 # How the weight-only search quantizes each candidate's weights: rtn, gptq (on Hessians collected once; the
 # residual-stream layers' Hessians are rotated per candidate), or null for the experiment's quantizer.
@@ -33,10 +41,12 @@ weight_only_quantizer: null
 evolution:
   # whisper-large-v3, 64 samples, float32: ~150 s per generation, so 8 generations ~ Cayley SGD's 200 steps (~19 min)
   generations: 8
-  # children per generation, and how many survive stage 1 and stage 2 (stage 3 scores the rest on all samples)
-  offspring: 16
+  # children per generation, and how many survive stage 1 and stage 2 (stage 3 scores the rest on all samples).
+  # No two children of a generation are the same, and no child repeats a candidate an earlier generation scored.
+  offspring: 32
   survivors: [4, 2]
-  # samples scored in stages 1, 2, 3; null: 8/16/N for N <= 64, 8/64/N for N <= 256, 16/64/N above
+  # samples scored in stages 1, 2, 3; null: 8/16/N for N <= 64, 16/32/N for N <= 128, 8/64/N for N <= 256,
+  # 16/64/N above
   stage_samples: null
   # sign positions flipped per child. mutate: s1_s2 draws them from both sign vectors, s1 from s1 only, auto
   # picks s1 when activation_symmetric (s2 then does not change the fitness) and s1_s2 when asymmetric

@@ -1,5 +1,6 @@
 # pyright: reportMissingImports=false
 
+import copy
 import gc
 import os
 import torch
@@ -7,7 +8,7 @@ import torch.nn as nn
 import numpy as np
 import json
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, Iterator, List, Optional, Tuple, Any
 from asrq.core.registry import ModelQ_Registry, QuantizerNames
 from asrq.quantizers.base import QuantConfig
 from asrq.transforms.base import TransformConfig
@@ -22,8 +23,9 @@ from asrq.evaluation.english_text_normalizer import normalizer
 from asrq.core.types import Processor
 from asrq.core.registry import get_quant_cls
 from asrq.core.utils import cuda_empty_cache
-from asrq.quantizers.norm_tweak import apply_norm_tweaks, capture_norm_tweaks
-from asrq.quantizers.output_refit import OutputRefit, insert_block_output_linear
+from asrq import tracking
+from asrq.quantizers.scale_recovery import ScaleTarget, apply_scale_recovery, capture_scale_recovery, quantize_scale_group
+from asrq.quantizers.output_refit import OutputRefit
 
 
 
@@ -153,24 +155,18 @@ class ModelQ(ABC):
         self.quant_cfg = quant_config
         self.quant_cls = get_quant_cls(self.quant_cfg.name)
 
-    QUANTIZED_FORMAT = 2
+    QUANTIZED_FORMAT = 4
 
     def save_quantized(self, path: str, fingerprint: str) -> None:
         """Save the quantized model so load_quantized can restore it without quantizing again.
 
-        The state dict is stored at each tensor's own dtype, together with what a freshly loaded and transformed model
-        lacks: the output Linears block_output_refit_insert added (``{block name: width}``) and the norm weights norm tweaking gave scale-free norms (module names whose
-        ``weight`` is a buffer). The rotation is not stored; load_quantized expects it applied, as exp.py does
-        before quantizing. Written to a temporary file and renamed, so an interrupted save leaves no file behind.
+        The state dict is stored at each tensor's own dtype, together with what a freshly loaded and transformed
+        model lacks: the norm weights norm tweaking gave scale-free norms (module names whose ``weight`` is a
+        buffer). The rotation is not stored; load_quantized expects it applied, as exp.py does before quantizing. Written to a temporary file and renamed, so an interrupted save leaves no file behind.
 
         Tensors are not narrowed to float16: evaluation casts the model to ``eval_dtype`` (bfloat16 by default), and
         rounding to float16 first changes some bfloat16 values, which changed the WER of a loaded model.
         """
-        output_linears = {
-            name: module.output_linear.in_features
-            for name, module in self.model.named_modules()
-            if isinstance(getattr(module, "output_linear", None), nn.Linear)
-        }
         weight_buffers = [name for name, module in self.model.named_modules() if "weight" in module._buffers]
         state = {
             key: (value.detach().cpu())
@@ -182,15 +178,15 @@ class ModelQ(ABC):
         temporary = f"{path}.tmp"
         torch.save({
             "format": self.QUANTIZED_FORMAT, "fingerprint": fingerprint, "state_dict": state,
-            "output_linears": output_linears, "weight_buffers": weight_buffers,
+            "weight_buffers": weight_buffers,
         }, temporary)
         os.replace(temporary, path)
 
     def load_quantized(self, path: str, fingerprint: Optional[str] = None) -> None:
         """Restore a model saved by save_quantized into this (transformed, unquantized) model, in place.
 
-        The inserted output Linears and norm weight buffers are recreated first, then every tensor is loaded; a
-        missing or unexpected key is an error, as is a fingerprint other than the given one.
+        The norm weight buffers are recreated first, then every tensor is loaded; a missing or unexpected key is
+        an error, as is a fingerprint other than the given one.
         """
         saved = torch.load(path, map_location="cpu", weights_only=False)
         if saved.get("format") != self.QUANTIZED_FORMAT:
@@ -201,8 +197,6 @@ class ModelQ(ABC):
                 f"{fingerprint}); delete it or point quantized_path elsewhere"
             )
         state = saved["state_dict"]
-        for block_name, width in saved["output_linears"].items():
-            insert_block_output_linear(self.model.get_submodule(block_name), width)
         for name in saved["weight_buffers"]:
             module = self.model.get_submodule(name)
             if "weight" not in module._buffers:
@@ -217,9 +211,6 @@ class ModelQ(ABC):
 
     def quantize(self):
         """Quantize the model to the desired bitwidth using the specified method."""
-        if getattr(self.quant_cfg, "block_output_refit", False) and getattr(self.quant_cfg, "block_output_refit_insert", False):
-            for name, width in self.transformer_block_widths().items():
-                insert_block_output_linear(self.model.get_submodule(name), width)
         # Implement the quantization logic here. Weights should be saved to disk.
         with torch.inference_mode():
             # First quantize the speech encoder
@@ -236,9 +227,19 @@ class ModelQ(ABC):
         cuda_empty_cache()
         print("Quantization complete.")
 
+    def layer_quant_cfg(self, name: str):
+        """The quantizer config for one layer: the experiment's, or a copy with block_output_linear_bits for the
+        Linear a rotation inserts after a Conformer block's output norm."""
+        bits = getattr(self.quant_cfg, "block_output_linear_bits", None)
+        if bits is None or not name.endswith(".norm_out.1"):
+            return self.quant_cfg
+        config = copy.copy(self.quant_cfg)
+        config.bits = bits
+        return config
+
     def should_quantize_module(self, name, module):
         """Check if a module should be quantized based on its name and type."""
-        if name in self.quant_cfg.exclude_modules or name.endswith(".output_linear"):
+        if name in self.quant_cfg.exclude_modules:
             return False
         return isinstance(module, nn.Linear)
 
@@ -250,46 +251,90 @@ class ModelQ(ABC):
         """Quantize the text decoder."""
         raise NotImplementedError("Text decoder quantization not implemented.")
     
-    def norm_tweak_targets(self) -> Dict[str, List[str]]:
-        """``{norm_name: [layer names]}``: each norm whose output feeds only those layers, in one block.
+    def scale_recovery_targets(self) -> List[ScaleTarget]:
+        """The norms of this model's transformer blocks and the quantized layers each one feeds, which share its
+        scale; see asrq.quantizers.scale_recovery. Empty by default.
 
-        Norm tweaking scales these norms' outputs after the layers are quantized; models without it return
-        nothing.
+        Conformer blocks are left out: they end in a linear layer, which block output refitting corrects instead
+        (see block_output_layer).
         """
-        return {}
+        return []
 
-    def capture_norm_tweaks(self, quantizers: Dict[str, Any]) -> list:
-        """Before a block's layers are quantized, keep what norm tweaking needs; empty when it is off."""
-        if not getattr(self.quant_cfg, "norm_tweak", False):
+    def capture_scale_recovery(self, quantizers: Dict[str, Any]) -> list:
+        """Before a block's layers are quantized, the groups to recover; empty when scale recovery is off."""
+        if not getattr(self.quant_cfg, "scale_recovery", False):
             return []
-        return capture_norm_tweaks(self.norm_tweak_targets(), quantizers, dict(self.model.named_modules()))
+        return capture_scale_recovery(self.scale_recovery_targets(), quantizers)
 
-    def apply_norm_tweaks(self, captured: list) -> None:
-        """After a block's layers are quantized, scale its norms; see asrq.quantizers.norm_tweak."""
+    def quantize_layers(self, quantizers: Dict[str, Any], groups: list, skip: Optional[set] = None) -> Iterator[str]:
+        """Quantize a block's layers, recording each one's quantization parameters in qparams, and yield each
+        name once its layer is quantized.
+
+        The layers a norm feeds are quantized together by quantize_scale_group, when the first of them comes up,
+        which also fits their scale for apply_scale_recovery; every other layer is quantized by its own
+        quantizer. Names in ``skip`` are left for the caller, as refit_block_output quantizes a block's output
+        layer itself, after refitting it.
+        """
+        leaders = {group.target.layers[0]: group for group in groups}
+        shared = {name for group in groups for name in group.target.layers}
+        skip = skip or set()
+        for name, quantizer in quantizers.items():
+            if name in skip:
+                continue
+            if name in leaders:
+                group = leaders[name]
+                group.scale, group.ratio, qparams = quantize_scale_group(
+                    [quantizers[layer] for layer in group.target.layers], self.quant_cfg.scale_recovery_ridge,
+                    self.quant_cfg.scale_recovery_method,
+                )
+                for layer, params in zip(group.target.layers, qparams):
+                    self.qparams[layer] = params
+                    yield layer
+            elif name not in shared:
+                self.qparams[name] = quantizer()
+                yield name
+
+    def apply_scale_recovery(self, captured: list) -> None:
+        """After a block's layers are quantized, fold their scales into the norms; see
+        asrq.quantizers.scale_recovery."""
         if not captured:
             return
-        results = apply_norm_tweaks(captured, dict(self.model.named_modules()), self.quant_cfg.norm_tweak_ridge)
+        results = apply_scale_recovery(captured, dict(self.model.named_modules()))
+        ratios = []
         for name, (s, ratio) in results.items():
-            tqdm.write(f"Tweaked {name}: s in [{float(s.min()):.3f}, {float(s.max()):.3f}], "
+            tqdm.write(f"Scaled {name}: s in [{float(s.min()):.3f}, {float(s.max()):.3f}], "
                        f"output error x{ratio:.3f}")
-
-    def transformer_block_widths(self) -> Dict[str, int]:
-        """``{block_name: residual width}`` of the blocks block_output_refit_insert gives an output Linear: those
-        that end in a residual sum rather than a linear layer. None by default."""
-        return {}
+            ratios.append(ratio)
+        if ratios:
+            tracking.step_metric("scale_recovery", "scale_recovery/group")
+            self._scale_recovery_groups = getattr(self, "_scale_recovery_groups", 0)
+            scales = torch.cat([results[name][0].flatten().float().cpu() for name in results])
+            self._scale_recovery_groups += len(ratios)
+            tracking.log({
+                "scale_recovery/group": self._scale_recovery_groups,
+                "scale_recovery/error_ratio": sum(ratios) / len(ratios),
+                "scale_recovery/error_ratio_max": max(ratios),
+                "scale_recovery/scale_min": float(scales.min()),
+                "scale_recovery/scale_max": float(scales.max()),
+                "scale_recovery/scales": tracking.histogram(scales),
+            })
 
     def block_output_layer(self, block_name: str) -> Optional[str]:
-        """The linear layer a block's output comes from, when it ends in one: the identity Linear a rotation
-        inserts after a Conformer block's output norm (``<block>.norm_out.1``), or the ``output_linear`` of
-        insert_block_output_linear. None for other blocks."""
-        for suffix in ("norm_out.1", "output_linear"):
-            try:
-                layer = self.model.get_submodule(f"{block_name}.{suffix}")
-            except AttributeError:
-                continue
-            if isinstance(layer, nn.Linear):
-                return f"{block_name}.{suffix}"
-        return None
+        """The layer a block's output comes from, when it ends in one: the identity Linear a rotation inserts after
+        a Conformer block's output norm (``<block>.norm_out.1``). None for other blocks."""
+        try:
+            layer = self.model.get_submodule(f"{block_name}.norm_out.1")
+        except AttributeError:
+            return None
+        return f"{block_name}.norm_out.1" if isinstance(layer, nn.Linear) else None
+
+    def refit_quantizes_output_layer(self, block_name: str, quantizers: Dict[str, Any]) -> set:
+        """``{output layer name}`` when refit_block_output will quantize that layer itself, for quantize_layers
+        to skip; empty otherwise."""
+        name = self.block_output_layer(block_name)
+        if name is None or name not in quantizers or self.capture_refit_targets(block_name) is None:
+            return set()
+        return {name}
 
     def capture_refit_targets(self, block_name: str) -> Optional[list]:
         """A list to collect the full-precision block's outputs in before its layers are quantized, when the block's
@@ -299,21 +344,31 @@ class ModelQ(ABC):
         return []
 
     def refit_block_output(self, block_name: str, quantizers: Dict[str, Any], run, targets: Optional[list]) -> None:
-        """After a block's layers are quantized, refit its output layer to the full-precision outputs in targets;
-        see asrq.quantizers.output_refit. ``run(i)`` runs the block on calibration sample i. An output layer that is
-        quantized itself is left alone, since the refit would replace its quantized weights."""
+        """After a block's other layers are quantized, refit its output layer to the full-precision outputs in
+        targets; see asrq.quantizers.output_refit. ``run(i)`` runs the block on calibration sample i.
+
+        An output layer that is quantized itself (``quantize_block_output_linear``) is refit first and quantized
+        afterwards, so it keeps the correction and still ends up on the grid. Its Hessian is collected in the
+        same pass, from the quantized block's inputs, which is what it will see; quantize_layers leaves it to
+        this method (see refit_quantizes_output_layer).
+        """
         if not targets:
             return
         name = self.block_output_layer(block_name)
-        if name in quantizers:
-            tqdm.write(f"Not refitting {name}: it is quantized")
-            return
         layer = self.model.get_submodule(name)
+        quantizer = quantizers.get(name)
+        if quantizer is not None and getattr(quantizer, "H", None) is not None:
+            quantizer.H.zero_()
+            quantizer.nsamples = 0
         refit = OutputRefit(layer)
         current = {}
-        handle = layer.register_forward_hook(
-            lambda _m, inputs, _output: refit.add(inputs[0], current["target"].to(inputs[0].device))
-        )
+
+        def hook(_module, inputs, _output):
+            refit.add(inputs[0], current["target"].to(inputs[0].device))
+            if quantizer is not None:
+                quantizer.add_batch((inputs[0], None))
+
+        handle = layer.register_forward_hook(hook)
         try:
             with torch.no_grad():
                 for index, target in enumerate(targets):
@@ -323,6 +378,15 @@ class ModelQ(ABC):
             handle.remove()
         before, after = refit.solve(self.quant_cfg.block_output_refit_ridge)
         tqdm.write(f"Refit {name}: block output error {before:.3e} -> {after:.3e} (relative to its energy)")
+        tracking.step_metric("refit", "refit/block")
+        self._refit_blocks = getattr(self, "_refit_blocks", 0) + 1
+        tracking.log({
+            "refit/block": self._refit_blocks, "refit/error_before": before, "refit/error_after": after,
+            "refit/error_ratio": after / before if before > 0 else 1.0,
+        })
+        if quantizer is not None:
+            self.qparams[name] = quantizer()
+            tqdm.write(f"Quantized {name} after refitting it")
 
     def online_hadamard_layers(self) -> Dict[str, str]:
         """``{layer_name: activation_name}`` for layers fed by an online Hadamard module.
@@ -352,7 +416,7 @@ class ModelQ(ABC):
         groupwise = set(cfg.activation_groupwise_roles)
         layers = {
             name: (
-                self.quant_cfg.bits,
+                self.layer_quant_cfg(name).bits,
                 activation_bits,
                 cfg.activation_group_size if role in groupwise else 0,
             )

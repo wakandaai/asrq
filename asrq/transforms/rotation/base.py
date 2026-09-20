@@ -2,6 +2,8 @@
 
 import os
 
+import torch
+
 from omegaconf import DictConfig, OmegaConf
 
 from asrq.core.registry import (
@@ -22,6 +24,7 @@ from asrq.transforms.rotation.parakeet_ctc_utils import (
 )
 from asrq.transforms.rotation.utils import (
     apply_rotations,
+    check_rotation_settings,
     check_hadamard_matches_groups,
     learn_rotations,
 )
@@ -34,23 +37,26 @@ from asrq.transforms.rotation.whisper_utils import (
 # mapping and the layers to rotate.
 _ROTATION_INPUTS_FNS = {
     ModelNames.OPENAI_WHISPER_LARGE_V3: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_whisper_rotation_inputs(
+        lambda modelQ, num_samples, batch_size, quantize_block_output_linear, sort_by_length: get_whisper_rotation_inputs(
             modelQ.model,
             modelQ.processor,
             modelQ.calibration_samples[:num_samples],
             batch_size=batch_size,
+            sort_by_length=sort_by_length,
         )
     ),
     ModelNames.NVIDIA_PARAKEET_CTC_1_1B: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_parakeet_rotation_inputs(
+        lambda modelQ, num_samples, batch_size, quantize_block_output_linear, sort_by_length: get_parakeet_rotation_inputs(
             modelQ.model, modelQ.calibration_samples[:num_samples],
             quantize_block_output_linear=quantize_block_output_linear, batch_size=batch_size,
+            sort_by_length=sort_by_length,
         )
     ),
     ModelNames.NVIDIA_CANARY_QWEN_2_5B: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_canary_qwen_rotation_inputs(
+        lambda modelQ, num_samples, batch_size, quantize_block_output_linear, sort_by_length: get_canary_qwen_rotation_inputs(
             modelQ.model, modelQ.calibration_samples[:num_samples],
             quantize_block_output_linear=quantize_block_output_linear, batch_size=batch_size,
+            sort_by_length=sort_by_length,
         )
     ),
 }
@@ -115,6 +121,14 @@ class RotationTransformConfig(TransformConfig):
         if self.search == "evolution" and self.objective != "kl":
             raise ValueError("transform.search=evolution minimises the KL divergence; set transform.objective=kl")
         self.evolution = cfg.get("evolution", None)
+        # Autocast dtype of the evolutionary search's forward passes; float32 runs them unchanged. The search's
+        # batches are also grouped by audio length, which cuts the padding the model computes on.
+        dtype = str(cfg.get("fitness_dtype", "float32"))
+        if dtype not in ("float32", "bfloat16", "float16"):
+            raise ValueError(f"transform.fitness_dtype must be float32, bfloat16 or float16, got {dtype!r}")
+        self.fitness_dtype = getattr(torch, dtype)
+        # Refuse a rotation searched under other quantization settings; see check_rotation_settings.
+        self.check_settings = bool(cfg.get("check_settings", True))
         self.weight_only = bool(cfg.get("weight_only", False))
         self.wbits = cfg.get("wbits", 4)
         self.wgroup = cfg.get("wgroup", None)
@@ -164,6 +178,7 @@ class RotationTransform(BaseTransform):
             num_samples=self.cfg.num_samples,
             batch_size=self.cfg.batch_size,
             quantize_block_output_linear=self.cfg.quantize_block_output_linear,
+            sort_by_length=self.cfg.search == "evolution",
         )
 
     def _rotation_layers(self, modelQ) -> dict:
@@ -192,6 +207,8 @@ class RotationTransform(BaseTransform):
             activation_group_size=self.cfg.activation_group_size,
             activation_symmetric=self.cfg.activation_symmetric,
             search=self.cfg.search,
+            model_name=self.cfg.model_name,
+            fitness_dtype=self.cfg.fitness_dtype,
             weight_quantization=self._weight_quantization(modelQ),
             evolution=EvolutionConfig.from_mapping(
                 OmegaConf.to_container(self.cfg.evolution, resolve=True) if self.cfg.evolution is not None else None
@@ -229,6 +246,17 @@ class RotationTransform(BaseTransform):
             raise FileNotFoundError(
                 f"no learned rotation at {self.cfg.path}. Learn one with asrq/rot-exp.py (which "
                 f"writes to transform.path), or point transform.path at an existing checkpoint."
+            )
+        if self.cfg.check_settings:
+            check_rotation_settings(
+                self.cfg.path,
+                {
+                    "bits": self.cfg.abits, "group_size": self.cfg.activation_group_size,
+                    "symmetric": self.cfg.activation_symmetric,
+                    "groupwise_roles": self.cfg.activation_groupwise_roles,
+                },
+                {"bits": self.cfg.wbits, "group_size": self.cfg.wgroup, "symmetric": self.cfg.wsymmetric},
+                model_name=self.cfg.model_name,
             )
         original_text = self.transcribe(modelQ)
         self.hook_handles = apply_rotations(

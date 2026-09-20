@@ -28,7 +28,9 @@ flips both vectors.
 One generation, as in EvoPress's multi-step selection:
 
 1. The parent is mutated into ``offspring`` children, each by flipping ``flips`` positions drawn uniformly
-   from the mutated sign vectors (of every stream).
+   from the mutated sign vectors (of every stream). No two children of a generation are the same, and no
+   child repeats a candidate an earlier generation already scored and discarded: every candidate's signs are
+   hashed into an archive that the mutation draws against.
 2. Stage 1 scores every child on a random subset of ``stage_samples[0]`` calibration samples, and the best
    ``survivors[0]`` go on.
 3. Stage 2 scores those on a new random subset of ``stage_samples[1]`` samples, and the best
@@ -42,12 +44,14 @@ compared on the same data while no small subset is selected against repeatedly. 
 close to its parent, which is what lets a small subset rank children that differ by little.
 """
 
+import hashlib
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
+from asrq import tracking
 from asrq.transforms.rotation.hadamard_utils import matmul_hadU
 
 SignVectors = Dict[Optional[str], Tuple[torch.Tensor, torch.Tensor]]
@@ -72,7 +76,7 @@ class EvolutionConfig:
     """
 
     generations: int = 8
-    offspring: int = 16
+    offspring: int = 32
     survivors: Tuple[int, int] = (4, 2)
     stage_samples: Optional[Tuple[int, int, int]] = None
     flips: int = 2
@@ -114,12 +118,15 @@ class EvolutionConfig:
 
 
 def default_stage_samples(num_samples: int) -> Tuple[int, int, int]:
-    """Stage sizes for a calibration set: 8, 16, 64 for 64 samples; 8, 64, 256 for 256; 16, 64, 768 for 768.
+    """Stage sizes for a calibration set: 8, 16, 64 for 64 samples; 16, 32, 128 for 128; 8, 64, 256 for 256;
+    16, 64, 768 for 768.
 
     The last stage is the whole set; the first two are capped by it.
     """
     if num_samples <= 64:
         first, second = 8, 16
+    elif num_samples <= 128:
+        first, second = 16, 32
     elif num_samples <= 256:
         first, second = 8, 64
     else:
@@ -179,6 +186,35 @@ def mutate_signs(parent: SignVectors, flips: int, mutate: str, generator: torch.
     return child
 
 
+def signs_key(signs: SignVectors) -> bytes:
+    """A hash of one candidate's sign vectors, for the archive of candidates already scored."""
+    digest = hashlib.sha1()
+    for stream in sorted(signs, key=lambda name: "" if name is None else name):
+        for vector in signs[stream]:
+            digest.update(bytes((vector > 0).to(torch.uint8).cpu().numpy()))
+    return digest.digest()
+
+
+def _new_children(
+    parent: SignVectors, config: EvolutionConfig, generator: torch.Generator, archive: set, attempts: int = 200,
+) -> List[SignVectors]:
+    """``config.offspring`` mutations of parent, none equal to each other or to a candidate in archive.
+
+    Each child's key is added to the archive as it is made. A child that cannot be made distinct within
+    ``attempts`` tries is skipped, which only happens when the mutations around the parent are exhausted.
+    """
+    children = []
+    for _ in range(config.offspring):
+        for _ in range(attempts):
+            child = mutate_signs(parent, config.flips, config.mutate, generator)
+            key = signs_key(child)
+            if key not in archive:
+                archive.add(key)
+                children.append(child)
+                break
+    return children
+
+
 def _subset(sample_counts: Sequence[int], samples: int, generator: Optional[torch.Generator]) -> List[int]:
     """Batch indices covering at least ``samples`` samples: a random subset, or the leading batches."""
     order = range(len(sample_counts)) if generator is None else torch.randperm(len(sample_counts), generator=generator).tolist()
@@ -213,14 +249,24 @@ def evolve_signs(
     total = sum(sample_counts)
     stages = config.stage_samples or default_stage_samples(total)
     generator = torch.Generator().manual_seed(config.seed)
+    archive = {signs_key(parent)}
     evaluation_set = _subset(sample_counts, min(stages[2], total), None)
     parent_fitness = fitness(parent, evaluation_set)
     log(f"evolution: initial fitness {parent_fitness:.6f} on {sum(sample_counts[i] for i in evaluation_set)} samples; "
         f"stages {stages}, {config.offspring} offspring, survivors {config.survivors}, {config.flips} flips of {config.mutate}")
     config.history.append({"generation": 0, "fitness": parent_fitness, "accepted": True})
+    tracking.step_metric("search", "search/generation")
+    tracking.summary({"search/name": "evolution", "search/stages": list(stages), "search/offspring": config.offspring,
+                      "search/flips": config.flips, "search/mutate": config.mutate,
+                      "search/samples_per_generation": stage_cost(config, total), "search/samples": total,
+                      "search/initial_fitness": parent_fitness})
+    tracking.log({"search/generation": 0, "search/fitness": parent_fitness})
     for generation in range(1, config.generations + 1):
         start = time.time()
-        children = [mutate_signs(parent, config.flips, config.mutate, generator) for _ in range(config.offspring)]
+        children = _new_children(parent, config, generator, archive)
+        if not children:
+            log(f"  generation {generation}/{config.generations}: no unseen mutation of the parent, stopping")
+            break
         for stage, keep in ((0, config.survivors[0]), (1, config.survivors[1])):
             subset = _subset([sample_counts[i] for i in evaluation_set], stages[stage], generator)
             batches = [evaluation_set[i] for i in subset]
@@ -236,7 +282,15 @@ def evolve_signs(
             "generation": generation, "fitness": parent_fitness, "best_child": scores[best], "accepted": accepted,
         })
         log(f"  generation {generation}/{config.generations}: parent {parent_fitness:.6f}, best child "
-            f"{scores[best]:.6f}{' (accepted)' if accepted else ''}, {time.time() - start:.1f}s")
+            f"{scores[best]:.6f}{' (accepted)' if accepted else ''}, {len(archive)} candidates seen, "
+            f"{time.time() - start:.1f}s")
+        tracking.log({
+            "search/generation": generation, "search/fitness": parent_fitness, "search/best_child": scores[best],
+            "search/accepted": int(accepted), "search/candidates_seen": len(archive),
+            "search/generation_seconds": time.time() - start,
+        })
+    tracking.summary({"search/final_fitness": parent_fitness,
+                      "search/improvement": config.history[0]["fitness"] - parent_fitness})
     return parent, parent_fitness
 
 

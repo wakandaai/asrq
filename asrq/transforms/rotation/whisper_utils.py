@@ -15,6 +15,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from asrq.calibration.data import length_sorted_batches
+
 from asrq.transforms.rotation.utils import (
     add_residual_stream_entry_hook,
     add_unrotate_input_hook,
@@ -152,15 +154,16 @@ def whisper_loss_fn(model, batch):
 
 
 def build_whisper_dataloader(
-    processor, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42
+    processor, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42, sort_by_length: bool = False,
 ) -> torch.utils.data.DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.DataLoader(
         WhisperCalibrationDataset(processor, samples),
-        batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
+        **(
+            {"batch_sampler": length_sorted_batches(samples, batch_size, seed)} if sort_by_length
+            else {"batch_size": batch_size, "shuffle": True, "generator": generator}
+        ),
         collate_fn=partial(whisper_collate_fn, pad_token_id=processor.tokenizer.pad_token_id),
         num_workers=0,
         pin_memory=True,

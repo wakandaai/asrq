@@ -77,14 +77,40 @@ def test_refitting_a_block_lowers_its_output_error_by_the_reported_amount():
     assert after < 0.8 * before
 
 
-def test_a_quantized_output_layer_is_not_refit():
+def test_a_quantized_output_layer_is_refit_and_then_quantized():
     model, samples = _model_and_samples()
     block = model.layers[0]
-    start = block.norm_out[1].weight.detach().clone()
-    targets = [torch.zeros(1, 40, 32) for _ in samples]
-    ModelQ.refit_block_output(_modelq(model), "layers.0", {"layers.0.norm_out.1": object()}, lambda i: block(samples[i]), targets)
-    assert torch.equal(block.norm_out[1].weight, start)
-    assert _modelq(model).block_output_layer("layers") is None
+    layer = block.norm_out[1]
+    start = layer.weight.detach().clone()
+
+    class Quantizer:
+        def __init__(self):
+            self.H = torch.zeros(32, 32, dtype=torch.float64)
+            self.nsamples = 7
+            self.tokens = 0
+            self.weight_when_called = None
+
+        def add_batch(self, batch):
+            self.tokens += batch[0].reshape(-1, batch[0].shape[-1]).shape[0]
+
+        def __call__(self):
+            self.weight_when_called = layer.weight.detach().clone()
+            with torch.no_grad():
+                layer.weight.copy_(torch.round(layer.weight * 4) / 4)
+            return ("scales", "zeros")
+
+    quantizer = Quantizer()
+    modelq = _modelq(model, block_output_refit=True)
+    modelq.qparams = {}
+    modelq.capture_refit_targets = lambda name: ModelQ.capture_refit_targets(modelq, name)
+    targets = [torch.randn(1, 40, 32) for _ in samples]
+    name = "layers.0.norm_out.1"
+    assert ModelQ.refit_quantizes_output_layer(modelq, "layers.0", {name: quantizer}) == {name}
+    ModelQ.refit_block_output(modelq, "layers.0", {name: quantizer}, lambda i: block(samples[i]), targets)
+    assert quantizer.nsamples == 0 or quantizer.tokens > 0
+    assert not torch.equal(quantizer.weight_when_called, start), "the layer was refit before it was quantized"
+    assert torch.equal(layer.weight, torch.round(quantizer.weight_when_called * 4) / 4)
+    assert modelq.qparams[name] == ("scales", "zeros")
 
 
 class TupleBlock(nn.Module):
@@ -94,23 +120,3 @@ class TupleBlock(nn.Module):
 
     def forward(self, x):
         return (x + self.fc(x), "cache")
-
-
-def test_an_inserted_output_linear_starts_as_the_identity_and_is_found_and_not_quantized():
-    from asrq.quantizers.output_refit import insert_block_output_linear
-
-    torch.manual_seed(0)
-    model = nn.Module()
-    model.layers = nn.ModuleList([Block(16), TupleBlock(16)])
-    x = torch.randn(2, 5, 16)
-    before = (model.layers[0](x), model.layers[1](x)[0])
-    for block in model.layers:
-        linear = insert_block_output_linear(block, 16)
-        assert insert_block_output_linear(block, 16) is linear
-    after_tensor, after_tuple = model.layers[0](x), model.layers[1](x)
-    assert torch.equal(after_tensor, before[0]) and torch.equal(after_tuple[0], before[1]) and after_tuple[1] == "cache"
-    modelq = _modelq(model, exclude_modules=[])
-    assert modelq.block_output_layer("layers.0") == "layers.0.norm_out.1"
-    assert modelq.block_output_layer("layers.1") == "layers.1.output_linear"
-    assert not ModelQ.should_quantize_module(modelq, "layers.1.output_linear", model.layers[1].output_linear)
-    assert ModelQ.should_quantize_module(modelq, "layers.1.fc", model.layers[1].fc)

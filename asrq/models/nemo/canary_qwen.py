@@ -19,9 +19,9 @@ from transformers import GenerationConfig
 
 from asrq.calibration.base import CalibConfig
 from asrq.core.model import ModelQ
+from asrq.quantizers.scale_recovery import ScaleTarget
 from asrq.core.registry import ModelNames, register_model
 from asrq.core.utils import cuda_empty_cache
-from asrq.models.nemo.parakeet_ctc import conformer_norm_tweak_targets
 from asrq.quantizers.base import QuantConfig, is_pointwise_conv1d
 from asrq.transforms.rotation.canary_qwen_utils import (
     TRANSCRIBE_PROMPT,
@@ -107,7 +107,7 @@ class CanaryQwenQ(ModelQ):
     def should_quantize_module(self, name, module) -> bool:
         """Every nn.Linear and pointwise Conv1d in the quantized blocks; see ParakeetCTCQ for the
         block-output Linears a rotation inserts into the encoder."""
-        if name in self.quant_cfg.exclude_modules or name.endswith(".output_linear"):
+        if name in self.quant_cfg.exclude_modules:
             return False
         if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
             return False
@@ -151,7 +151,7 @@ class CanaryQwenQ(ModelQ):
                 full_name = f"{prefix}.{index}.{name}"
                 if not name or not self.should_quantize_module(full_name, module):
                     continue
-                quantizers[full_name] = self.quant_cls(module, full_name, self.quant_cfg)
+                quantizers[full_name] = self.quant_cls(module, full_name, self.layer_quant_cfg(full_name))
 
                 def hook(_module, inputs, output, _name=full_name):
                     quantizers[_name].add_batch((inputs[0], output))
@@ -164,11 +164,10 @@ class CanaryQwenQ(ModelQ):
                     refit_targets.append((output[0] if isinstance(output, tuple) else output).detach().cpu())
             for hook in hooks:
                 hook.remove()
-            tweaks = self.capture_norm_tweaks(quantizers)
-            for name, quantizer in quantizers.items():
-                self.qparams[name] = quantizer()
+            groups = self.capture_scale_recovery(quantizers)
+            for name in self.quantize_layers(quantizers, groups, self.refit_quantizes_output_layer(block_name, quantizers)):
                 tqdm.write(f"Quantized {name}")
-            self.apply_norm_tweaks(tweaks)
+            self.apply_scale_recovery(groups)
 
             def run(i, block=block):
                 return block(*args_list[i], **kwargs_list[i])
@@ -204,20 +203,17 @@ class CanaryQwenQ(ModelQ):
         args_list, kwargs_list = self._capture_block_inputs(layers, run_sample)
         self._quantize_blocks(layers, "llm.model.layers", args_list, kwargs_list, "hidden_states")
 
-    def norm_tweak_targets(self) -> Dict[str, List[str]]:
-        """The speech encoder's Conformer norms (see conformer_norm_tweak_targets) and each LLM layer's input
-        norm, in front of q/k/v_proj, and post-attention norm, in front of gate/up_proj."""
-        targets = conformer_norm_tweak_targets("perception.encoder.layers", len(self.model.perception.encoder.layers))
+    def scale_recovery_targets(self) -> List[ScaleTarget]:
+        """Each LLM layer's input norm, in front of q/k/v_proj, and post-attention norm, in front of
+        gate/up_proj. The speech encoder's Conformer blocks are left to block output refitting."""
+        targets = []
         for i in range(len(self.model.llm.model.layers)):
             p = f"llm.model.layers.{i}"
-            targets[f"{p}.input_layernorm"] = [f"{p}.self_attn.{n}_proj" for n in ("q", "k", "v")]
-            targets[f"{p}.post_attention_layernorm"] = [f"{p}.mlp.gate_proj", f"{p}.mlp.up_proj"]
+            targets.append(ScaleTarget(f"{p}.input_layernorm",
+                                       [f"{p}.self_attn.{n}_proj" for n in ("q", "k", "v")]))
+            targets.append(ScaleTarget(f"{p}.post_attention_layernorm",
+                                       [f"{p}.mlp.gate_proj", f"{p}.mlp.up_proj"]))
         return targets
-
-    def transformer_block_widths(self) -> Dict[str, int]:
-        """The Qwen3 LLM's decoder layers, which end in a residual sum."""
-        width = self.model.llm.config.hidden_size
-        return {f"llm.model.layers.{i}": width for i in range(len(self.model.llm.model.layers))}
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Encoder attention, feed-forward and pointwise-conv layers and every LLM projection; the same

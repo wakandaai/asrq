@@ -52,3 +52,14 @@ eval_batches: null
 # every ASRQLinear convert its input and output, which cancelled W4A4's speedup under CUDA graphs
 # (1.19x in float16, 0.97-1.04x in bfloat16); use float16 when measuring humming speed.
 eval_dtype: bfloat16
+# Weights & Biases logging (asrq/tracking.py, dev/docs/wandb_logging.md). rot-exp.py logs one run per rotation
+# search, exp.py one per quantization and evaluation; both store the whole config. Off by default, and a no-op
+# when wandb is not installed.
+wandb:
+  enabled: False
+  project: asrq
+  entity: null
+  group: null
+  tags: []
+  # online, offline or disabled
+  mode: online

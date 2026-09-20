@@ -13,6 +13,7 @@ blocks of block_size with the error of a whole block applied to the rest at once
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -68,6 +69,28 @@ def gptq_quantize(W: torch.Tensor, factors: GPTQFactors, bits: int, group_size: 
 
     Returns the weight in its original column order and does not modify W.
     """
+    return gptq_quantize_columns(W, factors, bits, group_size, symmetric, block_size)[0]
+
+
+def gptq_quantize_columns(W: torch.Tensor, factors: GPTQFactors, bits: int, group_size: int, symmetric: bool,
+                          block_size: int, scale_ridge: Optional[float] = None):
+    """GPTQ with, optionally, one fitted scale per input column; see gptq_quantize.
+
+    When column j is quantized, GPTQ rounds its updated value w~_j, the original column plus the compensation
+    earlier columns pushed into it. With ``scale_ridge`` set, the rounded column q_j is then stretched by the
+    scale that best maps it onto w~_j,
+
+        s_j = argmin c_j ||w~_j - s q_j||^2 + lambda (s - 1)^2 = (c_j <w~_j, q_j> + lambda) / (c_j <q_j, q_j> + lambda)
+
+    with c_j = 1 / U_jj^2, the weight GPTQ's objective gives column j's error (U the upper Cholesky factor of the
+    damped inverse Hessian), and lambda = scale_ridge * mean_j(c_j ||w_j||^2), and the error
+    w~_j - s_j q_j, not w~_j - q_j, is what the later columns compensate. q_j stays on the grid; s is meant for
+    whatever feeds the layer's input (a norm), which multiplies input j by s_j.
+
+    Returns:
+        ``(Q, s)`` in the original column order: the grid weight (without s) and the scales (ones without
+        scale_ridge).
+    """
     maxq = 2 ** (bits - 1) - 1 if symmetric else 2 ** bits - 1
     minq = -(maxq + 1) if symmetric else 0
     W = W.clone()
@@ -80,7 +103,11 @@ def gptq_quantize(W: torch.Tensor, factors: GPTQFactors, bits: int, group_size: 
     W[:, factors.dead] = 0
     W = W[:, factors.perm]
     Q = torch.zeros_like(W)
+    column_scales = torch.ones(columns, dtype=W.dtype, device=W.device)
     hinv = factors.hinv
+    if scale_ridge is not None:
+        weights = 1 / torch.diagonal(hinv) ** 2
+        penalty = scale_ridge * float((weights * (W * W).sum(dim=0)).mean())
     for i1 in range(0, columns, block_size):
         i2 = min(i1 + block_size, columns)
         W1 = W[:, i1:i2].clone()
@@ -91,11 +118,17 @@ def gptq_quantize(W: torch.Tensor, factors: GPTQFactors, bits: int, group_size: 
             s, z = scales[:, i1 + i], zeros[:, i1 + i]
             q = torch.round((w - z) / s).clamp(minq, maxq) * s + z
             Q[:, i1 + i] = q
+            if scale_ridge is not None:
+                c = weights[i1 + i]
+                scale = (c * (w * q).sum() + penalty) / (c * (q * q).sum() + penalty)
+                column_scales[i1 + i] = scale
+                q = q * scale
             error = (w - q) / hinv1[i, i]
             W1[:, i:] -= error.unsqueeze(1) * hinv1[i, i:].unsqueeze(0)
             errors[:, i] = error
         W[:, i2:] -= errors @ hinv[i1:i2, i2:]
-    return Q[:, factors.inv_perm]
+    inverse = factors.inv_perm
+    return Q[:, inverse], column_scales[inverse]
 
 
 def gptq_factors_batched(H: torch.Tensor, percdamp: float) -> GPTQFactors:

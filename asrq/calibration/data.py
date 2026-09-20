@@ -31,6 +31,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import soundfile as sf
+import torch
 from datasets import Audio, load_dataset
 from tqdm import tqdm
 
@@ -284,3 +285,19 @@ def load_calibration_samples(
             print(f"calibration: only {len(entries)} usable utterances, fewer than {num_samples}")
         entries = entries[:num_samples]
     return [(load_audio(root, entry), texts[entry["id"]]) for entry in entries]
+
+
+def length_sorted_batches(
+    samples: Sequence[Tuple[np.ndarray, str]], batch_size: int, seed: int = 42
+) -> List[List[int]]:
+    """Batches of sample indices grouped by audio length, in a random order.
+
+    A batch of calibration audio is padded to its longest clip, so batching clips of similar length cuts the
+    padding the model computes on. The batches themselves are shuffled, so consecutive batches are not ordered
+    by length. Models that pad every clip to a fixed window (Whisper's 30 s mel) gain nothing from this.
+    """
+    order = sorted(range(len(samples)), key=lambda index: len(samples[index][0]))
+    batches = [order[start:start + batch_size] for start in range(0, len(order), batch_size)]
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return [batches[index] for index in torch.randperm(len(batches), generator=generator).tolist()]

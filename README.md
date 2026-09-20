@@ -2,7 +2,7 @@
 
 ASRQ quantizes large pre-trained speech recognition models to low bit widths, down to 2-bit weights and 4-bit
 weights and activations (W4A4), while keeping WER close to full precision. It combines rotation and scaling
-transforms, GPTQ, closed-form corrections after GPTQ, and real low-bit inference through
+transforms, GPTQ, scale recovery and block output refitting, and real low-bit inference through
 [humming](https://github.com/ldfrancis/humming) kernels.
 
 ## Supported models
@@ -18,12 +18,15 @@ transforms, GPTQ, closed-form corrections after GPTQ, and real low-bit inference
 Full LibriSpeech test-clean / test-other WER (%). GPTQ is calibrated on 2048 utterances, and the rotations
 come from the evolutionary Hadamard search.
 
-| Model | Full precision | W2 weight-only + block output refit | W4A4 + norm tweak |
+| Model | Full precision | W2 weight-only + recovery | W4A4 + recovery |
 |---|---|---|---|
-| Parakeet-CTC 1.1B | 1.83 / 3.53 | 2.52 / 5.29 | 1.83 / 3.75 |
-| Canary-Qwen 2.5B | 1.57 / 3.06 | 3.34 / 5.85 | 1.69 / 3.22 |
-| Whisper large-v3 | 1.94 / 3.88 | 2.42 / 5.36 | 2.11 / 4.53 |
+| Parakeet-CTC 1.1B | 1.83 / 3.53 | 2.52 / 5.29 | 1.89 / 3.75 |
+| Canary-Qwen 2.5B | 1.57 / 3.06 | 3.34 / 5.85 | 1.64 / 3.33 |
+| Whisper large-v3 | 1.94 / 3.88 | 2.42 / 5.36 | 2.10 / 4.44 |
 
+- **Recovery:** these runs used block output refitting for every block type, with a layer inserted into the
+  transformer blocks. The current code recovers transformer blocks with scale recovery instead, and has not been
+  re-run at full scale.
 - **W2:** 2-bit asymmetric weights in groups of 128, activations left at 16 bits.
 - **W4A4:** 4-bit symmetric weights in groups of 128. Activations are 4-bit per token, except `attn_out` and
   `fc2`, which use groups of 128.
@@ -96,12 +99,12 @@ available (`transform.search`):
 | `search` | What is searched | Cost |
 |---|---|---|
 | `cayley` | R1 and the R2s, from random Hadamards, by Cayley SGD on the KL objective | `num_samples`, `epochs`, `learning_rate`, `batch_size` |
-| `evolution` | R1 = diag(s1) · H · diag(s2), with (1+λ) evolution over the sign vectors; R2 stays a random Hadamard | `transform.evolution.*`; 8 generations ≈ Cayley's time on Whisper |
+| `evolution` | R1 = diag(s1) · H · diag(s2), with (1+λ) evolution over the sign vectors; R2 stays a random Hadamard | `transform.evolution.*`; 8 generations of 32 children |
 
 ```bash
 # W4A4: evolutionary search against 4-bit activations
 python asrq/rot-exp.py model=parakeet activation_bits=4 transform.search=evolution \
-    transform.num_samples=64 transform.path=outputs/rotation/parakeet_a4.pt
+    transform.num_samples=128 transform.path=outputs/rotation/parakeet_a4.pt
 
 # W4A4: Cayley SGD
 python asrq/rot-exp.py model=whisper activation_bits=4 transform.search=cayley \
@@ -110,12 +113,22 @@ python asrq/rot-exp.py model=whisper activation_bits=4 transform.search=cayley \
 # W2 weight-only: evolutionary search against GPTQ-quantized weights
 python asrq/rot-exp.py model=canary_qwen activation_bits=16 quantizer=gptq quantizer.bits=2 \
     quantizer.symmetric=False quantizer.group_size=128 transform.weight_only=true \
-    transform.weight_only_quantizer=gptq transform.search=evolution transform.num_samples=64 \
+    transform.weight_only_quantizer=gptq transform.search=evolution transform.num_samples=128 \
     transform.path=outputs/rotation/canary_qwen_w2.pt
 ```
 
 `evolution.generations: 0` saves the random Hadamard starting point without searching, which gives a
 random-rotation baseline.
+
+The search's batches are grouped by audio length, which cuts the padding the model computes on (16-19% less on
+Parakeet; Whisper pads every clip to 30 s and gains nothing). `transform.fitness_dtype` can run the search's
+forward passes in bfloat16 or float16, which is 2.7x faster on Whisper but ranks candidates by rounding noise
+rather than quantization error, so the default float32 is the one to use.
+
+A checkpoint records the model it was searched for and the quantization it was searched against, and exp.py
+refuses to apply it to another model, or under different activation settings (bits, group size, symmetry,
+group-wise roles) or, for a weight-only rotation, a different weight grid. `transform.check_settings=false`
+applies it anyway.
 
 #### How the search quantizes candidates
 
@@ -152,13 +165,17 @@ The fitness then runs the deployed model's forward pass, with quantized weights 
 #### Evolution details
 
 One generation follows EvoPress's multi-step selection:
-1. The parent produces `offspring` children, each with `flips` sign positions flipped.
+1. The parent produces `offspring` (32) children, each with `flips` (2) sign positions flipped. No two
+   children of a generation are the same, and no child repeats a candidate an earlier generation scored: every
+   candidate's signs are hashed into an archive the mutation draws against. The search stops early if the
+   parent has no unseen mutation left.
 2. Stage 1 scores every child on a few samples, and the best `survivors[0]` go on.
 3. Stage 2 scores those on more samples, and the best `survivors[1]` go on.
 4. Stage 3 scores the rest on the full set.
 
 The best child replaces the parent only if its KL is lower. `stage_samples: null` picks 8/16/N samples when
-N ≤ 64, 8/64/N when N ≤ 256, and 16/64/N above that.
+N ≤ 64, 16/32/N when N ≤ 128, 8/64/N when N ≤ 256, and 16/64/N above that. With 128 search samples that is
+32·16 + 4·32 + 2·128 = 896 samples scored per generation.
 
 `evolution.mutate` chooses which sign vectors are flipped:
 - `s1`: only s1.
@@ -194,8 +211,9 @@ python asrq/exp.py model=whisper quantizer=rtn transform=none
 - **Evaluation data:** `eval_datasets` lists the Open ASR Leaderboard datasets and splits to evaluate (all
   seven by default). `eval_batches: N` evaluates only the first N batches of each split, which is useful for
   quick checks.
-- **Results:** results go to `results/evaluations/<model>_<method>_..._results.csv`, next to a copy of the
-  config. Set `method=<label>` to name a run.
+- **Results:** each run gets its own directory,
+  `results/evaluations/<model>_<method>_<quantizer>_w<bits>g<group><sym|asym>_a<activation bits>_<transform>_<DD-MM-YY-SS-MM-HH>/`,
+  holding `results.csv` and `config.yaml`. Set `method=<label>` to name a run.
 
 #### Reusing quantized models
 
@@ -213,50 +231,51 @@ again.
   - Deleting the file forces a re-quantization.
 - **Disk use:** files keep the model's own dtype, so a float32 model costs about 4 bytes per parameter.
 
-### 3. Corrections after GPTQ: norm tweaking and block output refitting
+### 3. Corrections after GPTQ: scale recovery and block output refitting
 
-Both corrections run inside the GPTQ block loop, right after each block is quantized. Each is solved in closed
-form from statistics that GPTQ's calibration pass already collects. They are independent of each other; the
-results above use one or the other. Derivations, limits and full results are in
-[docs/norm_tweaking_and_output_refit.md](docs/norm_tweaking_and_output_refit.md).
+Both corrections run in the GPTQ block loop and need no gradient steps. They cover different block types, so a
+run normally enables both: transformer blocks (Whisper, the Qwen LLM) are recovered by scale recovery, and
+Conformer blocks (Parakeet, Canary-Qwen's encoder) by refitting the linear layer they already end in. Details and
+results are in [dev/docs/scale_recovery_and_output_refit.md](dev/docs/scale_recovery_and_output_refit.md).
 
-**Norm tweaking** (`quantizer.norm_tweak=true`, `asrq/quantizers/norm_tweak.py`) rescales each norm that feeds
-the block's quantized layers. The per-channel scale s makes the quantized layers reproduce the full-precision
-outputs:
+**Scale recovery** (`quantizer.scale_recovery=true`, `asrq/quantizers/scale_recovery.py`) gives each quantized
+layer a norm feeds a per-input-channel scale s, fitted inside GPTQ and folded into that norm, so nothing is
+added to the model. When GPTQ rounds column j, it has already pushed the
+earlier columns' compensation into it, so the updated column w̃_j is what GPTQ wants the column to be. The rounded
+column q_j is stretched by the scale that best matches it,
 
-    min_s  Σ_l ‖X·W_lᵀ − X·diag(s)·Q_lᵀ‖²   ⇒   (H ⊙ Σ_l Q_lᵀQ_l + λI) s = diag(H · Σ_l W_lᵀQ_l) + λ
+    s_j = ⟨w̃_j, q_j⟩ / ⟨q_j, q_j⟩
 
-- **Symbols:** H = XᵀX is the GPTQ Hessian. W_l and Q_l are layer l's full-precision and quantized weights.
-- **λ:** `norm_tweak_ridge` × mean diag, which pulls s toward 1.
+and GPTQ then compensates the remaining error w̃_j − s_j·q_j in the later columns, as usual.
+
+- **Where s goes:** into the norm feeding the layer, so only layers a norm feeds are scaled.
+- **Layers sharing a norm** (q/k/v, gate/up) share one s. `quantizer.scale_recovery_method=lockstep`
+  (default) quantizes them as one stacked matrix with s fitted over all their rows; `average` quantizes each on
+  its own and takes the column-energy weighted average of their scales.
+- **λ:** `scale_recovery_ridge` pulls s toward 1.
 - **Scope:** the fit covers weight error only.
 - **Cost:** none at inference, since the scale is folded into the norm.
 
+- **Scope:** transformer blocks only (Whisper's encoder and decoder, the Qwen LLM). Conformer blocks are left to
+  the refit below.
+
 **Block output refitting** (`quantizer.block_output_refit=true`, `asrq/quantizers/output_refit.py`) refits the
-linear layer at each block's output. It maps the quantized block's input to that layer, Z, onto the
-full-precision block's output, Y:
+linear layer a Conformer block ends in: the identity linear the rotation inserts after the block's output norm.
+It maps the quantized block's input to that layer, Z, onto the full-precision block's output, Y:
 
     [W, b] = (Yᵀ·Za + λ·[W0, b0]) · (Zaᵀ·Za + λI)⁻¹,   Za = [Z, 1]
 
 - **What it corrects:** any error that is linear in Z, including the error of layers that no norm feeds.
-- **Conformer blocks** (Parakeet, and Canary-Qwen's encoder): the identity linear that rotation inserts after
-  each block's output norm is refit, so inference costs nothing extra.
-- **Transformer blocks** (Whisper, the Qwen LLM): set `quantizer.block_output_refit_insert=true` to give each
-  block an identity `output_linear`. It stays unquantized, which costs one fp16 d×d matmul per block.
+- **Scope:** Conformer blocks (Parakeet, Canary-Qwen's encoder). The layer already exists, so inference costs
+  nothing extra.
 - **λ:** `block_output_refit_ridge` pulls the fit toward the current weights.
 
 ```bash
-# W2 with block output refitting (inserted layers for the transformer blocks)
-python asrq/exp.py model=whisper quantizer=gptq quantizer.bits=2 quantizer.symmetric=False \
-    quantizer.group_size=128 activation_bits=16 quantizer.block_output_refit=true \
-    quantizer.block_output_refit_insert=true transform.path=outputs/rotation/whisper_w2.pt
-
-# W4A4 with norm tweaking
-python asrq/exp.py model=whisper quantizer=gptq activation_bits=4 quantizer.norm_tweak=true \
-    transform.path=outputs/rotation/whisper_a4.pt
+# W2 with both corrections: scale recovery for the LLM, refit for the Conformer encoder
+python asrq/exp.py model=canary_qwen quantizer=gptq quantizer.bits=2 quantizer.symmetric=False \
+    quantizer.group_size=128 activation_bits=16 quantizer.scale_recovery=true \
+    quantizer.block_output_refit=true transform.path=outputs/rotation/canary_qwen_w2.pt
 ```
-
-On full LibriSpeech, refitting is better at W2 (Canary-Qwen test-other 5.85 vs 7.49 with norm tweaking). At
-W4A4 the two are within about 0.1 WER, and norm tweaking has no inference cost.
 
 ### 4. Real low-bit inference and speedups (humming)
 
@@ -307,7 +326,7 @@ python asrq/exp.py model=parakeet quantizer=gptq activation_bits=8 transform=sca
 |---|---|
 | `config.yaml` | Calibration, activation quantization, `quantized_path`, `inference`, `eval_datasets`, `eval_batches`, `eval_dtype` |
 | `model/*.yaml` | `exclude_modules`, `eval_batch_size`, `generate_fn`, `quantize_block_output_linear` (Conformer) |
-| `quantizer/gptq.yaml` | `bits`, `group_size`, `symmetric`, `percdamp`, `norm_tweak*`, `block_output_refit*` |
+| `quantizer/gptq.yaml` | `bits`, `group_size`, `symmetric`, `percdamp`, `scale_recovery*`, `block_output_refit*` |
 | `quantizer/rtn.yaml` | `bits`, `group_size`, `symmetric` |
 | `transform/rotation.yaml` | `search`, `evolution.*`, `weight_only`, `weight_only_quantizer`, `hadamard_block_size`, `learn_r2`, `fc2_online_hadamard`, `path` |
 | `transform/scaling.yaml` | `type`, `obtain_scales`, `path` |
@@ -330,13 +349,14 @@ asrq/
 ├── quantizers/
 │   ├── gptq.py, gptq_solver.py, rtn.py, weight_rounding.py
 │   ├── activation.py          # activation fake quantization, shared by the search and evaluation
-│   ├── norm_tweak.py          # closed-form norm tweaking
+│   ├── scale_recovery.py      # per-channel scales fitted inside GPTQ
 │   └── output_refit.py        # block output refitting
 ├── transforms/
 │   ├── rotation/              # rotation transform, Cayley SGD, evolutionary Hadamard search, per-model layers
 │   └── scaling/               # scaling transform and per-model layers
 └── evaluation/                # Open ASR Leaderboard evaluation, CUDA-graph transcription per model
 tests/                         # unit tests; `-m integration` runs small end-to-end pipelines per model
+dev/                           # checklists and notes; dev/docs holds the method write-ups
 third_party/                   # open_asr_leaderboard (normalizer), humming (fork with seeded Hadamard signs)
 ```
 

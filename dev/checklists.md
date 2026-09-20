@@ -43,7 +43,7 @@
 - [x] exp.py with transform=scaling for Whisper, Parakeet and Canary-Qwen, fake and humming (W4A8, 64 utterances): humming matches fake within 0.12 WER. tests/test_scaling.py (exactness on tiny models, hooks see the scaled input, same layers as rotation) and scaling cases in the model integration tests.
 - [ ] Compare no transform, scaling and rotation at W4A4 (256 utterances); scales searched at A4.
 
-# Norm tweaking
+# Scale recovery
 - [x] Closed-form norm tweaking in the GPTQ block loops (`quantizer.norm_tweak`, asrq/quantizers/norm_tweak.py): after each block's GPTQ, every norm feeding its quantized layers is scaled per channel by s solving (H * sum Q^T Q + lambda I) s = diag(H sum W^T Q) + lambda, from the Hessian GPTQ collected; weight error only.
 - [x] W2 asymmetric g128 GPTQ, 256 utterances test-clean / test-other, without -> with norm tweaking:
   - Whisper, random Hadamard: 2.44 / 7.62 -> 3.03 / 5.59; no rotation: 3.36 / 9.36 -> 3.22 / 7.30.
@@ -51,10 +51,14 @@
   - Canary-Qwen, random Hadamard: 52.6 / 36.0 -> 5.55 / 7.74 (the looping collapse is gone); no rotation: 103 / 109 -> 102 / 103.
 - [x] W4A4 (learned rotation, GPTQ W4, A4 mixed 128), 256 utterances test-clean / test-other, none -> closed form: Whisper 2.39 / 4.15 -> 2.24 / 4.41; Parakeet 2.08 / 3.12 -> 1.84 / 3.00; Canary-Qwen 1.71 / 2.72 -> 1.56 / 2.65 (full precision 1.47 / 2.46).
 - [x] A gradient variant (Adam on the norm scales with fake-quantized activations, from the closed form) was tried and removed: Canary-Qwen 1.54 / 2.57, Whisper and Parakeet within noise of the closed form, and hard to tune. Only the closed form is kept.
-- [ ] Optional: an activation-aware closed form, G = (Xq^T Xq) * sum Q^T Q, b = diag(Xq^T X sum W^T Q) with Xq = Qa(X), for W4A4.
-- [ ] Norm tweaking at full scale and with the GPTQ-fitness rotation search; the Whisper test-clean regression with the Hadamard (+0.6).
+- [ ] Scale recovery at W4A4.
+- [x] Compared fitting methods: closed, posthoc (fit s Q ~ the updated weight W~ GPTQ rounded, after GPTQ), inloop (s_j fitted as each column is rounded, the scaled error compensated; a norm's layers stacked into one GPTQ), inloop_average (per layer, then column-energy weighted average). W2 random Hadamard, 256 utt, closed / inloop / inloop_average / posthoc: Parakeet 2.54/4.42, 2.65/5.20, 2.75/5.32, 6.97/13.35; Canary-Qwen 5.55/7.74, 4.08/6.73, 3.99/6.34, 8.87/16.04; Whisper 3.03/5.59, 3.14/5.74, 3.32/5.93, 34.1/70.0. In-loop lowers every Parakeet layer's held-out output error below closed (0.84 vs 0.93 of GPTQ) yet raises its WER.
+- [x] Only the in-loop fit is kept (closed form and posthoc removed); `quantizer.norm_tweak_method`: lockstep (default) or average.
+- [x] Renamed to scale recovery (`quantizer.scale_recovery`, asrq/quantizers/scale_recovery.py): the fit is a per-input-channel scale on the quantized grid, and a norm is only one of the things that can absorb it. Folding into a preceding layer's rows (out_proj into v_proj, tied per value channel under Qwen's GQA; down_proj into up_proj) was implemented and removed at the user's request: the folds are exact (3e-16 on a real attention module) and free, but W2 256 utt measured flat to worse (Whisper 3.10/6.31 against 3.14/5.74, Canary-Qwen 3.32/5.40 against 3.21/5.20).
+- [ ] Compare lockstep and average at full scale.
 
 # Block output refitting
+- [x] The inserted Conformer block-output Linears are refit and then quantized when `model.quantize_block_output_linear` is set (their Hessian comes from the refit pass, on the quantized block's inputs), and `quantizer.block_output_linear_bits` gives them their own width. Parakeet W2 256 utt, 41 layers of 86 MB in fp16 against ~275 MB of W2 encoder weights: refit-then-quantize / quantize-only: fp16 2.65/4.47 / 2.96/4.80, W8 2.54/4.68 / 2.87/4.65 (43 MB), W4 2.91/4.96 / 3.43/5.20 (21.5 MB), W2 4.08/6.40 / 3.49/5.51 (11 MB). W8 is the useful trade; the refit helps down to W4 and hurts at W2, where it moves the weights off the near-identity map a 2-bit grid can hold.
 - [x] `quantizer.block_output_refit` (asrq/quantizers/output_refit.py), independent of norm tweaking: after each block's GPTQ, the block's output Linear (the identity a rotation inserts after a Conformer block's norm_out) is refit, weight and bias, in closed form to the full-precision block output, ridge toward the current weights. Output layers that are quantized are skipped.
 - [x] 256 utterances test-clean / test-other, none / norm tweak / refit:
   - Parakeet W2 (random Hadamard): 2.96 / 4.80, 2.54 / 4.42, 2.65 / 4.47 (block error x0.65).
@@ -67,10 +71,18 @@
   - Canary-Qwen W2: 52.6 / 36.0, 5.55 / 7.74, 5.17 / 5.83 (LLM x0.56, encoder x0.63).
   - Canary-Qwen W4A4: 1.71 / 2.72, 1.56 / 2.65, 1.56 / 2.62.
 - [ ] Measure the inference cost of the inserted fp16 d x d layer per block (Whisper, Canary-Qwen), and whether it can run quantized.
-- [ ] Refit and norm tweaking together; the Whisper test-clean regression at W2 (both methods).
+- [x] `quantizer.block_output_refit_rank`: the inserted transformer-block layers as identity plus a rank-r correction (x + (x @ A) @ B + b, asrq/quantizers/output_refit.py LowRankOutput), fitted by reduced-rank regression on the block error (A = M V_r, B = V_r.T with V_r the top eigenvectors of M.T S M, M the unconstrained fit). Conformer norm_out.1 stays a full weight and bias refit. W2 random Hadamard, 256 utt, dense / d4 / d8 / d16: Whisper 3.10/5.10, 2.33/5.49, 2.85/5.76, 2.72/6.00; Canary-Qwen 5.17/5.83, 5.34/8.08, 13.0/13.2, 15.2/14.3. Dense stays the default: Canary-Qwen's LLM needs the full rank, Whisper trades test-clean for test-other.
+- [ ] Optional: the eigenvalue spectrum of M.T S M per block, to see how many directions carry the error reduction.
+- [x] The recovery recipe: norm tweaking for transformer blocks, block output refitting for Conformer blocks, both enabled (the inserted-layer refit for transformer blocks is removed). W2 256 utt: Parakeet 2.65/4.47 (refit only), Whisper 3.14/5.74 (norm tweak only), Canary-Qwen 3.21/5.20 (encoder refit + LLM norm tweak), its best single correction being 4.08/6.73.
+- [ ] The recipe at full scale and at W4A4.
 
 # Hadamard Rotation Search
 - [x] `transform.search: evolution`: R1 = diag(s1) @ H @ diag(s2) searched by a (1 + lambda) evolutionary algorithm over the signs (2 flips per child), three-stage selection (8/16/64, 8/64/256 or 16/64/N samples, random subsets per generation), KL fitness with cached full-precision logits; R2 stays a random Hadamard. Shares learn_rotations' verification and checkpoint format; the checkpoint records the signs and per-generation history.
+- [x] Evolution settings raised: 32 offspring (default), children deduplicated within a generation and against an archive of every candidate scored so far (sha1 of the signs), stages 16/32/N for N <= 128. 128 search samples cost 896 scored samples per generation against 320 at 64 samples with 16 offspring.
+- [x] Search cost: the evolutionary search's batches are grouped by audio length (`length_sorted_batches`, evolution only), which cuts Parakeet's padded audio from 1.21-1.29x to 1.01-1.07x (16-19% less compute); Whisper pads to 30 s and gains nothing. Whisper fitness is 244/220/211 ms per sample at batch 4/8/16 in float32.
+- [x] `transform.fitness_dtype` (autocast of the search's teacher and student passes, default float32): bfloat16 is 2.7x faster on Whisper but unusable. Across 16 children of one parent the fp32 KL spread is 0.0029 while bfloat16's deviation is 0.0041 (1.4x the spread), Spearman rank correlation 0.11, top-4 overlap 0 of 4.
+- [x] Racing children against the survivor cut was implemented and reverted: KL accumulates positively, so a partial mean is a weak lower bound and a child within ~8% of the cut only aborts after ~93% of its batches. Measured no saving on a toy problem.
+- [x] A rotation checkpoint records the model and the quantization it was searched against; apply_rotations refuses another model (by the recorded name, or by R2 coverage and R1 width for checkpoints without it) and check_rotation_settings refuses different activation settings or weight grid (`transform.check_settings`).
 - [x] With symmetric activation quantization s2 does not change the KL (it flips already-rotated coordinates); with asymmetric it does. `evolution.mutate: auto` (default) flips s1 only for symmetric and both for asymmetric; `s1` and `s1_s2` force either.
 - [x] Whisper smoke run (64 samples, A4): KL 0.0400 -> 0.0311 in 3 generations, ~150 s per generation (320 scored samples, float32 forwards at ~450 ms/sample; TF32 ~250 ms/sample).
 - [x] Budget: Cayley SGD takes 5.8 s per step (batch 4, float32), 200 steps ~19 min; the evolutionary search matches it with 8 generations at 64 samples (default `generations: 8`).

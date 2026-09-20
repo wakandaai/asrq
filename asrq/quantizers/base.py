@@ -25,11 +25,16 @@ class QuantConfig(ABC):
         # Conformer models: also quantize the Linear a rotation inserts after each block's output
         # norm. Set from the model config, like exclude_modules; see ParakeetCTCQ.
         self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
-        self.norm_tweak = bool(cfg.get("norm_tweak", False))
-        self.norm_tweak_ridge = float(cfg.get("norm_tweak_ridge", 0.01))
+        # Bits for the Linear a rotation inserts after a Conformer block's output norm, when it is quantized;
+        # None gives it the same bits as every other layer. Its error lands straight in the residual stream, so
+        # it can be worth keeping it wider than the rest.
+        bits = cfg.get("block_output_linear_bits", None)
+        self.block_output_linear_bits = int(bits) if bits else None
+        self.scale_recovery = bool(cfg.get("scale_recovery", False))
+        self.scale_recovery_ridge = float(cfg.get("scale_recovery_ridge", 0.01))
+        self.scale_recovery_method = str(cfg.get("scale_recovery_method", "lockstep"))
         self.block_output_refit = bool(cfg.get("block_output_refit", False))
         self.block_output_refit_ridge = float(cfg.get("block_output_refit_ridge", 0.01))
-        self.block_output_refit_insert = bool(cfg.get("block_output_refit_insert", False))
 
 
 class LinearQuantConfig(QuantConfig):

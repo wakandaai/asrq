@@ -16,6 +16,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from asrq.calibration.data import length_sorted_batches
+
 from asrq.transforms.rotation.utils import (
     add_residual_stream_entry_hook,
     add_unrotate_input_hook,
@@ -125,9 +127,10 @@ def build_parakeet_dataloader(
     generator.manual_seed(seed)
     return torch.utils.data.DataLoader(
         ParakeetCalibrationDataset(model, samples),
-        batch_size=batch_size,
-        shuffle=True,
-        generator=generator,
+        **(
+            {"batch_sampler": length_sorted_batches(samples, batch_size, seed)} if sort_by_length
+            else {"batch_size": batch_size, "shuffle": True, "generator": generator}
+        ),
         collate_fn=partial(parakeet_ctc_collate_fn, pad_id=pad_id if pad_id > 0 else 0),
         num_workers=0,
         pin_memory=True,

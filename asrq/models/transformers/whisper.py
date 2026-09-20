@@ -13,6 +13,7 @@ from asrq.transforms.rotation.whisper_utils import (
     get_whisper_online_hadamard_layers,
 )
 from asrq.core.model import ModelQ
+from asrq.quantizers.scale_recovery import ScaleTarget
 from asrq.core.linear import ASRQLinear
 import transformers
 from transformers.models.whisper.modeling_whisper import (
@@ -539,7 +540,7 @@ class WhisperQ(ModelQ):
         for name, module in block.named_modules():
             name = f"model.encoder.layers.{block_idx}.{name}"
             if self.should_quantize_module(name, module):
-                quant_methods[name] = self.quant_cls(module, name, self.quant_cfg)
+                quant_methods[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
                 submodules[name] = module
         
         def get_hook(name):
@@ -562,12 +563,10 @@ class WhisperQ(ModelQ):
         # remove hooks
         for h in hooks:
             h.remove()
-        tweaks = self.capture_norm_tweaks(quant_methods)
+        groups = self.capture_scale_recovery(quant_methods)
         # quantize layers
-        for name in quant_methods.keys():
-            qresult = quant_methods[name]()
-            self.qparams[name] = qresult
-            # quant_methods[name]() (e.g. RTNQuantizer) only fake-quantizes:
+        for name in self.quantize_layers(quant_methods, groups, self.refit_quantizes_output_layer(block_name, quant_methods)):
+            # quantize_layers (e.g. RTNQuantizer) only fake-quantizes:
             # it writes a rounded-then-dequantized fp16 weight back into
             # submodules[name].weight.data for calibration/qparams
             # reporting. ASRQLinear needs an explicit .quantize_() call on
@@ -578,7 +577,7 @@ class WhisperQ(ModelQ):
             if isinstance(module, ASRQLinear):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
-        self.apply_norm_tweaks(tweaks)
+        self.apply_scale_recovery(groups)
         self.refit_block_output(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), refit_targets)
 
         # get input into the next block
@@ -718,7 +717,7 @@ class WhisperQ(ModelQ):
         for name, module in block.named_modules():
             name = f"model.decoder.layers.{block_idx}.{name}"
             if self.should_quantize_module(name, module):
-                quant_methods[name] = self.quant_cls(module, name, self.quant_cfg)
+                quant_methods[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
                 submodules[name] = module
         
         def get_hook(name):
@@ -741,12 +740,10 @@ class WhisperQ(ModelQ):
         # remove hooks
         for h in hooks:
             h.remove()
-        tweaks = self.capture_norm_tweaks(quant_methods)
+        groups = self.capture_scale_recovery(quant_methods)
         # quantize layers
-        for name in quant_methods.keys():
-            qresult = quant_methods[name]()
-            self.qparams[name] = qresult
-            # quant_methods[name]() (e.g. RTNQuantizer) only fake-quantizes:
+        for name in self.quantize_layers(quant_methods, groups, self.refit_quantizes_output_layer(block_name, quant_methods)):
+            # quantize_layers (e.g. RTNQuantizer) only fake-quantizes:
             # it writes a rounded-then-dequantized fp16 weight back into
             # submodules[name].weight.data for calibration/qparams
             # reporting. ASRQLinear needs an explicit .quantize_() call on
@@ -757,7 +754,7 @@ class WhisperQ(ModelQ):
             if isinstance(module, ASRQLinear):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
-        self.apply_norm_tweaks(tweaks)
+        self.apply_scale_recovery(groups)
         self.refit_block_output(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), refit_targets)
 
         # get input into the next block
@@ -778,25 +775,18 @@ class WhisperQ(ModelQ):
         mapping the rotation search quantizes."""
         return get_whisper_activation_roles(self.model)
 
-    def transformer_block_widths(self) -> Dict[str, int]:
-        """Every encoder and decoder layer, each ending in a residual sum."""
-        config = self.model.config
-        widths = {f"model.encoder.layers.{i}": config.d_model for i in range(config.encoder_layers)}
-        widths.update({f"model.decoder.layers.{i}": config.d_model for i in range(config.decoder_layers)})
-        return widths
-
-    def norm_tweak_targets(self) -> Dict[str, List[str]]:
+    def scale_recovery_targets(self) -> List[ScaleTarget]:
         """The norms in front of each block's attention projections and fc1; the decoder's cross-attention norm
         feeds only its q_proj, since k_proj and v_proj read the encoder output."""
         config = self.model.config
-        targets = {}
-        for i in range(config.encoder_layers):
-            p = f"model.encoder.layers.{i}"
-            targets[f"{p}.self_attn_layer_norm"] = [f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")]
-            targets[f"{p}.final_layer_norm"] = [f"{p}.fc1"]
-        for i in range(config.decoder_layers):
-            p = f"model.decoder.layers.{i}"
-            targets[f"{p}.self_attn_layer_norm"] = [f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")]
-            targets[f"{p}.encoder_attn_layer_norm"] = [f"{p}.encoder_attn.q_proj"]
-            targets[f"{p}.final_layer_norm"] = [f"{p}.fc1"]
+        targets = []
+        for prefix, count in (("model.encoder.layers", config.encoder_layers),
+                              ("model.decoder.layers", config.decoder_layers)):
+            for i in range(count):
+                p = f"{prefix}.{i}"
+                targets.append(ScaleTarget(f"{p}.self_attn_layer_norm",
+                                           [f"{p}.self_attn.{n}_proj" for n in ("q", "k", "v")]))
+                targets.append(ScaleTarget(f"{p}.final_layer_norm", [f"{p}.fc1"]))
+                if "decoder" in prefix:
+                    targets.append(ScaleTarget(f"{p}.encoder_attn_layer_norm", [f"{p}.encoder_attn.q_proj"]))
         return targets

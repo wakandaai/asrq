@@ -26,6 +26,13 @@ search: cayley
 # Weight-only quantization: search R1 (search: evolution only) against the quantizer's rounded weights instead of
 # quantized activations. Each candidate is folded into the weights, which are rounded with RTN at the quantizer's
 # bits, group size and symmetry; activations stay in full precision and activation_bits is ignored by the search.
+# Refuse to apply a rotation whose checkpoint records other quantization settings than this run uses; see
+# asrq/configs/transform/rotation.yaml.
+check_settings: True
+# Autocast dtype of the evolutionary search's forward passes, teacher and student alike, so the KL sees only
+# quantization error: float32, bfloat16 or float16. The search's batches are also grouped by audio length, which
+# cuts the padding the model computes on; the verification passes stay in float32.
+fitness_dtype: float32
 weight_only: False
 # How the weight-only search quantizes each candidate's weights: rtn, gptq (on Hessians collected once; the
 # residual-stream layers' Hessians are rotated per candidate), or null for the experiment's quantizer.

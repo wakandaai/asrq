@@ -995,3 +995,56 @@ def test_patching_one_layer_does_not_affect_other_instances():
     )
     assert nn.Linear.forward is original_forward
     assert "forward" not in untouched.__dict__
+
+
+def _checkpoint(activation=None, search=None, model=None):
+    return {"R1": torch.eye(4), "R2s": {}, "activation_quantization": activation, "search": search, "model": model}
+
+
+def test_settings_matching_the_search_are_accepted():
+    check_rotation_settings = utils.check_rotation_settings
+
+    activation = {"bits": 4, "group_size": 128, "symmetric": True, "groupwise_roles": ["attn_out", "fc2"]}
+    checkpoint = _checkpoint(activation)
+    check_rotation_settings("x.pt", dict(activation), checkpoint=checkpoint)
+    check_rotation_settings("x.pt", {**activation, "groupwise_roles": ["fc2", "attn_out"]}, checkpoint=checkpoint)
+    weights = {"bits": 2, "group_size": 128, "symmetric": False}
+    weight_only = _checkpoint({"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None},
+                              {"quantization": "weights", "weight_quantization": dict(weights)})
+    check_rotation_settings("x.pt", {"bits": 16, "group_size": 128, "symmetric": True, "groupwise_roles": None},
+                            weights, checkpoint=weight_only)
+
+
+@pytest.mark.parametrize("override, message", [
+    ({"bits": 8}, "activation bits"),
+    ({"symmetric": False}, "activation symmetric"),
+    ({"group_size": 64}, "activation group_size"),
+    ({"groupwise_roles": ["fc2"]}, "group-wise roles"),
+])
+def test_a_rotation_searched_under_other_activation_settings_is_refused(override, message):
+    check_rotation_settings = utils.check_rotation_settings
+
+    activation = {"bits": 4, "group_size": 128, "symmetric": True, "groupwise_roles": ["attn_out", "fc2"]}
+    with pytest.raises(ValueError, match=message):
+        check_rotation_settings("x.pt", {**activation, **override}, checkpoint=_checkpoint(activation))
+
+
+def test_a_weight_only_rotation_is_refused_for_another_weight_grid():
+    check_rotation_settings = utils.check_rotation_settings
+
+    checkpoint = _checkpoint({"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None},
+                             {"quantization": "weights", "weight_quantization": {"bits": 2, "group_size": 128, "symmetric": False}})
+    activation = {"bits": 16, "group_size": 128, "symmetric": True, "groupwise_roles": None}
+    with pytest.raises(ValueError, match="weight bits"):
+        check_rotation_settings("x.pt", activation, {"bits": 4, "group_size": 128, "symmetric": False}, checkpoint=checkpoint)
+
+
+def test_a_rotation_searched_for_another_model_is_refused():
+    check_rotation_settings = utils.check_rotation_settings
+
+    activation = {"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None}
+    checkpoint = _checkpoint(activation, model="nvidia/parakeet-ctc-1.1b")
+    check_rotation_settings("x.pt", dict(activation), checkpoint=checkpoint, model_name="nvidia/parakeet-ctc-1.1b")
+    check_rotation_settings("x.pt", dict(activation), checkpoint=_checkpoint(activation), model_name="openai/whisper-large-v3")
+    with pytest.raises(ValueError, match="was searched for nvidia/parakeet-ctc-1.1b"):
+        check_rotation_settings("x.pt", dict(activation), checkpoint=checkpoint, model_name="openai/whisper-large-v3")

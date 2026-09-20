@@ -201,19 +201,6 @@ class EncDecCTCModelBPEQ(EncDecCTCModelQ, EncDecCTCModelBPE):
     
 
 
-def conformer_norm_tweak_targets(prefix: str, num_layers: int) -> Dict[str, List[str]]:
-    """The norms in front of each Conformer block's feed-forward linear1s, attention projections and first
-    pointwise convolution; ``prefix`` is the path of the block list, such as ``encoder.layers``."""
-    targets = {}
-    for i in range(num_layers):
-        p = f"{prefix}.{i}"
-        targets[f"{p}.norm_feed_forward1"] = [f"{p}.feed_forward1.linear1"]
-        targets[f"{p}.norm_self_att"] = [f"{p}.self_attn.linear_{n}" for n in ("q", "k", "v")]
-        targets[f"{p}.norm_conv"] = [f"{p}.conv.pointwise_conv1"]
-        targets[f"{p}.norm_feed_forward2"] = [f"{p}.feed_forward2.linear1"]
-    return targets
-
-
 @register_model(ModelNames.NVIDIA_PARAKEET_CTC_1_1B)
 class ParakeetCTCQ(ModelQ):
     """Quantization wrapper for the NVIDIA Parakeet-CTC 1.1B model.
@@ -385,7 +372,7 @@ class ParakeetCTCQ(ModelQ):
                 name = f"encoder.layers.{idx}.{name}"
                 if self.should_quantize_module(name, module):
                     sublayers[name] = module
-                    quantizers[name] = self.quant_cls(module, name, self.quant_cfg)
+                    quantizers[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
             # hooks
             def add_hook(name):
                 def hook(module, input, output):
@@ -409,13 +396,12 @@ class ParakeetCTCQ(ModelQ):
             # remove hooks
             for hook in hooks:
                 hook.remove()
-            tweaks = self.capture_norm_tweaks(quantizers)
+            groups = self.capture_scale_recovery(quantizers)
 
             # quanitze
-            for name, quantizer in quantizers.items():
-                self.qparams[name] = quantizer()
+            for name in self.quantize_layers(quantizers, groups, self.refit_quantizes_output_layer(block_name, quantizers)):
                 tqdm.write(f"Quantized {name}")
-            self.apply_norm_tweaks(tweaks)
+            self.apply_scale_recovery(groups)
             self.refit_block_output(block_name, quantizers, lambda i, block=block: block(**inp_kwargs[i]), refit_targets)
 
             # get the output of the block and use it as input for the next block
@@ -437,7 +423,7 @@ class ParakeetCTCQ(ModelQ):
         model kept in a LayerNorm; it is quantized only with ``quantize_block_output_linear``, which
         also gives it an activation role.
         """
-        if name in self.quant_cfg.exclude_modules or name.endswith(".output_linear"):
+        if name in self.quant_cfg.exclude_modules:
             return False
         if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
             return False
@@ -453,10 +439,6 @@ class ParakeetCTCQ(ModelQ):
         See WhisperQ.online_hadamard_layers.
         """
         return {fc2: act for act, fc2 in get_parakeet_online_hadamard_layers(self.model)}
-
-    def norm_tweak_targets(self) -> Dict[str, List[str]]:
-        """The norms in front of each Conformer block's first layers; see conformer_norm_tweak_targets."""
-        return conformer_norm_tweak_targets("encoder.layers", len(self.model.encoder.layers))
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Attention projections, feed-forward linears and pointwise convs, fc2-like layers

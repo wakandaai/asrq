@@ -1,6 +1,8 @@
 import torch
 import datetime
 import os
+
+from asrq import tracking
 from asrq.evaluation.openasr import DATASET_PATH, evaluate_model
 from asrq.quantizers.activation import (
     attach_activation_quantization,
@@ -97,6 +99,7 @@ def evaluate_openasr(modelQ, cfg, generate_fn, evaluation_results_file, create_a
         print(f"Evaluating only the first {batches_to_eval} batches "
               f"({batches_to_eval * cfg.model.eval_batch_size} utterances) of each dataset split")
 
+    word_error_rates = []
     for dataset, split in evaluation_splits(cfg):
         print(f"Evaluating dataset {dataset} split {split}...")
         result = evaluate_model(
@@ -107,3 +110,12 @@ def evaluate_openasr(modelQ, cfg, generate_fn, evaluation_results_file, create_a
         )
         with open(evaluation_results_file, "a") as f:
             f.write(f"{cfg.model.name},{cfg.method},{cfg.quantizer.name},{cfg.transform.name},{cfg.quantizer.bits},{cfg.activation_bits},{dataset},{split},{result['wer']}\n")
+        tracking.summary({
+            f"eval/{dataset}.{split}/wer": result["wer"], f"eval/{dataset}.{split}/rtfx": result.get("rtfx"),
+        })
+        tracking.log({"eval/wer": result["wer"], "eval/rtfx": result.get("rtfx"),
+                      "eval/dataset": f"{dataset}.{split}"})
+        word_error_rates.append(result["wer"])
+    if word_error_rates:
+        tracking.summary({"eval/wer_mean": sum(word_error_rates) / len(word_error_rates),
+                          "eval/splits": len(word_error_rates)})

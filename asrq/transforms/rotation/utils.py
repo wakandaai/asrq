@@ -1,9 +1,11 @@
 import types
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
+
+from asrq import tracking
 import torch.nn as nn
 import torch.nn.functional as F
 from humming import ops
@@ -181,7 +183,7 @@ class _rmsnorm(nn.Module):
     A norm with no next layers cannot be converted: the scale has nowhere to go and must stay
     in the norm, so leave it as an _RMSNorm rather than calling this.
 
-    Norm tweaking (asrq.quantizers.norm_tweak) can give it a per-channel ``weight`` buffer again, after the
+    Scale recovery (asrq.quantizers.scale_recovery) can give it a per-channel ``weight`` buffer again, after the
     next layers are quantized; the output is then multiplied by it.
 
     Args:
@@ -1328,6 +1330,13 @@ def kl_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor) ->
     return F.kl_div(student, teacher, log_target=True, reduction="batchmean")
 
 
+def autocast_context(dtype: Optional[torch.dtype]):
+    """``torch.autocast`` in dtype, or nothing when dtype is None or float32."""
+    if dtype is None or dtype == torch.float32:
+        return nullcontext()
+    return torch.autocast("cuda", dtype=dtype)
+
+
 @contextmanager
 def exact_float32_arithmetic():
     """Disable TF32 for cuBLAS matmuls and cuDNN convolutions, restoring both on exit.
@@ -1387,6 +1396,7 @@ def check_logits_unchanged(
         (logits[mask].float() - reference).abs().max() / reference.abs().max().clamp_min(1e-12)
     )
     print(f"  after {stage}: relative logit error {error:.2e}")
+    tracking.summary({f"rotation/logit_error_{stage.replace(' ', '_')}": error})
     if error > tolerance:
         raise RuntimeError(
             f"{stage} changed the model's output: the logits moved by {error:.2e} relative to "
@@ -1557,7 +1567,7 @@ def fold_rotations(
 def _save_rotations(
     path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
     r1_block_size, objective, activation_bits, activation_group_size, activation_symmetric, groupwise_roles,
-    search,
+    search, model_name=None,
 ) -> None:
     """Save a searched rotation in the checkpoint format apply_rotations reads, with the search's record."""
     torch.save(
@@ -1567,6 +1577,7 @@ def _save_rotations(
                 else R1.data.detach().cpu()
             ),
             "R2s": {k: v.data.detach().cpu() for k, v in R2s.items()},
+            "model": model_name,
             "hadamard_block_size": hadamard_block_size,
             "learn_r2": learn_r2,
             "fc2_online_hadamard": fc2_online_hadamard,
@@ -1641,6 +1652,7 @@ def _search_r1_for_weight_quantization(
     model, path, layers_to_rotate, compute_logits, train_loader, reference_batch, reference_logits, tolerance,
     R1, R2s, r1_signs, write_r1, multi_stream, hadamard_block_size, online_hadamard_layers, hadamard_signs,
     hadamard_sign_seed, learn_r2, fc2_online_hadamard, r1_block_size, objective, evolution, weight_quantization,
+    model_name, fitness_dtype,
 ):
     """The evolutionary R1 search of learn_rotations for weight-only quantization.
 
@@ -1725,7 +1737,7 @@ def _search_r1_for_weight_quantization(
 
     batches = list(train_loader)
     teachers, sample_counts = [], []
-    with torch.no_grad():
+    with torch.no_grad(), autocast_context(fitness_dtype):
         for batch in batches:
             logits, mask = compute_logits(model, batch)
             sample_counts.append(int(mask.shape[0]))
@@ -1744,7 +1756,7 @@ def _search_r1_for_weight_quantization(
             fold(signs, quantize=True)
             applied["signs"] = signs
         total = 0.0
-        with torch.no_grad():
+        with torch.no_grad(), autocast_context(fitness_dtype):
             for index in indices:
                 student_logits, mask = compute_logits(model, batches[index])
                 total += float(kl_divergence(student_logits[mask], teachers[index].to(device)))
@@ -1757,7 +1769,7 @@ def _search_r1_for_weight_quantization(
     write_r1(r1_signs)
     _save_rotations(
         path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
-        r1_block_size, objective, None, -1, True, None,
+        r1_block_size, objective, None, -1, True, None, model_name=model_name,
         search={
             "name": "evolution",
             "quantization": "weights",
@@ -1799,6 +1811,8 @@ def learn_rotations(
     search="cayley",
     evolution=None,
     weight_quantization=None,
+    model_name=None,
+    fitness_dtype=None,
 ):
     """Search the rotations R1 and R2 for a model and save them to disk.
 
@@ -1917,6 +1931,10 @@ def learn_rotations(
         evolution: The EvolutionConfig of an evolutionary search; None uses its defaults. Its
             ``mutate="auto"`` is resolved from activation_symmetric, or to both sign vectors for a weight-only
             search, and the run's per-generation record is appended to its history; both are saved.
+        model_name: The model being rotated, saved in the checkpoint so applying it to another model is refused.
+        fitness_dtype: Autocast dtype of the evolutionary search's forward passes, teacher and student alike, so
+            the KL sees only quantization error. None or float32 runs them in float32. The verification passes
+            stay in float32 whatever this is.
         weight_quantization: ``{"method", "bits", "group_size", "symmetric", "layers", "percdamp", "block_size"}``
             for a weight-only search: R1 is searched against the weights of ``layers`` (None: every rotated
             layer) quantized with ``method`` (``"rtn"`` or ``"gptq"``, with GPTQ's percdamp and block_size),
@@ -2040,7 +2058,7 @@ def learn_rotations(
             model, path, layers_to_rotate, compute_logits, train_loader, reference_batch, reference_logits,
             tolerance, R1, R2s, r1_signs, write_r1, multi_stream, hadamard_block_size, online_hadamard_layers,
             hadamard_signs, hadamard_sign_seed, learn_r2, fc2_online_hadamard, r1_block_size, objective, evolution,
-            weight_quantization,
+            weight_quantization, model_name, fitness_dtype,
         )
     patch_rotations(
         model, layers_to_rotate, R1, R2s, {}, hadamard_block_size, quantizers, hadamard_signs,
@@ -2076,11 +2094,13 @@ def learn_rotations(
             f"{objective_name} with {activation_bits}-bit activations at the random Hadamard "
             f"initialisation: {initial:.6f}"
         )
+        tracking.summary({"rotation/initial_objective": initial, "rotation/objective": objective_name,
+                          "rotation/activation_bits": activation_bits})
 
     if search == "evolution":
         batches = list(train_loader)
         teachers, sample_counts = [], []
-        with torch.no_grad(), full_precision():
+        with torch.no_grad(), full_precision(), autocast_context(fitness_dtype):
             for batch in batches:
                 logits, mask = compute_logits(model, batch)
                 sample_counts.append(int(mask.shape[0]))
@@ -2089,7 +2109,7 @@ def learn_rotations(
         def fitness(signs, indices):
             write_r1(signs)
             total = 0.0
-            with torch.no_grad():
+            with torch.no_grad(), autocast_context(fitness_dtype):
                 for index in indices:
                     student_logits, mask = compute_logits(model, batches[index])
                     if evolution.cache_teacher:
@@ -2107,7 +2127,7 @@ def learn_rotations(
         _save_rotations(
             path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
             r1_block_size, objective, activation_bits, activation_group_size, activation_symmetric,
-            groupwise_roles,
+            groupwise_roles, model_name=model_name,
             search={
                 "name": "evolution",
                 "R1_signs": {stream: (s1.cpu(), s2.cpu()) for stream, (s1, s2) in r1_signs.items()},
@@ -2155,18 +2175,82 @@ def learn_rotations(
                     f"|R1^T R1 - I| {drift:.1e}",
                     flush=True,
                 )
+                tracking.step_metric("search", "search/step")
+                tracking.log({
+                    "search/step": step, "search/loss": sum(window) / len(window), "search/loss_min": min(window),
+                    "search/loss_max": max(window), "search/learning_rate": lr, "search/orthogonality_drift": drift,
+                    "search/epoch": epoch + 1,
+                })
                 window = []
         avg_loss = total_loss / max(num_batches, 1)
         print(
             f"Epoch {epoch + 1}/{epochs}, average {objective_name}: {avg_loss:.6f}", flush=True
         )
+        tracking.summary({f"search/epoch_{epoch + 1}_loss": avg_loss, "search/final_loss": avg_loss,
+                          "search/name": "cayley", "search/steps": step})
 
     _save_rotations(
         path, R1, R2s, multi_stream, hadamard_block_size, learn_r2, fc2_online_hadamard, hadamard_sign_seed,
         r1_block_size, objective, activation_bits, activation_group_size, activation_symmetric, groupwise_roles,
-        search={"name": "cayley"},
+        model_name=model_name, search={"name": "cayley"},
     )
     return R1, R2s
+
+
+def check_rotation_settings(
+    path: str, activation: Mapping, weight: Optional[Mapping] = None, checkpoint: Optional[Mapping] = None,
+    model_name: Optional[str] = None,
+) -> None:
+    """Raise when a saved rotation was searched under different quantization settings than the run applying it.
+
+    A rotation is searched against a quantizer, so applying it under another one is unsound: the search's
+    fitness is the KL of exactly the quantization being used. The checkpoint records what it assumed in
+    ``activation_quantization`` and, for a weight-only search, in ``search["weight_quantization"]``.
+
+    Args:
+        path: The checkpoint's path, for the message.
+        activation: The run's ``{"bits", "group_size", "symmetric", "groupwise_roles"}``; bits None or >= 16
+            means activations are not quantized.
+        weight: The run's ``{"bits", "group_size", "symmetric"}``, checked against a weight-only search.
+        checkpoint: The loaded checkpoint; read from path when not given.
+        model_name: The model being quantized, checked against the one the rotation was searched for.
+    """
+    checkpoint = torch.load(path, map_location="cpu") if checkpoint is None else checkpoint
+    searched_model = checkpoint.get("model")
+    if model_name is not None and searched_model is not None and searched_model != model_name:
+        raise ValueError(
+            f"the rotation in {path} was searched for {searched_model}, but this run quantizes {model_name}. "
+            f"A rotation belongs to the model it was searched on; search one for this model."
+        )
+    saved = dict(checkpoint.get("activation_quantization") or {})
+    search = checkpoint.get("search") or {}
+    mismatches = []
+    bits = activation.get("bits")
+    bits = None if bits is None or bits >= 16 else bits
+    saved_bits = saved.get("bits")
+    if saved_bits != bits:
+        mismatches.append(f"activation bits {saved_bits} searched, {bits} requested")
+    elif bits is not None:
+        for key in ("group_size", "symmetric"):
+            if saved.get(key) != activation.get(key):
+                mismatches.append(f"activation {key} {saved.get(key)!r} searched, {activation.get(key)!r} requested")
+        roles = activation.get("groupwise_roles")
+        roles = None if roles is None else sorted(roles)
+        if saved.get("groupwise_roles") != roles:
+            mismatches.append(f"group-wise roles {saved.get('groupwise_roles')} searched, {roles} requested")
+    searched_weights = search.get("weight_quantization") if search.get("quantization") == "weights" else None
+    if searched_weights is not None and weight is not None:
+        for key in ("bits", "group_size", "symmetric"):
+            if searched_weights.get(key) != weight.get(key):
+                mismatches.append(
+                    f"weight {key} {searched_weights.get(key)!r} searched, {weight.get(key)!r} requested"
+                )
+    if mismatches:
+        raise ValueError(
+            f"the rotation in {path} was searched under different quantization settings: "
+            + "; ".join(mismatches)
+            + ". Search a rotation for these settings, or set transform.check_settings=false to apply it anyway."
+        )
 
 
 def apply_rotations(
@@ -2235,6 +2319,26 @@ def apply_rotations(
     else:
         R1 = saved_r1.to(device)
     R2s = {name: R2.to(device) for name, R2 in checkpoint["R2s"].items()}
+    if use_r2:
+        missing = [group[0] for group in layers_to_rotate if group[0] not in R2s]
+        if missing:
+            raise ValueError(
+                f"the rotation in {path} has no R2 for {len(missing)} of this model's attention modules, the "
+                f"first being {missing[0]!r}; it was searched for a different model."
+                + (f" It records {checkpoint['model']}." if checkpoint.get("model") else "")
+            )
+    moduledict = dict(model.named_modules())
+    for group in layers_to_rotate:
+        for name, _rot_type in group[2]:
+            width = _weight_2d(moduledict[name]).shape[1]
+            rotation = _group_rotation(R1, group)
+            if rotation is not None and rotation.shape[0] != width:
+                raise ValueError(
+                    f"the rotation in {path} has a {tuple(rotation.shape)} R1, but {name} of this model reads "
+                    f"{width} channels; it was searched for a different model."
+                    + (f" It records {checkpoint['model']}." if checkpoint.get("model") else "")
+                )
+            break
     hadamard_sign_seed = checkpoint.get("hadamard_sign_seed") or 0
     saved_signs = checkpoint.get("hadamard_signs")
     hadamard_signs = None

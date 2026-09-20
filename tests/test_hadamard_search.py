@@ -20,11 +20,14 @@ from asrq.transforms.rotation.hadamard_search import (
     mutate_signs,
     random_sign_vectors,
     signed_hadamard,
+    signs_key,
     stage_cost,
 )
 
 
-@pytest.mark.parametrize("samples, stages", [(64, (8, 16, 64)), (256, (8, 64, 256)), (768, (16, 64, 768)), (8, (8, 8, 8))])
+@pytest.mark.parametrize("samples, stages", [
+    (64, (8, 16, 64)), (128, (16, 32, 128)), (256, (8, 64, 256)), (768, (16, 64, 768)), (8, (8, 8, 8)),
+])
 def test_default_stages_follow_the_calibration_size(samples, stages):
     assert default_stage_samples(samples) == stages
 
@@ -191,3 +194,32 @@ def test_batched_gptq_is_per_layer_gptq(symmetric):
     for layer in range(4):
         single = gptq_quantize(weights[layer], gptq_factors(hessians[layer], 0.01), 2, 8, symmetric, 8)
         assert torch.allclose(batched[layer], single, atol=1e-6)
+
+
+def test_no_candidate_is_scored_twice_within_or_across_generations():
+    seen = []
+
+    def fitness(signs, indices):
+        seen.append(signs_key(signs))
+        return float((signs[None][0] < 0).sum() + (signs[None][1] < 0).sum())
+
+    config = EvolutionConfig(generations=6, offspring=8, survivors=(3, 2), stage_samples=(4, 8, 16), flips=2,
+                             mutate="s1_s2")
+    parent = random_sign_vectors({None: 32}, torch.Generator().manual_seed(0), "cpu")
+    evolve_signs(parent, fitness, [4] * 4, config, log=lambda _line: None)
+    children = {key for key in seen if key != signs_key(parent)}
+    assert len(children) == config.generations * config.offspring
+
+
+def test_the_search_stops_when_every_mutation_of_the_parent_has_been_seen():
+    lines = []
+
+    def fitness(signs, indices):
+        return 1.0
+
+    config = EvolutionConfig(generations=20, offspring=4, survivors=(2, 1), stage_samples=(4, 4, 4), flips=1,
+                             mutate="s1")
+    parent = random_sign_vectors({None: 6}, torch.Generator().manual_seed(0), "cpu")
+    evolve_signs(parent, fitness, [4], config, log=lines.append)
+    assert any("no unseen mutation" in line for line in lines)
+    assert len(config.history) - 1 < config.generations

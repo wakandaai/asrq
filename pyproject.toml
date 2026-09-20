@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Experiment logging; asrq/tracking.py is a no-op without it, and with wandb.enabled off.
+wandb = ["wandb>=0.17"]
+
 # Two separate CUDA kernels for the same Hadamard transform; pick one for the online
 # rotations. Both build from source, need a CUDA toolkit, and must be installed with
 # --no-build-isolation so the build sees the already-installed torch. Setting
