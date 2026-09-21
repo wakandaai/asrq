@@ -8,14 +8,16 @@
 # Varies:  the model (whisper, parakeet, canary_qwen) and the activation width (4, 8).
 # Fixed:   W4 symmetric weights in groups of 128, rounded to nearest. Activations symmetric, per token, except
 #          attn_out and fc2, which keep one scale per group of 128 (activation_groupwise_roles).
-#          Transform: smoothquant scales, one per scaled entry, searched inside exp.py against the same weight
-#          and activation quantization the run evaluates with, then folded in -- into the previous layer's rows
+#          Transform: smoothquant scales with SmoothQuant's own migration strength, alpha = 0.5 for every
+#          entry, s = amax^0.5 / wmax^0.5, from the per-channel input maxima over every calibration utterance
+#          and the per-channel weight maxima -- no search. They are folded in: into the previous layer's rows
 #          where one exists, and into an InputScale module after the activation where a nonlinearity sits in
-#          between. Statistics come from every calibration utterance, the grid search from the first 128.
+#          between (fc2, pointwise_conv2). With alpha fixed the scales depend on neither the weight nor the
+#          activation bits, so each model's scales are computed once and shared by its A4 and A8 runs.
 #          Quantization: RTN alone. No rotation, no GPTQ, no scale recovery, no block output refitting, and no
 #          inserted block-output Linears, which only a rotation creates.
 #          Evaluation: all seven leaderboard datasets, with the activations fake-quantized.
-# Output:  outputs/scaling/smoothquant_w4a<bits>_<model>.pt, and
+# Output:  outputs/scaling/smoothquant_alpha0.5_<model>.pt, and
 #          results/evaluations/smoothquant_<model>_smoothquant_w4a<bits>_.../{results.csv,config.yaml}, one
 #          directory per run. Every run is logged to wandb in the group smoothquant.
 #
@@ -33,13 +35,12 @@ stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 EXPERIMENT="exp_name=smoothquant wandb.enabled=true"
 # attn_out and fc2 stay group-wise through the default activation_groupwise_roles.
 ACTIVATIONS="activation_symmetric=True activation_group_size=128"
-# RTN needs no Hessians, so the calibration set is only what the scale search sees: statistics over all of it,
-# and the grid search over the first 128 utterances.
+# RTN needs no Hessians, so the calibration set is only what the scales are computed from.
 GRID="quantizer=rtn quantizer.bits=4 quantizer.symmetric=True quantizer.group_size=128"
 
 for model in ${MODELS:-parakeet whisper canary_qwen}; do
   for abits in ${ABITS:-4 8}; do
-    scales=outputs/scaling/smoothquant_w4a${abits}_${model}.pt
+    scales=outputs/scaling/smoothquant_alpha0.5_${model}.pt
     if [ -f $scales ]; then
       obtain=transform.obtain_scales=false
       stamp "$model W4A$abits scales exist, reusing them"
@@ -48,7 +49,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
     fi
 
     stamp "$model W4A$abits scale, quantize and evaluate start"
-    python -u asrq/exp.py model=$model transform=scaling transform.path=$scales $obtain transform.type=smoothquant \
+    python -u asrq/exp.py model=$model transform=scaling transform.path=$scales $obtain transform.type=smoothquant transform.alpha=0.5 \
       $GRID $EXPERIMENT $ACTIVATIONS activation_bits=$abits \
       calibration.num_samples=512 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False method=smoothquant_w4a$abits \

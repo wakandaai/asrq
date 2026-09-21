@@ -162,22 +162,16 @@ def test_input_scale_divides_the_channel_axis():
     assert torch.allclose(InputScale(scale)(x.transpose(1, 2)), x.transpose(1, 2) / scale)
 
 
-def test_searched_scales_keep_whisper_exact(whisper, tmp_path):
+def test_scales_keep_whisper_exact(whisper, tmp_path):
     model, inputs = whisper
     model = model.float()
     inputs = {**inputs, "input_features": inputs["input_features"].float()}
     layers_to_scale = get_whisper_layers_to_scale(model)
-    modelQ = SimpleNamespace(
-        model=model, processor=None, calibration_samples=[(None, None)] * 2,
-        activation_quantization_roles=lambda: get_whisper_activation_roles(model),
-    )
-    path = tmp_path / "searched.pt"
+    modelQ = SimpleNamespace(model=model, processor=None, calibration_samples=[(None, None)] * 2)
+    path = tmp_path / "scales.pt"
     with torch.no_grad():
         before = model(**inputs).logits
-        obtain_scales(
-            modelQ, layers_to_scale, str(path), lambda _x, _text, _modelQ: model(**inputs), HEAD_DIM,
-            wbit=4, abit=8, weight_group_size=32, activation_group_size=32, activation_groupwise_roles=["attn_out", "fc2"],
-        )
+        obtain_scales(modelQ, layers_to_scale, str(path), lambda _x, _text, _modelQ: model(**inputs), HEAD_DIM)
         scales = torch.load(path)
         assert set(scales) == {names[0] for names, _ in layers_to_scale}
         assert all((scale > 0).all() for scale in scales.values())
@@ -185,3 +179,54 @@ def test_searched_scales_keep_whisper_exact(whisper, tmp_path):
         scale_model(SimpleNamespace(model=model, processor=None), None, layers_to_scale, HEAD_DIM, str(path))
         after = model(**inputs).logits
     assert (after - before).abs().max() < 1e-3
+
+
+def test_every_entry_gets_the_smoothquant_scale(whisper, tmp_path):
+    """s = amax^alpha / wmax^(1 - alpha) per entry, with amax the channel maximum of the input over the
+    calibration set and wmax the channel maximum of the entry's weights."""
+    model, inputs = whisper
+    model = model.float()
+    inputs = {**inputs, "input_features": inputs["input_features"].float()}
+    layers_to_scale = get_whisper_layers_to_scale(model)
+    modelQ = SimpleNamespace(model=model, processor=None, calibration_samples=[(None, None)] * 2)
+    moduledict = dict(model.named_modules())
+    layer = "model.encoder.layers.0.fc1"
+    seen = []
+    handle = moduledict[layer].register_forward_hook(lambda _m, args, _out: seen.append(args[0].detach().abs()))
+    path = tmp_path / "fixed.pt"
+    with torch.no_grad():
+        obtain_scales(modelQ, layers_to_scale, str(path), lambda _x, _text, _modelQ: model(**inputs), HEAD_DIM, alpha=0.5)
+    handle.remove()
+    scales = torch.load(path)
+    assert set(scales) == {names[0] for names, _ in layers_to_scale}
+    amax = torch.cat([x.reshape(-1, x.shape[-1]) for x in seen]).amax(dim=0)
+    wmax = moduledict[layer].weight.abs().amax(dim=0)
+    assert torch.allclose(scales[layer], amax ** 0.5 / (wmax ** 0.5 + 1e-7), rtol=1e-4)
+
+
+def test_an_alpha_outside_zero_to_one_is_rejected():
+    from omegaconf import OmegaConf
+    from asrq.transforms.scaling.base import ScalingTransformConfig
+
+    cfg = OmegaConf.create({"name": "scaling", "path": "", "obtain_scales": True, "use": True, "type": "smoothquant",
+                            "wbits": 4, "abits": 8, "alpha": 1.5, "model_name": "openai/whisper-large-v3"})
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        ScalingTransformConfig(cfg)
+
+
+def test_a_silent_channel_gets_the_minimum_scale_rather_than_zero(tmp_path):
+    """A channel that never fires on the calibration set has amax = 0, so s = 0 unclamped. Evaluation runs in
+    float16, where such a scale turns w * s into zeros and x / s into infinities the moment the channel fires."""
+    from asrq.transforms.scaling.base import MIN_SCALE
+
+    torch.manual_seed(0)
+    model = nn.Module()
+    model.fc = nn.Linear(4, 3)
+    x = torch.randn(8, 4)
+    x[:, 0] = 0
+    modelQ = SimpleNamespace(model=model, processor=None, calibration_samples=[(None, None)])
+    path = tmp_path / "scales.pt"
+    obtain_scales(modelQ, [(["fc"], None)], str(path), lambda _x, _text, _modelQ: model.fc(x), head_dim=4)
+    scale = torch.load(path)["fc"]
+    assert scale[0] == pytest.approx(MIN_SCALE)
+    assert (scale >= MIN_SCALE).all() and (scale[1:] > MIN_SCALE).all()

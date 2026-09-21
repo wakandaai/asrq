@@ -55,7 +55,8 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
         method=search_w4a$abits calibration.num_samples=128 \
         transform=rotation transform.path=$rotation \
         transform.search=evolution transform.num_samples=128 \
-        "transform.evolution.stage_samples=[16,64,128]" "transform.evolution.survivors=[16,4]" \
+        "transform.evolution.stage_samples=[]" "transform.evolution.survivors=[]" \
+        transform.evolution.random_offspring=32 transform.evolution.stages=1 \
         transform.evolution.offspring=32 2>&1 | tr '\r' '\n'
       stamp "$model W4A$abits rotation search end"
     else

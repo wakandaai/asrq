@@ -3,3 +3,6 @@ path: ""
 obtain_scales: True
 use: True
 type: smoothquant # or awq
+# Migration strength, one for every entry as SmoothQuant uses: s = amax^alpha / wmax^(1 - alpha), from the
+# per-channel input maxima over the calibration set and the weight maxima. 0.5 is SmoothQuant's default.
+alpha: 0.5

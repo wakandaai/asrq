@@ -8,7 +8,6 @@ from asrq.transforms.rotation.canary_qwen_utils import canary_qwen_logits_fn
 from asrq.transforms.scaling.canary_qwen_utils import get_canary_qwen_layers_to_scale
 from asrq.transforms.scaling.parakeet_ctc_utils import get_parakeet_ctc_layers_to_scale
 from asrq.transforms.scaling.whisper_utils import get_whisper_layers_to_scale
-from asrq.quantizers.activation import fake_quantize_activations
 import torch
 import torch.nn as nn
 
@@ -94,10 +93,15 @@ class ScalingTransformConfig(TransformConfig):
         self.activation_group_size = cfg.get("activation_group_size", -1)
         self.activation_symmetric = cfg.get("activation_symmetric", True)
         self.activation_groupwise_roles = list(cfg.get("activation_groupwise_roles", []) or [])
+        # The migration strength, one for every entry, as SmoothQuant uses.
+        self.alpha = float(cfg.get("alpha", 0.5))
+        if not 0 <= self.alpha <= 1:
+            raise ValueError(f"transform.alpha must be between 0 and 1, got {self.alpha}")
 
 
-ALPHAS = torch.linspace(0, 1, 10).tolist()
 ATTENTION_OUTPUTS = ("linear_out", "o_proj", "out_proj")
+# The smallest scale and weight maximum obtain_scales allows, as SmoothQuant's reference code clamps them.
+MIN_SCALE = 1e-5
 
 
 def _is_attention_output(name: str) -> bool:
@@ -109,55 +113,38 @@ def _input_width_scale(scale: torch.Tensor, in_features: int) -> torch.Tensor:
     return scale.repeat(in_features // scale.numel())
 
 
-def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, type="smoothquant", wbit=4, abit=8,
-                  weight_group_size=None, activation_group_size=-1, activation_groupwise_roles=(),
-                  activation_symmetric=True, search_samples=128):
-    """Search one smoothing scale per entry of ``layers_to_scale`` and save ``{entry's first layer: scale}``.
+def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, type="smoothquant", alpha=0.5):
+    """Compute one smoothing scale per entry of ``layers_to_scale`` and save ``{entry's first layer: scale}``.
 
-    Statistics first: over every calibration sample, the per-channel maximum (smoothquant) or mean (awq) of
-    each layer's absolute input. An attention output projection's input is folded to ``head_dim`` channels,
-    since its scale is shared by every head (the reciprocal is folded into v_proj's rows, head by head).
-
-    Then a grid search per entry, on the first ``search_samples`` calibration samples. The candidates are no
-    scaling, ``s = 1``, and for each alpha
+    Over every calibration sample, the per-channel maximum (smoothquant) or mean (awq) of each layer's absolute
+    input is collected. An attention output projection's input is folded to ``head_dim`` channels, since its
+    scale is shared by every head (the reciprocal is folded into v_proj's rows, head by head). Each entry then
+    gets, with one migration strength ``alpha`` for every entry as SmoothQuant uses,
 
         smoothquant:  s = amax ** alpha / wmax ** (1 - alpha)
         awq:          s = amean ** alpha
 
-    with ``wmax`` the per-channel weight maximum over all of the entry's layers, which is the scale the
-    entry is given. Each candidate is scored by the output error of every layer in the entry under the
-    quantization the model is evaluated with,
+    with ``wmax`` the per-channel weight maximum over all of the entry's layers, so layers sharing one input
+    (q, k, v) share one scale. The scale depends on neither the weight nor the activation bits.
 
-        || X @ W.T - Qa(X / s) @ Qw(W * s).T ||^2
-
-    where Qw rounds the weight symmetrically with one scale per ``weight_group_size`` inputs of each row
-    (per row when it is None or does not divide the width), as GPTQ groups it, and Qa quantizes activations
-    as evaluation does: groups of ``activation_group_size`` for the layer's role in
-    ``activation_groupwise_roles``, one scale per token otherwise, nothing at 16 bits or more. The entry
-    keeps the candidate with the smallest error summed over its layers, so layers sharing one input (q, k,
-    v) are scored together, and a layer that no alpha improves stays unscaled.
+    Both the weight maxima and the scales are clamped below at ``MIN_SCALE``, as SmoothQuant's reference code
+    does. A channel nearly silent on the calibration set would otherwise get a scale around 1e-8; evaluation
+    runs in float16, where ``w * s`` then underflows to zero while ``x / s`` overflows as soon as that channel
+    is active, and the model outputs NaNs even with nothing quantized.
 
     Args:
-        modelQ: The model wrapper; its activation_quantization_roles() give each layer's role.
+        modelQ: The model wrapper, whose calibration_samples are run.
         layers_to_scale: ``[(layer_names, prev), ...]``, as scale_model reads them.
         scale_path: Where the scales are saved.
         forward_fn: ``forward_fn(audio, text, modelQ)`` runs one calibration sample.
         head_dim: Attention head width.
         type: ``"smoothquant"`` or ``"awq"``.
-        wbit: Weight bits.
-        abit: Activation bits.
-        weight_group_size: Inputs per weight scale.
-        activation_group_size: Features per activation group for the group-wise roles.
-        activation_groupwise_roles: Roles quantized group-wise.
-        activation_symmetric: Symmetric activation quantization.
-        search_samples: Calibration samples the grid search runs on.
+        alpha: The migration strength, between 0 (all scale on the weights) and 1 (all on the activations).
     """
     if type not in ("smoothquant", "awq"):
         raise ValueError(f"Unsupported scaling type: {type}")
     model = modelQ.model
     moduledict = dict(model.named_modules())
-    roles = modelQ.activation_quantization_roles()
-    groupwise = set(activation_groupwise_roles)
 
     statistics = {}
     counts = {}
@@ -181,86 +168,29 @@ def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, typ
         for name in names:
             w = weight_2d(moduledict[name]).abs().float().amax(dim=0)
             maxima.append(w.reshape(-1, head_dim).amax(dim=0) if _is_attention_output(name) else w)
-        return torch.stack(maxima).amax(dim=0)
-
-    def run(samples, hooks):
-        handles = [moduledict[name].register_forward_hook(hook) for name, hook in hooks.items()]
-        try:
-            with torch.no_grad():
-                for x, text in samples:
-                    forward_fn(x, text, modelQ)
-        finally:
-            for handle in handles:
-                handle.remove()
+        return torch.stack(maxima).amax(dim=0).clamp(min=MIN_SCALE)
 
     names = [name for layer_names, _ in layers_to_scale for name in layer_names]
-    run(modelQ.calibration_samples, {name: statistics_hook(name) for name in names})
+    handles = [moduledict[name].register_forward_hook(statistics_hook(name)) for name in names]
+    try:
+        with torch.no_grad():
+            for x, text in modelQ.calibration_samples:
+                forward_fn(x, text, modelQ)
+    finally:
+        for handle in handles:
+            handle.remove()
     if type == "awq":
         statistics = {name: total / counts[name] for name, total in statistics.items()}
 
-    def candidate_scale(layer_names, alpha):
+    final_scales = {}
+    for layer_names, _ in layers_to_scale:
         activation = statistics[layer_names[0]]
-        if alpha is None:
-            return torch.ones_like(activation)
         if type == "smoothquant":
             scale = activation ** alpha / (weight_max(layer_names) ** (1 - alpha) + 1e-7)
         else:
             scale = activation ** alpha
-        return scale.where(scale > 0, torch.full_like(scale, 1e-3))
-
-    def quantize_weight(w):
-        size = weight_group_size if weight_group_size and w.shape[1] % weight_group_size == 0 else -1
-        return fake_quantize_activations(w, wbit, size, True)
-
-    def quantize_input(name, x):
-        if abit >= 16:
-            return x
-        size = activation_group_size if roles.get(name) in groupwise else -1
-        if size not in (-1, 0) and x.shape[-1] % size:
-            size = -1
-        return fake_quantize_activations(x, abit, size, activation_symmetric)
-
-    candidates = [None, *ALPHAS]
-    entry_of = {name: index for index, (layer_names, _) in enumerate(layers_to_scale) for name in layer_names}
-    errors = torch.zeros(len(layers_to_scale), len(candidates), dtype=torch.float64)
-    current = {}
-
-    def error_hook(name):
-        module = moduledict[name]
-        weight = weight_2d(module).float()
-
-        def hook(_module, inputs, output):
-            x = channels_last(module, inputs[0].detach().float())
-            x = x.reshape(-1, x.shape[-1])
-            x = x[x.abs().sum(dim=1) != 0]
-            reference = x @ weight.T
-            scale = current[name]
-            if _is_attention_output(name):
-                scale = _input_width_scale(scale, weight.shape[1])
-            quantized = quantize_input(name, x / scale) @ quantize_weight(weight * scale).T
-            errors[entry_of[name], current["candidate"]] += ((reference - quantized) ** 2).sum().item()
-        return hook
-
-    hooks = {name: error_hook(name) for name in names}
-    for index, alpha in enumerate(candidates):
-        current["candidate"] = index
-        for layer_names, _ in layers_to_scale:
-            scale = candidate_scale(layer_names, alpha)
-            for name in layer_names:
-                current[name] = scale
-        run(modelQ.calibration_samples[:search_samples], hooks)
-        print(f"Scored candidate {'s=1' if alpha is None else f'alpha={alpha:.2f}'}")
-
-    chosen = errors.argmin(dim=1).tolist()
-    final_scales = {}
-    for (layer_names, _), index in zip(layers_to_scale, chosen):
-        final_scales[layer_names[0]] = candidate_scale(layer_names, candidates[index]).cpu()
-    summary = {}
-    for index in chosen:
-        label = "s=1" if candidates[index] is None else f"{candidates[index]:.2f}"
-        summary[label] = summary.get(label, 0) + 1
-    print(f"Chosen scales per entry: {dict(sorted(summary.items()))}")
-    print(f"Saving scales for {len(final_scales)} entries to {scale_path}")
+        final_scales[layer_names[0]] = scale.clamp(min=MIN_SCALE).cpu()
+    print(f"alpha={alpha:.2f} for all {len(final_scales)} entries; saving the scales to {scale_path}")
     torch.save(final_scales, scale_path)
 
 
@@ -345,12 +275,7 @@ class ScalingTransform(BaseTransform):
         if self.cfg.obtain_scales is False:
             return
         layers_to_scale, _, forward_fn, head_dim  = self.prepare_for_transform(modelQ)
-        obtain_scales(
-            modelQ, layers_to_scale, self.cfg.path, forward_fn, head_dim, self.cfg.type, self.cfg.wbits, self.cfg.abits,
-            weight_group_size=self.cfg.wgroup, activation_group_size=self.cfg.activation_group_size,
-            activation_groupwise_roles=self.cfg.activation_groupwise_roles,
-            activation_symmetric=self.cfg.activation_symmetric,
-        )
+        obtain_scales(modelQ, layers_to_scale, self.cfg.path, forward_fn, head_dim, self.cfg.type, self.cfg.alpha)
 
     def prepare_for_transform(self, modelQ):
         if self.cfg.model_name == ModelNames.OPENAI_WHISPER_LARGE_V3:

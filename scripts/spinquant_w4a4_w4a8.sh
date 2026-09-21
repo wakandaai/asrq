@@ -13,7 +13,8 @@
 #          calibration utterances for one epoch at learning rate 0.5, with the activations fake-quantized as
 #          evaluation will quantize them. The objective is transform.objective=auto, which for Cayley is the
 #          model's own training loss on the calibration transcripts, as SpinQuant optimises, rather than the KL
-#          to the full-precision model.
+#          to the full-precision model. On Parakeet that loss is the CTC loss, whose backward has no
+#          deterministic CUDA kernel, so its search passes deterministic=false.
 #          Quantization: GPTQ on 2048 calibration utterances and nothing else -- no scale recovery and no block
 #          output refitting. The Linears a rotation inserts after each Conformer block's output norm are still
 #          quantized at 4 bits, so this baseline carries the same weights as the recipe it is compared with;
@@ -32,6 +33,9 @@ PROJECT_DIR=${2:-/home/ubuntu/asrq}
 source "$CONDA_ACTIVATE" asrq
 cd "$PROJECT_DIR"
 declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
+# Parakeet's CE objective is the CTC loss, and ctc_loss_backward has no deterministic CUDA kernel, so its search
+# warns instead of refusing. The candidate draws and the dataloader stay seeded; only the gradient is affected.
+declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
 # Only the Conformer models have block-output Linears; quantizing them at 4 bits keeps this baseline's weights
 # comparable with the recipe's, even though nothing here refits them. Whisper has no such setting.
 declare -A BLOCK_OUT=(
@@ -53,7 +57,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
     if [ ! -f $rotation ]; then
       stamp "$model W4A$abits Cayley rotation start"
       python -u asrq/rot-exp.py model=$model $GRID $EXPERIMENT $ACTIVATIONS activation_bits=$abits \
-        method=cayley_w4a$abits calibration.num_samples=800 \
+        ${DETERMINISTIC[$model]} method=cayley_w4a$abits calibration.num_samples=800 \
         transform=rotation transform.path=$rotation \
         transform.search=cayley transform.num_samples=800 transform.epochs=1 \
         transform.learning_rate=0.5 2>&1 | tr '\r' '\n'

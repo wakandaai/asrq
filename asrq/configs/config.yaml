@@ -5,6 +5,10 @@ defaults:
   - _self_
 
 seed: 42
+# rot-exp.py refuses operations without a deterministic implementation, so a search is reproducible. false warns
+# instead, which a Cayley search on Parakeet needs: its CE objective is the CTC loss, whose backward has no
+# deterministic CUDA kernel.
+deterministic: True
 
 calibration:
   num_samples: 2048
