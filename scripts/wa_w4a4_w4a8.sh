@@ -45,7 +45,7 @@ EXPERIMENT="exp_name=wa_w4a4_w4a8 wandb.enabled=true"
 ACTIVATIONS="activation_symmetric=True activation_group_size=128"
 GRID="quantizer=gptq quantizer.bits=4 quantizer.symmetric=True quantizer.group_size=128"
 
-for model in ${MODELS:-parakeet whisper canary_qwen}; do
+for model in ${MODELS:-whisper canary_qwen}; do
   for abits in ${ABITS:-4 8}; do
     rotation=outputs/rotation/evo128_wa_w4a${abits}_${model}.pt
 
@@ -55,9 +55,10 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
         method=search_w4a$abits calibration.num_samples=128 \
         transform=rotation transform.path=$rotation \
         transform.search=evolution transform.num_samples=128 \
-        "transform.evolution.stage_samples=[]" "transform.evolution.survivors=[]" \
-        transform.evolution.random_offspring=32 transform.evolution.stages=1 \
-        transform.evolution.offspring=32 2>&1 | tr '\r' '\n'
+        transform.evolution.stages=1 \
+        transform.evolution.offspring=32 \
+        transform.evolution.random_offspring=32 \
+        transform.evolution.generations=1 2>&1 | tr '\r' '\n'
       stamp "$model W4A$abits rotation search end"
     else
       stamp "$model W4A$abits rotation exists, skipping the search"

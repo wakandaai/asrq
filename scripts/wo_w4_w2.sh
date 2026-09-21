@@ -54,8 +54,10 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
         calibration.num_samples=128 transform=rotation transform.path=$rotation \
         transform.weight_only=true transform.weight_only_quantizer=gptq \
         transform.search=evolution transform.num_samples=128 \
-        "transform.evolution.stage_samples=[16,64,128]" "transform.evolution.survivors=[16,4]" \
-        transform.evolution.offspring=32 2>&1 | tr '\r' '\n'
+        transform.evolution.stages=1 \
+        transform.evolution.offspring=32 \
+        transform.evolution.random_offspring=32 \
+        transform.evolution.generations=1 2>&1 | tr '\r' '\n'
       stamp "$model W$bits rotation search end"
     else
       stamp "$model W$bits rotation exists, skipping the search"
