@@ -218,8 +218,82 @@ def test_the_search_stops_when_every_mutation_of_the_parent_has_been_seen():
         return 1.0
 
     config = EvolutionConfig(generations=20, offspring=4, survivors=(2, 1), stage_samples=(4, 4, 4), flips=1,
-                             mutate="s1")
+                             mutate="s1", random_offspring=0)
     parent = random_sign_vectors({None: 6}, torch.Generator().manual_seed(0), "cpu")
     evolve_signs(parent, fitness, [4], config, log=lines.append)
     assert any("no unseen mutation" in line for line in lines)
     assert len(config.history) - 1 < config.generations
+
+
+def test_a_single_stage_scores_every_child_once_on_the_whole_set():
+    fitness, calls = _target_problem()
+    config = EvolutionConfig(generations=2, offspring=5, stages=1, stage_samples=(64,), mutate="s1")
+    assert config.survivors == ()
+    parent = random_sign_vectors({None: 64}, torch.Generator().manual_seed(0), "cpu")
+    evolve_signs(parent, fitness, [4] * 16, config, log=lambda _line: None)
+    assert calls == [16] + [16] * 5 + [16] * 5
+    assert stage_cost(config, 64) == 5 * 64
+
+
+def test_two_stages_use_one_survivor_count():
+    fitness, calls = _target_problem()
+    config = EvolutionConfig(generations=1, offspring=6, stages=2, survivors=(3, 2), stage_samples=(8, 64),
+                             mutate="s1")
+    assert config.survivors == (3,)
+    evolve_signs(random_sign_vectors({None: 64}, torch.Generator().manual_seed(0), "cpu"), fitness, [4] * 16,
+                 config, log=lambda _line: None)
+    assert calls == [16] + [2] * 6 + [16] * 3
+    assert stage_cost(config, 64) == 6 * 8 + 3 * 64
+
+
+@pytest.mark.parametrize("settings", [
+    {"stages": 0}, {"stages": 2, "survivors": ()}, {"stages": 3, "survivors": (2, 4)},
+    {"stages": 1, "stage_samples": (8, 64)},
+])
+def test_inconsistent_stage_settings_are_rejected(settings):
+    with pytest.raises(ValueError):
+        EvolutionConfig(**settings)
+
+
+def test_the_last_offspring_is_drawn_at_random_and_the_others_are_mutations():
+    from asrq.transforms.rotation.hadamard_search import _new_children
+
+    parent = random_sign_vectors({None: 64}, torch.Generator().manual_seed(0), "cpu")
+    config = EvolutionConfig(offspring=6, flips=2, mutate="s1", random_offspring=1)
+    children, random_keys = _new_children(parent, config, torch.Generator().manual_seed(1), {signs_key(parent)})
+    assert len(children) == 6 and len(random_keys) == 1
+    distances = [int((child[None][0] != parent[None][0]).sum() + (child[None][1] != parent[None][1]).sum())
+                 for child in children]
+    assert distances[:5] == [2] * 5, "every mutated child flips exactly `flips` positions"
+    assert distances[5] > 10, "the random child is far from the parent, not a step away from it"
+    assert signs_key(children[5]) in random_keys
+
+
+def test_a_winning_random_child_is_recorded():
+    target = random_sign_vectors({None: 32}, torch.Generator().manual_seed(7), "cpu")[None][0]
+
+    def fitness(signs, batches):
+        return float((signs[None][0] != target).float().mean())
+
+    config = EvolutionConfig(generations=3, offspring=4, survivors=(2, 1), stage_samples=(4, 4, 8), flips=1,
+                             mutate="s1", random_offspring=1)
+    parent = random_sign_vectors({None: 32}, torch.Generator().manual_seed(0), "cpu")
+    evolve_signs(parent, fitness, [4] * 2, config, log=lambda _line: None)
+    assert all("best_child_random" in record for record in config.history[1:])
+
+
+@pytest.mark.parametrize("setting, offspring, resolved", [(0.5, 32, 16), (0.5, 9, 5), (1, 8, 1), (0, 8, 0), (4, 8, 4)])
+def test_random_offspring_takes_a_count_or_a_fraction(setting, offspring, resolved):
+    assert EvolutionConfig(offspring=offspring, random_offspring=setting).random_offspring == resolved
+
+
+def test_half_the_generation_is_drawn_at_random():
+    from asrq.transforms.rotation.hadamard_search import _new_children
+
+    parent = random_sign_vectors({None: 64}, torch.Generator().manual_seed(0), "cpu")
+    config = EvolutionConfig(offspring=8, flips=2, mutate="s1", random_offspring=0.5)
+    children, random_keys = _new_children(parent, config, torch.Generator().manual_seed(1), {signs_key(parent)})
+    distances = [int((child[None][0] != parent[None][0]).sum() + (child[None][1] != parent[None][1]).sum())
+                 for child in children]
+    assert distances[:4] == [2] * 4 and all(distance > 10 for distance in distances[4:])
+    assert len(random_keys) == 4

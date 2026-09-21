@@ -28,16 +28,21 @@ flips both vectors.
 One generation, as in EvoPress's multi-step selection:
 
 1. The parent is mutated into ``offspring`` children, each by flipping ``flips`` positions drawn uniformly
-   from the mutated sign vectors (of every stream). No two children of a generation are the same, and no
-   child repeats a candidate an earlier generation already scored and discarded: every candidate's signs are
-   hashed into an archive that the mutation draws against.
-2. Stage 1 scores every child on a random subset of ``stage_samples[0]`` calibration samples, and the best
-   ``survivors[0]`` go on.
-3. Stage 2 scores those on a new random subset of ``stage_samples[1]`` samples, and the best
-   ``survivors[1]`` go on.
-4. Stage 3 scores the remaining children on the full evaluation set, the first ``stage_samples[2]``
-   samples, the same set the parent was scored on. The best child replaces the parent only if its fitness
-   is lower, so the parent's fitness never increases.
+   from the mutated sign vectors (of every stream), except the last ``random_offspring`` of them, which are
+   drawn at random instead. A random child sits at the distance two independent sign vectors do, so it is a
+   restart rather than a step: it costs one candidate and can only be accepted by beating the parent on the
+   full set, which keeps an unlucky starting point from trapping the search. No two children of a generation
+   are the same, and no child repeats a candidate an earlier generation already scored and discarded: every
+   candidate's signs are hashed into an archive that the mutation draws against.
+2. Each selection stage but the last scores the children it was given on a random subset of that stage's
+   calibration samples and keeps the best ``survivors[i]`` of them.
+3. The last stage scores what is left on the full evaluation set, the same set the parent was scored on. The
+   best child replaces the parent only if its fitness is lower, so the parent's fitness never increases.
+
+``stages`` sets how many there are. With ``stages: 1`` there is no funnel: every child is scored once, on the
+full set, so the best of them is chosen exactly, at ``offspring`` times the cost of one evaluation. More stages
+spend most of the budget on the few children that reach the end, which buys more children per unit of compute
+at the price of choosing among them from noisy subsets.
 
 The subsets are drawn anew each generation and shared by all children within a stage, so children are
 compared on the same data while no small subset is selected against repeatedly. Few flips keep a child
@@ -64,10 +69,14 @@ class EvolutionConfig:
     Args:
         generations: Number of generations.
         offspring: Children per generation (lambda).
-        survivors: Children kept after stage 1 and after stage 2.
-        stage_samples: Calibration samples scored in stages 1, 2 and 3; None chooses them from the
-            calibration set's size with default_stage_samples.
+        stages: Selection stages per generation; 1 scores every child once on the full set.
+        survivors: Children kept after each stage but the last, so ``stages - 1`` numbers; longer settings are
+            truncated, which lets one setting serve several stage counts.
+        stage_samples: Calibration samples scored in each stage; None chooses them from the calibration set's
+            size with default_stage_samples.
         flips: Sign positions flipped per mutation.
+        random_offspring: Children per generation drawn at random rather than mutated from the parent. Below 1
+            it is a fraction of offspring, so 0.5 splits the generation between mutations and random draws.
         mutate: ``"s1_s2"`` flips positions of both sign vectors, ``"s1"`` only of s1, and ``"auto"`` chooses
             ``"s1"`` for symmetric activation quantization and ``"s1_s2"`` for asymmetric; see resolve_mutate.
         seed: Seed of the initial signs, the mutations and the stage subsets.
@@ -77,28 +86,43 @@ class EvolutionConfig:
 
     generations: int = 8
     offspring: int = 32
-    survivors: Tuple[int, int] = (4, 2)
-    stage_samples: Optional[Tuple[int, int, int]] = None
+    stages: int = 3
+    survivors: Tuple[int, ...] = (4, 2)
+    stage_samples: Optional[Tuple[int, ...]] = None
     flips: int = 2
+    random_offspring: float = 1
     mutate: str = "auto"
     seed: int = 0
     cache_teacher: bool = True
     history: List[dict] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
-        self.survivors = tuple(self.survivors)
+        if self.stages < 1:
+            raise ValueError(f"stages must be at least 1, got {self.stages}")
+        self.survivors = tuple(self.survivors)[: self.stages - 1]
         if self.stage_samples is not None:
             self.stage_samples = tuple(self.stage_samples)
         if self.mutate not in ("auto", "s1_s2", "s1"):
             raise ValueError(f"mutate must be 'auto', 's1_s2' or 's1', got {self.mutate!r}")
-        if len(self.survivors) != 2 or not self.offspring >= self.survivors[0] >= self.survivors[1] >= 1:
+        if len(self.survivors) != self.stages - 1:
             raise ValueError(
-                f"need offspring >= survivors[0] >= survivors[1] >= 1, got {self.offspring} and {self.survivors}"
+                f"{self.stages} stages need {self.stages - 1} survivor counts, got {self.survivors}"
             )
-        if self.stage_samples is not None and len(self.stage_samples) != 3:
-            raise ValueError(f"stage_samples needs three sizes, got {self.stage_samples}")
+        kept = [self.offspring, *self.survivors]
+        if any(before < after or after < 1 for before, after in zip(kept, kept[1:])):
+            raise ValueError(f"survivors must not grow and must stay at least 1, got {self.offspring} and {self.survivors}")
+        if self.stage_samples is not None and len(self.stage_samples) != self.stages:
+            raise ValueError(f"stage_samples needs {self.stages} sizes, got {self.stage_samples}")
         if self.flips < 1:
             raise ValueError(f"flips must be at least 1, got {self.flips}")
+        if 0 < self.random_offspring < 1:
+            self.random_offspring = max(1, int(self.offspring * self.random_offspring + 0.5))
+        self.random_offspring = int(self.random_offspring)
+        if not 0 <= self.random_offspring <= self.offspring:
+            raise ValueError(
+                f"random_offspring must be between 0 and offspring ({self.offspring}), or a fraction below 1, "
+                f"got {self.random_offspring}"
+            )
 
     @classmethod
     def from_mapping(cls, settings: Optional[Mapping]) -> "EvolutionConfig":
@@ -117,12 +141,15 @@ class EvolutionConfig:
         return settings
 
 
-def default_stage_samples(num_samples: int) -> Tuple[int, int, int]:
+def default_stage_samples(num_samples: int, stages: int = 3) -> Tuple[int, ...]:
     """Stage sizes for a calibration set: 8, 16, 64 for 64 samples; 16, 32, 128 for 128; 8, 64, 256 for 256;
     16, 64, 768 for 768.
 
-    The last stage is the whole set; the first two are capped by it.
+    The last stage is the whole set; the earlier ones are capped by it. With fewer than three stages the
+    earlier sizes are dropped from the front, so one stage is the whole set alone.
     """
+    if stages == 1:
+        return (num_samples,)
     if num_samples <= 64:
         first, second = 8, 16
     elif num_samples <= 128:
@@ -131,7 +158,8 @@ def default_stage_samples(num_samples: int) -> Tuple[int, int, int]:
         first, second = 8, 64
     else:
         first, second = 16, 64
-    return min(first, num_samples), min(second, num_samples), num_samples
+    sizes = (min(first, num_samples), min(second, num_samples), num_samples)
+    return sizes[3 - stages:] if stages < 3 else sizes
 
 
 def _hadamard(width: int) -> torch.Tensor:
@@ -197,22 +225,33 @@ def signs_key(signs: SignVectors) -> bytes:
 
 def _new_children(
     parent: SignVectors, config: EvolutionConfig, generator: torch.Generator, archive: set, attempts: int = 200,
-) -> List[SignVectors]:
-    """``config.offspring`` mutations of parent, none equal to each other or to a candidate in archive.
+) -> Tuple[List[SignVectors], set]:
+    """``config.offspring`` children, none equal to each other or to a candidate in archive.
 
-    Each child's key is added to the archive as it is made. A child that cannot be made distinct within
-    ``attempts`` tries is skipped, which only happens when the mutations around the parent are exhausted.
+    All but the last ``config.random_offspring`` are mutations of parent; those are drawn at random. Each
+    child's key is added to the archive as it is made. A child that cannot be made distinct within ``attempts``
+    tries is skipped, which only happens when the mutations around the parent are exhausted.
+
+    Returns:
+        ``(children, random_keys)``: the children and the signs_key of those drawn at random.
     """
-    children = []
-    for _ in range(config.offspring):
+    widths = {stream: vectors[0].numel() for stream, vectors in parent.items()}
+    device = next(iter(parent.values()))[0].device
+    mutations = config.offspring - config.random_offspring
+    children, random_keys = [], set()
+    for index in range(config.offspring):
+        drawn = index >= mutations
         for _ in range(attempts):
-            child = mutate_signs(parent, config.flips, config.mutate, generator)
+            child = (random_sign_vectors(widths, generator, device) if drawn
+                     else mutate_signs(parent, config.flips, config.mutate, generator))
             key = signs_key(child)
             if key not in archive:
                 archive.add(key)
                 children.append(child)
+                if drawn:
+                    random_keys.add(key)
                 break
-    return children
+    return children, random_keys
 
 
 def _subset(sample_counts: Sequence[int], samples: int, generator: Optional[torch.Generator]) -> List[int]:
@@ -247,13 +286,14 @@ def evolve_signs(
     if config.mutate == "auto":
         raise ValueError("resolve mutate='auto' with EvolutionConfig.resolve_mutate before the search")
     total = sum(sample_counts)
-    stages = config.stage_samples or default_stage_samples(total)
+    stages = config.stage_samples or default_stage_samples(total, config.stages)
     generator = torch.Generator().manual_seed(config.seed)
     archive = {signs_key(parent)}
-    evaluation_set = _subset(sample_counts, min(stages[2], total), None)
+    evaluation_set = _subset(sample_counts, min(stages[-1], total), None)
     parent_fitness = fitness(parent, evaluation_set)
     log(f"evolution: initial fitness {parent_fitness:.6f} on {sum(sample_counts[i] for i in evaluation_set)} samples; "
-        f"stages {stages}, {config.offspring} offspring, survivors {config.survivors}, {config.flips} flips of {config.mutate}")
+        f"stages {stages}, {config.offspring} offspring ({config.random_offspring} drawn at random), "
+        f"survivors {config.survivors}, {config.flips} flips of {config.mutate}")
     config.history.append({"generation": 0, "fitness": parent_fitness, "accepted": True})
     tracking.step_metric("search", "search/generation")
     tracking.summary({"search/name": "evolution", "search/stages": list(stages), "search/offspring": config.offspring,
@@ -263,11 +303,11 @@ def evolve_signs(
     tracking.log({"search/generation": 0, "search/fitness": parent_fitness})
     for generation in range(1, config.generations + 1):
         start = time.time()
-        children = _new_children(parent, config, generator, archive)
+        children, random_keys = _new_children(parent, config, generator, archive)
         if not children:
             log(f"  generation {generation}/{config.generations}: no unseen mutation of the parent, stopping")
             break
-        for stage, keep in ((0, config.survivors[0]), (1, config.survivors[1])):
+        for stage, keep in enumerate(config.survivors):
             subset = _subset([sample_counts[i] for i in evaluation_set], stages[stage], generator)
             batches = [evaluation_set[i] for i in subset]
             scores = [fitness(child, batches) for child in children]
@@ -276,17 +316,20 @@ def evolve_signs(
         scores = [fitness(child, evaluation_set) for child in children]
         best = min(range(len(children)), key=scores.__getitem__)
         accepted = scores[best] < parent_fitness
+        from_random = signs_key(children[best]) in random_keys
         if accepted:
             parent, parent_fitness = children[best], scores[best]
         config.history.append({
             "generation": generation, "fitness": parent_fitness, "best_child": scores[best], "accepted": accepted,
+            "best_child_random": from_random,
         })
         log(f"  generation {generation}/{config.generations}: parent {parent_fitness:.6f}, best child "
-            f"{scores[best]:.6f}{' (accepted)' if accepted else ''}, {len(archive)} candidates seen, "
-            f"{time.time() - start:.1f}s")
+            f"{scores[best]:.6f}{' (accepted)' if accepted else ''}{' (a random candidate)' if from_random else ''}, "
+            f"{len(archive)} candidates seen, {time.time() - start:.1f}s")
         tracking.log({
             "search/generation": generation, "search/fitness": parent_fitness, "search/best_child": scores[best],
-            "search/accepted": int(accepted), "search/candidates_seen": len(archive),
+            "search/accepted": int(accepted), "search/best_child_random": int(from_random),
+            "search/candidates_seen": len(archive),
             "search/generation_seconds": time.time() - start,
         })
     tracking.summary({"search/final_fitness": parent_fitness,
@@ -296,7 +339,8 @@ def evolve_signs(
 
 def stage_cost(config: EvolutionConfig, num_samples: int) -> int:
     """Calibration samples scored per generation, a measure of a generation's cost."""
-    stages = config.stage_samples or default_stage_samples(num_samples)
-    return (config.offspring * stages[0] + config.survivors[0] * stages[1]
-            + config.survivors[1] * min(stages[2], num_samples))
+    stages = config.stage_samples or default_stage_samples(num_samples, config.stages)
+    scored = [config.offspring, *config.survivors]
+    sizes = [*stages[:-1], min(stages[-1], num_samples)]
+    return sum(count * size for count, size in zip(scored, sizes))
 

@@ -13,7 +13,10 @@ hadamard_random_signs: True
 learn_r2: True
 # online Hadamard on every fc2 input (False: fc2 input unrotated)
 fc2_online_hadamard: True
-objective: kl
+# What the search minimises: ce (the model's training loss on the calibration transcripts), kl (the divergence
+# from the full-precision model's logits, which costs a teacher pass) or auto, which is ce for Cayley SGD and kl
+# for the evolutionary search, the only objective it supports.
+objective: auto
 # 0: full-width R1; otherwise block-diagonal R1 with this block width (use the group size)
 r1_block_size: 0
 use: True
@@ -41,16 +44,25 @@ weight_only_quantizer: null
 evolution:
   # whisper-large-v3, 64 samples, float32: ~150 s per generation, so 8 generations ~ Cayley SGD's 200 steps (~19 min)
   generations: 8
-  # children per generation, and how many survive stage 1 and stage 2 (stage 3 scores the rest on all samples).
-  # No two children of a generation are the same, and no child repeats a candidate an earlier generation scored.
+  # children per generation. No two children of a generation are the same, and no child repeats a candidate an
+  # earlier generation scored.
   offspring: 32
+  # selection stages per generation; 1 scores every child once on the whole set, so the best of them is chosen
+  # exactly, and more stages spend most of the budget on the few children that reach the last one.
+  stages: 3
+  # children kept after each stage but the last, so stages - 1 numbers; a longer list is truncated
   survivors: [4, 2]
-  # samples scored in stages 1, 2, 3; null: 8/16/N for N <= 64, 16/32/N for N <= 128, 8/64/N for N <= 256,
+  # samples scored in each stage; null: 8/16/N for N <= 64, 16/32/N for N <= 128, 8/64/N for N <= 256,
   # 16/64/N above
   stage_samples: null
   # sign positions flipped per child. mutate: s1_s2 draws them from both sign vectors, s1 from s1 only, auto
   # picks s1 when activation_symmetric (s2 then does not change the fitness) and s1_s2 when asymmetric
   flips: 2
+  # children per generation drawn at random instead of mutated from the parent, the last ones of the batch; below
+  # 1 it is a fraction of offspring, so 0.5 splits the generation in half. A random child is a restart, not a
+  # step: it is accepted only by beating the parent on the full set, so it costs one candidate and guards against
+  # an unlucky starting point. 0 turns it off.
+  random_offspring: 0.5
   mutate: auto
   seed: 0
   # keep the full-precision logits of every batch on the CPU instead of recomputing them per candidate

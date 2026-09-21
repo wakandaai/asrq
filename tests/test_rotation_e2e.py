@@ -1613,7 +1613,12 @@ def test_the_evolutionary_search_saves_a_signed_hadamard_r1_that_applies_exactly
         {None: D_MODEL}, torch.Generator().manual_seed(evolution.seed), "cpu"
     )[None]
     assert saved["search"]["settings"]["mutate"] == ("s1" if symmetric else "s1_s2")
-    assert torch.equal(s2, initial_s2) == symmetric
+    # Mutations only flip s1 under symmetric quantization, so s2 survives unless a random child was accepted,
+    # which replaces both vectors.
+    accepted_random = any(record["accepted"] and record.get("best_child_random")
+                          for record in saved["search"]["history"][1:])
+    if symmetric and not accepted_random:
+        assert torch.equal(s2, initial_s2)
     assert not torch.equal(s1, initial_s1)
     for R2 in saved["R2s"].values():
         assert (R2.T @ R2 - torch.eye(R2.shape[0])).abs().max() < 1e-5

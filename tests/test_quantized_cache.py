@@ -107,6 +107,8 @@ def test_the_run_directory_name_carries_the_settings_and_the_time():
     name = experiment_run_name(_cfg("quantizer.bits=2", "quantizer.symmetric=False", "activation_bits=4", "method=demo"))
     settings, stamp = name.rsplit("_", 1)
     assert settings == "openai-whisper-large-v3_demo_gptq_w2g128asym_a4_rotation"
+    named = experiment_run_name(_cfg("method=demo", "exp_name=sweep"))
+    assert named.startswith("sweep_openai-whisper-large-v3_demo_")
     day, month, year, second, minute, hour = stamp.split("-")
     now = datetime.datetime.now()
     assert (int(day), int(month), int(year), int(hour)) == (now.day, now.month, now.year % 100, now.hour)

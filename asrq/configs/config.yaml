@@ -26,6 +26,9 @@ activation_symmetric: True
 # q, k, v and fc1 read the R1-rotated residual stream and are quantized per token; attn_out
 # (head-wise R2 basis) and fc2 (block online Hadamard) keep one scale per group.
 activation_groupwise_roles: [attn_out, fc2]
+# Name of the experiment these runs belong to, e.g. weight_only_w4_w2. It groups the runs in wandb and prefixes
+# their results directory, so one experiment's runs stay together; method names the run within it.
+exp_name: null
 create_audio_files: True
 # Reuse quantized weights: exp.py saves the quantized model here after quantizing, and loads it instead of quantizing
 # again when the file exists. auto names it outputs/quantized/<model>-<hash of every setting that determines the

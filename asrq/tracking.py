@@ -26,7 +26,8 @@ def start(cfg, job_type: str, name: Optional[str] = None):
 
     Args:
         cfg: The composed experiment config; ``cfg.wandb`` holds project, entity, group, tags and mode, and the
-            whole config is stored as the run's config.
+            whole config is stored as the run's config. The run is grouped by ``cfg.exp_name`` unless
+            ``wandb.group`` overrides it, and named by run_name.
         job_type: ``"rotation"`` for rot-exp.py, ``"quantize"`` for exp.py.
         name: The run's name; a default is built from the model, method and job type.
     """
@@ -44,14 +45,15 @@ def start(cfg, job_type: str, name: Optional[str] = None):
     from omegaconf import OmegaConf
 
     container = OmegaConf.to_container(cfg, resolve=True)
+    experiment = cfg.get("exp_name", None)
     _run = wandb.init(
         project=settings.get("project", "asrq"),
         entity=settings.get("entity", None),
-        group=settings.get("group", None),
+        group=settings.get("group", None) or experiment,
         tags=list(settings.get("tags", []) or []),
         mode=settings.get("mode", "online"),
         job_type=job_type,
-        name=name or f"{cfg.model.name.split('/')[-1]}-{cfg.get('method', job_type)}",
+        name=name or run_name(cfg, job_type),
         config=container,
     )
     try:
@@ -60,6 +62,12 @@ def start(cfg, job_type: str, name: Optional[str] = None):
         _defined.clear()
         run, _run = _run, None
         run.finish()
+
+
+def run_name(cfg, job_type: str) -> str:
+    """``<exp_name>_<model>_<method>``, leaving out the experiment when the config has none."""
+    parts = [cfg.get("exp_name", None), cfg.model.name.split("/")[-1], cfg.get("method", job_type)]
+    return "_".join(str(part) for part in parts if part)
 
 
 def step_metric(prefix: str, counter: str) -> None:

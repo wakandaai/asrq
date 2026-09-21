@@ -88,3 +88,6 @@ slurm_*
 
 # cuda
 cutlass/
+
+# wandb
+wandb/

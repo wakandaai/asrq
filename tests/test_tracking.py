@@ -84,6 +84,27 @@ def _raise_for_wandb(real_import):
     return guarded
 
 
+def test_the_experiment_name_groups_and_names_the_run(fake_wandb):
+    cfg = _cfg()
+    cfg.exp_name = "weight_only_w4_w2"
+    cfg.method = "wo_w2"
+    with tracking.start(cfg, "quantize"):
+        pass
+    (fake,) = fake_wandb
+    assert fake.kwargs["group"] == "weight_only_w4_w2"
+    assert fake.kwargs["name"] == "weight_only_w4_w2_whisper-large-v3_wo_w2"
+
+
+def test_without_an_experiment_name_the_run_is_named_by_model_and_method(fake_wandb):
+    cfg = _cfg()
+    cfg.exp_name = None
+    cfg.method = "wo_w2"
+    with tracking.start(cfg, "quantize"):
+        pass
+    (fake,) = fake_wandb
+    assert fake.kwargs["group"] is None and fake.kwargs["name"] == "whisper-large-v3_wo_w2"
+
+
 def test_a_run_carries_the_config_and_closes(fake_wandb):
     cfg = _cfg(tags=["w2"])
     with tracking.start(cfg, "rotation") as run:

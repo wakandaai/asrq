@@ -91,11 +91,12 @@ class RotationTransformConfig(TransformConfig):
         self.abits = cfg.abits
         if self.abits is not None and self.abits >= 16:
             self.abits = None
-        # "kl" matches the full-precision model's output distribution; "ce" minimises the
-        # model's training loss on the calibration labels. See learn_rotations.
+        # "kl" matches the full-precision model's output distribution; "ce" minimises the model's training loss
+        # on the calibration labels, which is what Cayley SGD optimises by default and needs no teacher pass.
+        # "auto" resolves below, once the search is known. See learn_rotations.
         self.objective = cfg.objective
-        if self.objective not in ("kl", "ce"):
-            raise ValueError(f"transform.objective must be 'kl' or 'ce', got {self.objective!r}")
+        if self.objective not in ("kl", "ce", "auto"):
+            raise ValueError(f"transform.objective must be 'kl', 'ce' or 'auto', got {self.objective!r}")
         self.activation_group_size = cfg.activation_group_size
         self.activation_symmetric = cfg.activation_symmetric
         # Roles quantized group-wise, the rest per token; see asrq.quantizers.activation. Set
@@ -118,6 +119,8 @@ class RotationTransformConfig(TransformConfig):
         self.search = cfg.get("search", "cayley")
         if self.search not in ("cayley", "evolution"):
             raise ValueError(f"transform.search must be 'cayley' or 'evolution', got {self.search!r}")
+        if self.objective == "auto":
+            self.objective = "ce" if self.search == "cayley" else "kl"
         if self.search == "evolution" and self.objective != "kl":
             raise ValueError("transform.search=evolution minimises the KL divergence; set transform.objective=kl")
         self.evolution = cfg.get("evolution", None)

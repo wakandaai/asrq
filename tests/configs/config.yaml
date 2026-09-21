@@ -15,6 +15,8 @@ calibration:
 
 evaluate: True
 method: "test"
+# Name of the experiment these runs belong to; it groups the runs in wandb and prefixes their results directory.
+exp_name: null
 create_audio_files: False
 # Activation quantization, read by evaluation and passed to the rotation search, so a rotation is
 # searched against exactly the quantization it is evaluated with. 16 or more disables it.

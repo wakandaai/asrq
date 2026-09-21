@@ -117,13 +117,15 @@ def transform_record(cfg: DictConfig) -> dict:
 def experiment_run_name(cfg: DictConfig) -> str:
     """The directory name of one evaluation run: the settings it used and when it started.
 
-    ``<model>_<method>_<quantizer>_w<bits>g<group size><sym|asym>_a<activation bits>_<transform>_<DD-MM-YY-SS-MM-HH>``,
-    with the group size left out when the weights are quantized per row.
+    ``<exp_name>_<model>_<method>_<quantizer>_w<bits>g<group size><sym|asym>_a<activation bits>_<transform>_<DD-MM-YY-SS-MM-HH>``,
+    with the group size left out when the weights are quantized per row and the experiment left out when the
+    config has no ``exp_name``.
     """
     group = cfg.quantizer.get("group_size", -1)
     weights = f"w{cfg.quantizer.bits}" + (f"g{group}" if group and group > 0 else "")
     weights += "sym" if cfg.quantizer.get("symmetric", True) else "asym"
     parts = [
+        *([str(cfg.exp_name)] if cfg.get("exp_name", None) else []),
         cfg.model.name.replace("/", "-"), str(cfg.method), cfg.quantizer.name, weights,
         f"a{cfg.activation_bits}", cfg.transform.name,
         datetime.datetime.now().strftime("%d-%m-%y-%S-%M-%H"),

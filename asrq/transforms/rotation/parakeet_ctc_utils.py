@@ -120,7 +120,8 @@ def parakeet_ctc_logits_fn(model, batch):
 
 
 def build_parakeet_dataloader(
-    model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42
+    model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42,
+    sort_by_length: bool = False,
 ) -> torch.utils.data.DataLoader:
     pad_id = getattr(model.tokenizer, "pad_id", 0)
     generator = torch.Generator()
