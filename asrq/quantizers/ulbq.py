@@ -115,7 +115,9 @@ class ULBQQuantizer(HessianAddBatchMixin, Quantizer):
 
 
     def __call__(self) -> Tuple[Any, Any]:
-        W = self.module.weight.data.clone() # type: ignore
+        # weight_2d/set_weight_2d keep this identical for nn.Linear and pointwise Conv1d, whose weight is
+        # (out, in, 1) and would otherwise make the column loop index a 2D slice.
+        W = self.weight_2d().clone()
         bits = self.quant_config.bits
         W = W.float()
         KM = []
@@ -234,7 +236,7 @@ class ULBQQuantizer(HessianAddBatchMixin, Quantizer):
 
         inv_perm = torch.argsort(perm)
         Q = Q[:, inv_perm]
-        self.module.weight.data = Q.reshape(self.module.weight.shape).to(self.module.weight.data.dtype) # type: ignore
+        self.set_weight_2d(Q)
 
         cuda_empty_cache()
         return (None, None)
