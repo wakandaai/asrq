@@ -198,6 +198,8 @@ def _run_experiment(cfg: DictConfig, results_dir: str) -> Tuple[ModelQ, Optional
         f.write(OmegaConf.to_yaml(cfg))
     evaluate_openasr(modelQ=modelQ, cfg=cfg, generate_fn=getattr(openasr, cfg.model.generate_fn),
                      evaluation_results_file=results_file, create_audio_files=cfg.create_audio_files)
+    tracking.results_csv(results_file)
+    tracking.save_file(os.path.join(run_dir, "config.yaml"))
     return modelQ, results_file
 
 

@@ -24,6 +24,9 @@ class FakeRun:
     def log(self, data, commit=True):
         self.rows.append(("log", data))
 
+    def save(self, path, base_path=None, policy=None):
+        self.rows.append(("save", path))
+
     def finish(self):
         self.finished = True
 
@@ -40,6 +43,7 @@ def fake_wandb(monkeypatch):
     module.init = init
     module.define_metric = lambda *args, **kwargs: None
     module.Histogram = lambda values: ("histogram", len(values))
+    module.Table = lambda columns, data: ("table", tuple(columns), len(data))
     monkeypatch.setitem(sys.modules, "wandb", module)
     return runs
 
@@ -155,3 +159,27 @@ def test_scale_recovery_and_refit_log_per_group_and_block(fake_wandb):
     (row,) = [row for kind, row in fake.rows if kind == "log" and "scale_recovery/group" in row]
     assert row["scale_recovery/error_ratio"] == 0.5 and row["scale_recovery/scale_min"] == pytest.approx(0.9)
     assert row["scale_recovery/scales"] == ("histogram", 8)
+
+
+def test_a_results_csv_is_logged_as_a_table_and_uploaded(fake_wandb, tmp_path):
+    results = tmp_path / "results.csv"
+    results.write_text(
+        "model,method,quantizer,transform,wbits,abits,dataset,split,wer\n"
+        "openai/whisper-large-v3,wa_w4a4,gptq,rotation,4,4,librispeech,test.clean,2.11\n"
+        "openai/whisper-large-v3,wa_w4a4,gptq,rotation,4,4,librispeech,test.other,4.53\n"
+    )
+    with tracking.start(_cfg(), "quantize"):
+        tracking.results_csv(str(results))
+    (fake,) = fake_wandb
+    (logged,) = [row for kind, row in fake.rows if kind == "log" and "eval/results" in row]
+    kind, columns, count = logged["eval/results"]
+    assert kind == "table" and columns[-1] == "wer" and count == 2
+    assert ("save", str(results)) in fake.rows
+
+
+def test_a_missing_results_file_is_ignored(fake_wandb, tmp_path):
+    with tracking.start(_cfg(), "quantize"):
+        tracking.results_csv(str(tmp_path / "absent.csv"))
+        tracking.save_file(str(tmp_path / "absent.yaml"))
+    (fake,) = fake_wandb
+    assert not [row for kind, row in fake.rows if kind == "save"]

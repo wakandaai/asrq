@@ -8,8 +8,10 @@ What each stage logs is documented in dev/docs/wandb_logging.md; the keys are na
 of a stage that repeats (a generation, a block, a split) carry their own counter as the x axis.
 """
 
+import csv
+import os
 from contextlib import contextmanager
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 _run = None
 _defined = set()
@@ -103,6 +105,33 @@ def histogram(values) -> Optional[Any]:
     import wandb
 
     return wandb.Histogram(values.detach().float().cpu().numpy())
+
+
+def save_file(path: str) -> None:
+    """Upload a file to the run, so it is kept beside the metrics; a no-op when no run is open."""
+    if _run is None or not os.path.isfile(path):
+        return
+    _run.save(path, base_path=os.path.dirname(path) or ".", policy="now")
+
+
+def table(key: str, columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
+    """Log rows as a wandb table, which the UI can sort and compare across runs."""
+    if _run is None:
+        return
+    import wandb
+
+    _run.log({key: wandb.Table(columns=list(columns), data=[list(row) for row in rows])})
+
+
+def results_csv(path: str, key: str = "eval/results") -> None:
+    """Log an evaluation's results.csv as a table and upload the file itself."""
+    if _run is None or not os.path.isfile(path):
+        return
+    with open(path, newline="") as handle:
+        rows = list(csv.reader(handle))
+    if len(rows) > 1:
+        table(key, rows[0], rows[1:])
+    save_file(path)
 
 
 def config_update(data: Dict[str, Any]) -> None:
