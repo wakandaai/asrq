@@ -31,7 +31,8 @@ mkdir -p outputs/scaling
 declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 EXPERIMENT="exp_name=smoothquant wandb.enabled=true"
-ACTIVATIONS="activation_symmetric=True activation_group_size=128 activation_groupwise_roles=[attn_out,fc2]"
+# attn_out and fc2 stay group-wise through the default activation_groupwise_roles.
+ACTIVATIONS="activation_symmetric=True activation_group_size=128"
 # RTN needs no Hessians, so the calibration set is only what the scale search sees: statistics over all of it,
 # and the grid search over the first 128 utterances.
 GRID="quantizer=rtn quantizer.bits=4 quantizer.symmetric=True quantizer.group_size=128"
@@ -48,7 +49,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
 
     stamp "$model W4A$abits scale, quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=scaling transform.path=$scales $obtain transform.type=smoothquant \
-      $GRID $EXPERIMENT "$ACTIVATIONS" activation_bits=$abits \
+      $GRID $EXPERIMENT $ACTIVATIONS activation_bits=$abits \
       calibration.num_samples=512 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False method=smoothquant_w4a$abits \
       2>&1 | tr '\r' '\n'
