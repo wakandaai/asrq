@@ -6,6 +6,7 @@ from typing import Any, Tuple
 
 import torch
 from sklearn.cluster import KMeans
+from threadpoolctl import threadpool_limits
 from omegaconf import DictConfig
 from asrq.core.registry import QuantizerNames, register_quantizer, register_quantizer_config
 from asrq.core.utils import cuda_empty_cache, cuda_synchronize
@@ -187,50 +188,51 @@ class ULBQQuantizer(HessianAddBatchMixin, Quantizer):
                 sens[cur[round(len(sens)*outlierorder_):]]=3  
             out = sens
         
-        columns = W.size(1)
-        blocksize = self.quant_config.block_size # type: ignore
-        for i1 in range(0, columns, blocksize):
-            i2 = min(i1 + blocksize, columns)
-            count = i2 - i1
-            if self.quant_config.outlierorder:
-                out1 = out[i1:i2].clone() # type: ignore
-            if self.quant_config.outlier_col_dynamic:
-                out_per1 = out_per[i1:i2].clone() # type: ignore
-            W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            # Prune_mask1 = prune_mask[:, i1:i2].clone()
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
+        with threadpool_limits(1):
+            columns = W.size(1)
+            blocksize = self.quant_config.block_size # type: ignore
+            for i1 in range(0, columns, blocksize):
+                i2 = min(i1 + blocksize, columns)
+                count = i2 - i1
                 if self.quant_config.outlierorder:
-                    bits = int(out1[i]) # type: ignore
+                    out1 = out[i1:i2].clone() # type: ignore
                 if self.quant_config.outlier_col_dynamic:
-                    outlier = out_per1[i].item() # type: ignore
-                else:
-                    outlier = 0
+                    out_per1 = out_per[i1:i2].clone() # type: ignore
+                W1 = W[:, i1:i2].clone()
+                Q1 = torch.zeros_like(W1)
+                # Prune_mask1 = prune_mask[:, i1:i2].clone()
+                Err1 = torch.zeros_like(W1)
+                Losses1 = torch.zeros_like(W1)
+                Hinv1 = Hinv[i1:i2, i1:i2]
+                for i in range(count):
+                    w = W1[:, i]
+                    d = Hinv1[i, i]
+                    if self.quant_config.outlierorder:
+                        bits = int(out1[i]) # type: ignore
+                    if self.quant_config.outlier_col_dynamic:
+                        outlier = out_per1[i].item() # type: ignore
+                    else:
+                        outlier = 0
                 
-                km = kmclustering(w, bits)
-                KM.append(km)
-                if outlier != 0:
-                    q = quantize_outlier(w.unsqueeze(1), bits, outlier, 1-outlier, mean, km)
-                else:
-                    q = quantize(w.unsqueeze(1), bits, km)
-                q = q.squeeze()
-                # q = q * Prune_mask1[:, i]
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
-                err1 = (w-q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                # W1[:, i:] *= Prune_mask1[:, i:]
-                Err1[:, i] = err1
+                    km = kmclustering(w, bits)
+                    KM.append(km)
+                    if outlier != 0:
+                        q = quantize_outlier(w.unsqueeze(1), bits, outlier, 1-outlier, mean, km)
+                    else:
+                        q = quantize(w.unsqueeze(1), bits, km)
+                    q = q.squeeze()
+                    # q = q * Prune_mask1[:, i]
+                    Q1[:, i] = q
+                    Losses1[:, i] = (w - q) ** 2 / d ** 2
+                    err1 = (w-q) / d
+                    W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
+                    # W1[:, i:] *= Prune_mask1[:, i:]
+                    Err1[:, i] = err1
             
-            Q[:, i1:i2] = Q1
-            Losses[:, i1:i2] = Losses1/2
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-            # W[:, i2:] *= prune_mask[:, i2:]
+                Q[:, i1:i2] = Q1
+                Losses[:, i1:i2] = Losses1/2
+                W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+                # W[:, i2:] *= prune_mask[:, i2:]
         
         cuda_synchronize()
 
