@@ -119,14 +119,17 @@ def experiment_run_name(cfg: DictConfig) -> str:
 
     ``<exp_name>_<model>_<method>_<quantizer>_w<bits>g<group size><sym|asym>_a<activation bits>_<transform>_<DD-MM-YY-SS-MM-HH>``,
     with the group size left out when the weights are quantized per row and the experiment left out when the
-    config has no ``exp_name``.
+    config has no ``exp_name``; with ``quantize`` off the quantizer is ``none`` and the weights ``w16``.
     """
     group = cfg.quantizer.get("group_size", -1)
     weights = f"w{cfg.quantizer.bits}" + (f"g{group}" if group and group > 0 else "")
     weights += "sym" if cfg.quantizer.get("symmetric", True) else "asym"
+    quantizer = cfg.quantizer.name
+    if not cfg.get("quantize", True):
+        quantizer, weights = "none", "w16"
     parts = [
         *([str(cfg.exp_name)] if cfg.get("exp_name", None) else []),
-        cfg.model.name.replace("/", "-"), str(cfg.method), cfg.quantizer.name, weights,
+        cfg.model.name.replace("/", "-"), str(cfg.method), quantizer, weights,
         f"a{cfg.activation_bits}", cfg.transform.name,
         datetime.datetime.now().strftime("%d-%m-%y-%S-%M-%H"),
     ]
@@ -170,7 +173,9 @@ def _run_experiment(cfg: DictConfig, results_dir: str) -> Tuple[ModelQ, Optional
             tracking.config_update(transform_record(cfg))
 
     quantized_path, fingerprint = quantized_model_path(cfg)
-    if quantized_path is not None and os.path.isfile(quantized_path):
+    if not cfg.get("quantize", True):
+        print("quantize is off: evaluating the model in full precision")
+    elif quantized_path is not None and os.path.isfile(quantized_path):
         print(f"Loading the quantized model from {quantized_path} instead of quantizing")
         modelQ.load_quantized(quantized_path, fingerprint)
         tracking.summary({"quantize/loaded_from_cache": True})

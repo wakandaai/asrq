@@ -18,6 +18,9 @@ calibration:
   text_source: transcript
 
 evaluate: True
+# False evaluates the model in full precision: nothing is quantized and no quantized model is saved or loaded, and
+# the run is recorded with quantizer none and 16-bit weights. The transform, if any, is still applied.
+quantize: True
 method: "gptq"
 # Activation quantization, read by evaluation and passed to the rotation search, so a rotation is
 # searched against exactly the quantization it is evaluated with. 16 or more disables it.

@@ -18,6 +18,7 @@ calibration:
   text_source: transcript
 
 evaluate: True
+quantize: True
 method: "test"
 # Name of the experiment these runs belong to; it groups the runs in wandb and prefixes their results directory.
 exp_name: null

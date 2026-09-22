@@ -109,7 +109,8 @@ def evaluate_openasr(modelQ, cfg, generate_fn, evaluation_results_file, create_a
             dtype=getattr(torch, cfg.get("eval_dtype", "bfloat16")),
         )
         with open(evaluation_results_file, "a") as f:
-            f.write(f"{cfg.model.name},{cfg.method},{cfg.quantizer.name},{cfg.transform.name},{cfg.quantizer.bits},{cfg.activation_bits},{dataset},{split},{result['wer']}\n")
+            quantizer, bits = (cfg.quantizer.name, cfg.quantizer.bits) if cfg.get("quantize", True) else ("none", 16)
+            f.write(f"{cfg.model.name},{cfg.method},{quantizer},{cfg.transform.name},{bits},{cfg.activation_bits},{dataset},{split},{result['wer']}\n")
         tracking.summary({
             f"eval/{dataset}.{split}/wer": result["wer"], f"eval/{dataset}.{split}/rtfx": result.get("rtfx"),
         })
