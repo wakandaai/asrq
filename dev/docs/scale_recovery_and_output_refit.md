@@ -101,6 +101,12 @@ Only norms whose layers are **all** quantized in the current block (`scale_recov
 |---|---|
 | Whisper (encoder and decoder) | `self_attn_layer_norm` → q/k/v; `final_layer_norm` → fc1; decoder `encoder_attn_layer_norm` → cross-attention q only (k/v read the encoder output) |
 | Canary-Qwen LLM | `input_layernorm` → q/k/v_proj; `post_attention_layernorm` → gate/up_proj |
+| Conformer blocks, **unrotated only** | `norm_feed_forward1` → ff1.linear1; `norm_self_att` → q/k/v; `norm_conv` → pointwise_conv1; `norm_feed_forward2` → ff2.linear1 |
+
+With a rotation, Conformer blocks are refit through the Linear the rotation inserts after their output norm, and
+get no scale recovery. Without one there is no such Linear, so the refit has nothing to do; their four norms,
+ordinary LayerNorms there, take the scale instead. Parakeet at W2, no transform, 16 utterances: plain GPTQ 27.2%
+WER, with scale recovery 11.6%.
 
 In the block loop, `capture_scale_recovery` lists these targets, `ModelQ.quantize_layers` quantizes each
 norm's layers together (and every other layer on its own), and `apply_scale_recovery` folds the scales in. The log reports,

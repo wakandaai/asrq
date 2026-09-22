@@ -20,6 +20,7 @@ from transformers import GenerationConfig
 from asrq.calibration.base import CalibConfig
 from asrq.core.model import ModelQ
 from asrq.quantizers.scale_recovery import ScaleTarget
+from asrq.models.nemo.parakeet_ctc import conformer_scale_recovery_targets
 from asrq.core.registry import ModelNames, register_model
 from asrq.core.utils import cuda_empty_cache
 from asrq.quantizers.base import QuantConfig, is_pointwise_conv1d
@@ -205,8 +206,10 @@ class CanaryQwenQ(ModelQ):
 
     def scale_recovery_targets(self) -> List[ScaleTarget]:
         """Each LLM layer's input norm, in front of q/k/v_proj, and post-attention norm, in front of
-        gate/up_proj. The speech encoder's Conformer blocks are left to block output refitting."""
-        targets = []
+        gate/up_proj, and the speech encoder's Conformer norms when the model is not rotated (with a rotation
+        they are left to block output refitting; see conformer_scale_recovery_targets)."""
+        encoder = self.model.perception.encoder
+        targets = conformer_scale_recovery_targets(self.model, "perception.encoder.layers", len(encoder.layers))
         for i in range(len(self.model.llm.model.layers)):
             p = f"llm.model.layers.{i}"
             targets.append(ScaleTarget(f"{p}.input_layernorm",

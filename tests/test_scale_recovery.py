@@ -118,3 +118,28 @@ def test_the_average_is_lockstep_for_one_layer_and_agrees_with_it_on_the_first_c
     lockstep, average = (quantize_scale_group([Quantizer(W) for W in weights], 0.0, m)[0] for m in ("lockstep", "average"))
     first = factors.perm[0]
     assert torch.allclose(lockstep[first], average[first], atol=1e-12) and not torch.allclose(lockstep, average)
+
+
+def _conformer(layers=2, rotated=False):
+    blocks = nn.ModuleList()
+    for _ in range(layers):
+        block = nn.Module()
+        for norm in ("norm_feed_forward1", "norm_self_att", "norm_conv", "norm_feed_forward2"):
+            setattr(block, norm, nn.LayerNorm(8))
+        block.norm_out = nn.Sequential(nn.LayerNorm(8), nn.Linear(8, 8)) if rotated else nn.LayerNorm(8)
+        blocks.append(block)
+    model = nn.Module()
+    model.encoder = nn.Module()
+    model.encoder.layers = blocks
+    return model
+
+
+def test_conformer_norms_are_recovered_only_when_no_rotation_left_a_layer_to_refit():
+    from asrq.models.nemo.parakeet_ctc import conformer_scale_recovery_targets
+
+    targets = conformer_scale_recovery_targets(_conformer(), "encoder.layers", 2)
+    assert len(targets) == 8
+    by_norm = {target.norm: target.layers for target in targets}
+    assert by_norm["encoder.layers.1.norm_self_att"] == [f"encoder.layers.1.self_attn.linear_{n}" for n in "qkv"]
+    assert by_norm["encoder.layers.0.norm_conv"] == ["encoder.layers.0.conv.pointwise_conv1"]
+    assert conformer_scale_recovery_targets(_conformer(rotated=True), "encoder.layers", 2) == []

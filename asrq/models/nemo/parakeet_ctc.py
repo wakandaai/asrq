@@ -7,6 +7,7 @@ from asrq.core.types import Processor
 from typing import Dict, List, Tuple, Optional
 
 from asrq.core.model import ModelQ
+from asrq.quantizers.scale_recovery import ScaleTarget
 from asrq.core.registry import ModelNames, register_model
 from asrq.transforms.rotation.parakeet_ctc_utils import (
     get_parakeet_activation_roles,
@@ -199,6 +200,32 @@ class EncDecCTCModelBPEQ(EncDecCTCModelQ, EncDecCTCModelBPE):
         )
 
     
+
+
+def conformer_scale_recovery_targets(model: nn.Module, prefix: str, num_layers: int) -> List[ScaleTarget]:
+    """The norms in front of each Conformer block's feed-forward linear1s, attention projections and first
+    pointwise convolution -- but only when the model is not rotated.
+
+    A rotation inserts a Linear after each block's output norm (``<block>.norm_out.1``), and block output refitting
+    corrects those blocks through it, so they get no scale recovery. Without a rotation there is no such layer to
+    refit, and the norms are ordinary LayerNorms whose affine weight takes the scale directly.
+
+    Args:
+        model: The model the block paths are relative to.
+        prefix: The path of the block list, such as ``encoder.layers``.
+        num_layers: Blocks in the list.
+    """
+    names = {name for name, _ in model.named_modules()}
+    if f"{prefix}.0.norm_out.1" in names:
+        return []
+    targets = []
+    for i in range(num_layers):
+        p = f"{prefix}.{i}"
+        targets.append(ScaleTarget(f"{p}.norm_feed_forward1", [f"{p}.feed_forward1.linear1"]))
+        targets.append(ScaleTarget(f"{p}.norm_self_att", [f"{p}.self_attn.linear_{n}" for n in ("q", "k", "v")]))
+        targets.append(ScaleTarget(f"{p}.norm_conv", [f"{p}.conv.pointwise_conv1"]))
+        targets.append(ScaleTarget(f"{p}.norm_feed_forward2", [f"{p}.feed_forward2.linear1"]))
+    return targets
 
 
 @register_model(ModelNames.NVIDIA_PARAKEET_CTC_1_1B)
@@ -439,6 +466,10 @@ class ParakeetCTCQ(ModelQ):
         See WhisperQ.online_hadamard_layers.
         """
         return {fc2: act for act, fc2 in get_parakeet_online_hadamard_layers(self.model)}
+
+    def scale_recovery_targets(self) -> List[ScaleTarget]:
+        """The Conformer norms, when the model is not rotated; see conformer_scale_recovery_targets."""
+        return conformer_scale_recovery_targets(self.model, "encoder.layers", len(self.model.encoder.layers))
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Attention projections, feed-forward linears and pointwise convs, fc2-like layers
