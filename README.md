@@ -62,22 +62,6 @@ The same activation settings (`activation_bits`, `activation_group_size`, `activ
 evaluation. So a rotation is searched against the quantization it will be evaluated with. Use the same
 overrides for both commands.
 
-#### Reusing quantized models
-
-With `quantized_path: auto` (the default), exp.py saves the quantized model to
-`outputs/quantized/<model>-<hash>.pt`. A later run with the same settings loads that file instead of quantizing
-again.
-
-- **What the hash covers:** the model, the whole quantizer config, the calibration set, the transform config and
-  the contents of the rotation file. Changing any of them quantizes again into a new file.
-- **What it leaves out:** evaluation and inference settings. You can re-evaluate the same weights with a
-  different `inference`, `eval_dtype` or dataset.
-- **Options:**
-  - `quantized_path=/some/file.pt` uses a specific file.
-  - `quantized_path=null` never saves or loads.
-  - Deleting the file forces a re-quantization.
-- **Disk use:** files keep the model's own dtype, so a float32 model costs about 4 bytes per parameter.
-
 ### Scaling transform
 
 `transform=scaling` is a SmoothQuant-style per-channel scaling on the same layers that rotation targets. Where a
