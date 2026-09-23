@@ -62,16 +62,6 @@ The same activation settings (`activation_bits`, `activation_group_size`, `activ
 evaluation. So a rotation is searched against the quantization it will be evaluated with. Use the same
 overrides for both commands.
 
-### Scaling transform
-
-`transform=scaling` is a SmoothQuant-style per-channel scaling on the same layers that rotation targets. Where a
-nonlinearity feeds the layer, it inserts an `InputScale` module after the activation. The scales are searched in
-exp.py against the configured weight and activation quantization, and saved to `transform.path`:
-
-```bash
-python asrq/exp.py model=parakeet quantizer=gptq activation_bits=8 transform=scaling \
-    transform.path=outputs/scaling/parakeet_a8.pt
-```
 ---
 
 ## Tests
