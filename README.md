@@ -8,8 +8,6 @@
 | `parakeet` | `nvidia/parakeet-ctc-1.1b` | Conformer encoder, CTC head (NeMo) |
 | `canary_qwen` | `nvidia/canary-qwen-2.5b` | Conformer encoder + Qwen3 LLM decoder (NeMo SALM, LoRA merged) |
 
-## Results
-
 ## Installation
 
 ```bash
@@ -91,21 +89,6 @@ python asrq/exp.py model=parakeet quantizer=gptq activation_bits=8 transform=sca
     transform.path=outputs/scaling/parakeet_a8.pt
 ```
 ---
-
-## Configuration
-
-`asrq/configs/` holds the Hydra config groups, and any value can be overridden on the command line.
-
-| File | Main settings |
-|---|---|
-| `config.yaml` | Calibration, activation quantization, `quantized_path`, `inference`, `eval_datasets`, `eval_batches`, `eval_dtype` |
-| `model/*.yaml` | `exclude_modules`, `eval_batch_size`, `generate_fn`, `quantize_block_output_linear` (Conformer) |
-| `quantizer/gptq.yaml` | `bits`, `group_size`, `symmetric`, `percdamp`, `scale_recovery*`, `block_output_refit*` |
-| `quantizer/rtn.yaml` | `bits`, `group_size`, `symmetric` |
-| `transform/rotation.yaml` | `search`, `evolution.*`, `weight_only`, `weight_only_quantizer`, `hadamard_block_size`, `learn_r2`, `fc2_online_hadamard`, `path` |
-| `transform/scaling.yaml` | `type`, `obtain_scales`, `path` |
-| `transform/none.yaml` | No transform |
-
 
 ## Tests
 
