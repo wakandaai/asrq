@@ -158,22 +158,22 @@ class CanaryQwenQ(ModelQ):
                     quantizers[_name].add_batch((inputs[0], output))
                 hooks.append(module.register_forward_hook(hook))
             block_name = f"{prefix}.{index}"
-            refit_targets = self.capture_refit_targets(block_name)
+            recovery_targets = self.capture_weight_recovery(block_name)
             for args, kwargs in zip(args_list, kwargs_list):
                 output = block(*args, **kwargs)
-                if refit_targets is not None:
-                    refit_targets.append((output[0] if isinstance(output, tuple) else output).detach().cpu())
+                if recovery_targets is not None:
+                    recovery_targets.append((output[0] if isinstance(output, tuple) else output).detach().cpu())
             for hook in hooks:
                 hook.remove()
             groups = self.capture_scale_recovery(quantizers)
-            for name in self.quantize_layers(quantizers, groups, self.refit_quantizes_output_layer(block_name, quantizers)):
+            for name in self.quantize_layers(quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers)):
                 tqdm.write(f"Quantized {name}")
             self.apply_scale_recovery(groups)
 
             def run(i, block=block):
                 return block(*args_list[i], **kwargs_list[i])
 
-            self.refit_block_output(block_name, quantizers, run, refit_targets)
+            self.apply_weight_recovery(block_name, quantizers, run, recovery_targets)
             for j, (args, kwargs) in enumerate(zip(args_list, kwargs_list)):
                 output = block(*args, **kwargs)
                 output = output[0] if isinstance(output, tuple) else output
@@ -207,7 +207,7 @@ class CanaryQwenQ(ModelQ):
     def scale_recovery_targets(self) -> List[ScaleTarget]:
         """Each LLM layer's input norm, in front of q/k/v_proj, and post-attention norm, in front of
         gate/up_proj, and the speech encoder's Conformer norms when the model is not rotated (with a rotation
-        they are left to block output refitting; see conformer_scale_recovery_targets)."""
+        they are left to weight recovery; see conformer_scale_recovery_targets)."""
         encoder = self.model.perception.encoder
         targets = conformer_scale_recovery_targets(self.model, "perception.encoder.layers", len(encoder.layers))
         for i in range(len(self.model.llm.model.layers)):

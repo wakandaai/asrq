@@ -1,4 +1,9 @@
-"""Refit a Conformer block's output linear layer so the quantized block reproduces the full-precision block's output.
+"""Weight recovery: refit a Conformer block's output linear layer so the quantized block reproduces the
+full-precision block's output.
+
+One of the two error recovery techniques, beside scale recovery (asrq/quantizers/scale_recovery.py), which
+recovers a transformer block instead by scaling the layers its norms feed. A Conformer block ends in a linear
+layer, so its whole error can be corrected there, which is what this does.
 
 A block ending in a linear layer (the identity Linear a rotation inserts after each Conformer block's output
 norm) computes its output as Z W.T + b, where Z is that layer's input. Once the block's other layers are quantized,
@@ -22,7 +27,7 @@ import torch
 import torch.nn as nn
 
 
-class OutputRefit:
+class WeightRecovery:
     """Accumulate the statistics of one output layer's refit, then solve and apply it.
 
     Args:

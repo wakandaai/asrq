@@ -538,7 +538,7 @@ class WhisperQ(ModelQ):
         quant_methods = {}
         submodules = {}
         for name, module in block.named_modules():
-            name = f"model.encoder.layers.{block_idx}.{name}"
+            name = f"{block_name}.{name}"
             if self.should_quantize_module(name, module):
                 quant_methods[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
                 submodules[name] = module
@@ -554,18 +554,18 @@ class WhisperQ(ModelQ):
             hooks.append(layer.register_forward_hook(get_hook(name)))
 
         # forward pass through the block
-        refit_targets = self.capture_refit_targets(block_name)
+        recovery_targets = self.capture_weight_recovery(block_name)
         for i in range(num_samples):
             with torch.no_grad():
                 out = block(*inp_args[i], **inp_kwargs[i])
-            if refit_targets is not None:
-                refit_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
+            if recovery_targets is not None:
+                recovery_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
         # remove hooks
         for h in hooks:
             h.remove()
         groups = self.capture_scale_recovery(quant_methods)
         # quantize layers
-        for name in self.quantize_layers(quant_methods, groups, self.refit_quantizes_output_layer(block_name, quant_methods)):
+        for name in self.quantize_layers(quant_methods, groups, self.weight_recovery_quantizes(block_name, quant_methods)):
             # quantize_layers (e.g. RTNQuantizer) only fake-quantizes:
             # it writes a rounded-then-dequantized fp16 weight back into
             # submodules[name].weight.data for calibration/qparams
@@ -578,7 +578,7 @@ class WhisperQ(ModelQ):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
         self.apply_scale_recovery(groups)
-        self.refit_block_output(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), refit_targets)
+        self.apply_weight_recovery(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), recovery_targets)
 
         # get input into the next block
         for i in range(num_samples):
@@ -731,18 +731,18 @@ class WhisperQ(ModelQ):
             hooks.append(layer.register_forward_hook(get_hook(name)))
 
         # forward pass through the block
-        refit_targets = self.capture_refit_targets(block_name)
+        recovery_targets = self.capture_weight_recovery(block_name)
         for i in range(num_samples):
             with torch.no_grad():
                 out = block(*inp_args[i], **inp_kwargs[i])
-            if refit_targets is not None:
-                refit_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
+            if recovery_targets is not None:
+                recovery_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
         # remove hooks
         for h in hooks:
             h.remove()
         groups = self.capture_scale_recovery(quant_methods)
         # quantize layers
-        for name in self.quantize_layers(quant_methods, groups, self.refit_quantizes_output_layer(block_name, quant_methods)):
+        for name in self.quantize_layers(quant_methods, groups, self.weight_recovery_quantizes(block_name, quant_methods)):
             # quantize_layers (e.g. RTNQuantizer) only fake-quantizes:
             # it writes a rounded-then-dequantized fp16 weight back into
             # submodules[name].weight.data for calibration/qparams
@@ -755,7 +755,7 @@ class WhisperQ(ModelQ):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
         self.apply_scale_recovery(groups)
-        self.refit_block_output(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), refit_targets)
+        self.apply_weight_recovery(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), recovery_targets)
 
         # get input into the next block
         for i in range(num_samples):

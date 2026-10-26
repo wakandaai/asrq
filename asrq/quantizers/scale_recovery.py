@@ -15,7 +15,7 @@ Nothing is added to the model: diag(s) is folded into the norm feeding the layer
 (its affine weight and bias, or a new ``weight`` buffer when a rotation left it scale-free). Only layers a norm
 feeds are scaled. Folding into a preceding layer's rows instead -- an attention output projection into the value
 projection, a SwiGLU down projection into the up projection -- is exact and free but measured no better, and was
-removed; see dev/docs/scale_recovery_and_output_refit.md.
+removed; see dev/docs/scale_and_weight_recovery.md.
 
 Several layers can share one norm -- q/k/v share theirs, gate/up share theirs -- and then share one s.
 Two ways to fit it (SCALE_RECOVERY_METHODS):

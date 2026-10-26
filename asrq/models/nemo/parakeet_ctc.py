@@ -206,7 +206,7 @@ def conformer_scale_recovery_targets(model: nn.Module, prefix: str, num_layers: 
     """The norms in front of each Conformer block's feed-forward linear1s, attention projections and first
     pointwise convolution -- but only when the model is not rotated.
 
-    A rotation inserts a Linear after each block's output norm (``<block>.norm_out.1``), and block output refitting
+    A rotation inserts a Linear after each block's output norm (``<block>.norm_out.1``), and weight recovery
     corrects those blocks through it, so they get no scale recovery. Without a rotation there is no such layer to
     refit, and the norms are ordinary LayerNorms whose affine weight takes the scale directly.
 
@@ -412,13 +412,13 @@ class ParakeetCTCQ(ModelQ):
             
             # run calibration samples through the model to collect stats
             block_name = f"encoder.layers.{idx}"
-            refit_targets = self.capture_refit_targets(block_name)
+            recovery_targets = self.capture_weight_recovery(block_name)
             for i in range(len(self.calibration_samples)):  # type: ignore[arg-type]
                 audio_signal = block(
                     **inp_kwargs[i],
                 )
-                if refit_targets is not None:
-                    refit_targets.append(audio_signal.detach().cpu())
+                if recovery_targets is not None:
+                    recovery_targets.append(audio_signal.detach().cpu())
 
             # remove hooks
             for hook in hooks:
@@ -426,10 +426,10 @@ class ParakeetCTCQ(ModelQ):
             groups = self.capture_scale_recovery(quantizers)
 
             # quanitze
-            for name in self.quantize_layers(quantizers, groups, self.refit_quantizes_output_layer(block_name, quantizers)):
+            for name in self.quantize_layers(quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers)):
                 tqdm.write(f"Quantized {name}")
             self.apply_scale_recovery(groups)
-            self.refit_block_output(block_name, quantizers, lambda i, block=block: block(**inp_kwargs[i]), refit_targets)
+            self.apply_weight_recovery(block_name, quantizers, lambda i, block=block: block(**inp_kwargs[i]), recovery_targets)
 
             # get the output of the block and use it as input for the next block
             for i in range(len(self.calibration_samples)):  # type: ignore[arg-type]

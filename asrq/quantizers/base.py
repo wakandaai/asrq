@@ -33,8 +33,8 @@ class QuantConfig(ABC):
         self.scale_recovery = bool(cfg.get("scale_recovery", False))
         self.scale_recovery_ridge = float(cfg.get("scale_recovery_ridge", 0.01))
         self.scale_recovery_method = str(cfg.get("scale_recovery_method", "lockstep"))
-        self.block_output_refit = bool(cfg.get("block_output_refit", False))
-        self.block_output_refit_ridge = float(cfg.get("block_output_refit_ridge", 0.01))
+        self.weight_recovery = bool(cfg.get("weight_recovery", False))
+        self.weight_recovery_ridge = float(cfg.get("weight_recovery_ridge", 0.01))
 
 
 class LinearQuantConfig(QuantConfig):

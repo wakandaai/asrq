@@ -25,7 +25,7 @@ from asrq.core.registry import get_quant_cls
 from asrq.core.utils import cuda_empty_cache
 from asrq import tracking
 from asrq.quantizers.scale_recovery import ScaleTarget, apply_scale_recovery, capture_scale_recovery, quantize_scale_group
-from asrq.quantizers.output_refit import OutputRefit
+from asrq.quantizers.weight_recovery import WeightRecovery
 
 
 
@@ -161,7 +161,7 @@ class ModelQ(ABC):
         """Save the quantized model so load_quantized can restore it without quantizing again.
 
         The state dict is stored at each tensor's own dtype, together with what a freshly loaded and transformed
-        model lacks: the norm weights norm tweaking gave scale-free norms (module names whose ``weight`` is a
+        model lacks: the norm weights scale recovery gave scale-free norms (module names whose ``weight`` is a
         buffer). The rotation is not stored; load_quantized expects it applied, as exp.py does before quantizing. Written to a temporary file and renamed, so an interrupted save leaves no file behind.
 
         Tensors are not narrowed to float16: evaluation casts the model to ``eval_dtype`` (bfloat16 by default), and
@@ -255,7 +255,7 @@ class ModelQ(ABC):
         """The norms of this model's transformer blocks and the quantized layers each one feeds, which share its
         scale; see asrq.quantizers.scale_recovery. Empty by default.
 
-        Conformer blocks are left out: they end in a linear layer, which block output refitting corrects instead
+        Conformer blocks are left out: they end in a linear layer, which weight recovery corrects instead
         (see block_output_layer).
         """
         return []
@@ -272,7 +272,7 @@ class ModelQ(ABC):
 
         The layers a norm feeds are quantized together by quantize_scale_group, when the first of them comes up,
         which also fits their scale for apply_scale_recovery; every other layer is quantized by its own
-        quantizer. Names in ``skip`` are left for the caller, as refit_block_output quantizes a block's output
+        quantizer. Names in ``skip`` are left for the caller, as apply_weight_recovery quantizes a block's output
         layer itself, after refitting it.
         """
         leaders = {group.target.layers[0]: group for group in groups}
@@ -328,29 +328,29 @@ class ModelQ(ABC):
             return None
         return f"{block_name}.norm_out.1" if isinstance(layer, nn.Linear) else None
 
-    def refit_quantizes_output_layer(self, block_name: str, quantizers: Dict[str, Any]) -> set:
-        """``{output layer name}`` when refit_block_output will quantize that layer itself, for quantize_layers
+    def weight_recovery_quantizes(self, block_name: str, quantizers: Dict[str, Any]) -> set:
+        """``{output layer name}`` when apply_weight_recovery will quantize that layer itself, for quantize_layers
         to skip; empty otherwise."""
         name = self.block_output_layer(block_name)
-        if name is None or name not in quantizers or self.capture_refit_targets(block_name) is None:
+        if name is None or name not in quantizers or self.capture_weight_recovery(block_name) is None:
             return set()
         return {name}
 
-    def capture_refit_targets(self, block_name: str) -> Optional[list]:
+    def capture_weight_recovery(self, block_name: str) -> Optional[list]:
         """A list to collect the full-precision block's outputs in before its layers are quantized, when the block's
         output layer is to be refit; None otherwise."""
-        if not getattr(self.quant_cfg, "block_output_refit", False) or self.block_output_layer(block_name) is None:
+        if not getattr(self.quant_cfg, "weight_recovery", False) or self.block_output_layer(block_name) is None:
             return None
         return []
 
-    def refit_block_output(self, block_name: str, quantizers: Dict[str, Any], run, targets: Optional[list]) -> None:
+    def apply_weight_recovery(self, block_name: str, quantizers: Dict[str, Any], run, targets: Optional[list]) -> None:
         """After a block's other layers are quantized, refit its output layer to the full-precision outputs in
-        targets; see asrq.quantizers.output_refit. ``run(i)`` runs the block on calibration sample i.
+        targets; see asrq.quantizers.weight_recovery. ``run(i)`` runs the block on calibration sample i.
 
         An output layer that is quantized itself (``quantize_block_output_linear``) is refit first and quantized
         afterwards, so it keeps the correction and still ends up on the grid. Its Hessian is collected in the
         same pass, from the quantized block's inputs, which is what it will see; quantize_layers leaves it to
-        this method (see refit_quantizes_output_layer).
+        this method (see weight_recovery_quantizes).
         """
         if not targets:
             return
@@ -360,7 +360,7 @@ class ModelQ(ABC):
         if quantizer is not None and getattr(quantizer, "H", None) is not None:
             quantizer.H.zero_()
             quantizer.nsamples = 0
-        refit = OutputRefit(layer)
+        refit = WeightRecovery(layer)
         current = {}
 
         def hook(_module, inputs, _output):
@@ -376,17 +376,17 @@ class ModelQ(ABC):
                     run(index)
         finally:
             handle.remove()
-        before, after = refit.solve(self.quant_cfg.block_output_refit_ridge)
-        tqdm.write(f"Refit {name}: block output error {before:.3e} -> {after:.3e} (relative to its energy)")
-        tracking.step_metric("refit", "refit/block")
-        self._refit_blocks = getattr(self, "_refit_blocks", 0) + 1
+        before, after = refit.solve(self.quant_cfg.weight_recovery_ridge)
+        tqdm.write(f"Recovered {name}: block output error {before:.3e} -> {after:.3e} (relative to its energy)")
+        tracking.step_metric("weight_recovery", "weight_recovery/block")
+        self._weight_recovery_blocks = getattr(self, "_weight_recovery_blocks", 0) + 1
         tracking.log({
-            "refit/block": self._refit_blocks, "refit/error_before": before, "refit/error_after": after,
-            "refit/error_ratio": after / before if before > 0 else 1.0,
+            "weight_recovery/block": self._weight_recovery_blocks, "weight_recovery/error_before": before, "weight_recovery/error_after": after,
+            "weight_recovery/error_ratio": after / before if before > 0 else 1.0,
         })
         if quantizer is not None:
             self.qparams[name] = quantizer()
-            tqdm.write(f"Quantized {name} after refitting it")
+            tqdm.write(f"Quantized {name} after recovering it")
 
     def online_hadamard_layers(self) -> Dict[str, str]:
         """``{layer_name: activation_name}`` for layers fed by an online Hadamard module.
