@@ -136,13 +136,6 @@ class RotationTransformConfig(TransformConfig):
         self.wbits = cfg.get("wbits", 4)
         self.wgroup = cfg.get("wgroup", None)
         self.wsymmetric = cfg.get("wsymmetric", True)
-        self.weight_only_quantizer = cfg.get("weight_only_quantizer", None) or (
-            cfg.get("wmethod") if cfg.get("wmethod") in ("rtn", "gptq") else "rtn"
-        )
-        if self.weight_only_quantizer not in ("rtn", "gptq"):
-            raise ValueError(f"transform.weight_only_quantizer must be rtn, gptq or null, got {self.weight_only_quantizer!r}")
-        self.wpercdamp = cfg.get("wpercdamp", 0.01)
-        self.wblock_size = cfg.get("wblock_size", 128)
         if self.weight_only and self.search != "evolution":
             raise ValueError("transform.weight_only searches R1 with transform.search=evolution")
         if self.weight_only:
@@ -220,17 +213,14 @@ class RotationTransform(BaseTransform):
         )
 
     def _weight_quantization(self, modelQ):
-        """The weight-only search's quantization: RTN or GPTQ (transform.weight_only_quantizer, by default the
-        experiment's quantizer) with the quantizer's bits, group size, symmetry, damping and block size, on the
+        """The weight-only search's quantization: RTN at the quantizer's bits, group size and symmetry, on the
         rotated layers the quantizer quantizes."""
         if not self.cfg.weight_only:
             return None
         model = modelQ.model
         rotated = [name for group in self._rotation_layers(modelQ)["layers_to_rotate"] for name, _ in group[2]]
         return {
-            "method": self.cfg.weight_only_quantizer,
-            "percdamp": self.cfg.wpercdamp,
-            "block_size": self.cfg.wblock_size,
+            "method": "rtn",
             "bits": self.cfg.wbits,
             "group_size": self.cfg.wgroup,
             "symmetric": self.cfg.wsymmetric,

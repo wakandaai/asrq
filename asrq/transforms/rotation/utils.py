@@ -17,7 +17,7 @@ from asrq.quantizers.activation import (  # noqa: F401  re-exported for the rota
     make_activation_quantizer,
     quantizers_disabled,
 )
-from asrq.quantizers.gptq_solver import add_to_hessian, gptq_factors_batched, gptq_quantize_batched
+from asrq.quantizers.gptq_solver import add_to_hessian
 from asrq.quantizers.weight_rounding import round_weight
 from asrq.transforms.rotation.cayley_sgd import SGDG
 from asrq.transforms.rotation.hadamard_search import (
@@ -1596,58 +1596,6 @@ def _save_rotations(
     )
 
 
-def _collect_hessians(model, batches, compute_logits, quantized, reads_r1, fold, percdamp, max_elements=5 * 10**8):
-    """GPTQ Hessians of the quantized layers, collected once and grouped for batched GPTQ.
-
-    The model is folded with R1 set to the identity, with the R2s and online Hadamards in place, and the
-    inputs of every quantized layer are accumulated over the calibration batches as the GPTQ quantizer
-    accumulates them. Layers are grouped by weight shape and by the residual-stream rotation their input
-    reads, in groups of at most ``max_elements`` Hessian or weight entries. A group reading R1 keeps its
-    stacked Hessians H, from which a candidate's ``R1.T @ H @ R1`` is formed; every other group keeps only its
-    factors, which no candidate changes.
-
-    Returns:
-        ``[(names, rotation or None, Hessians or factors)]``.
-    """
-    fold(None, quantize=False)
-    moduledict = dict(model.named_modules())
-    state = {}
-    handles = []
-    for name in quantized:
-        layer = moduledict[name]
-        width = _weight_2d(layer).shape[1]
-        state[name] = [torch.zeros(width, width, device=layer.weight.device), 0]
-
-        def hook(module, inputs, _output, name=name):
-            x = inputs[0].detach()
-            x = x.transpose(1, 2) if isinstance(module, nn.Conv1d) else x
-            state[name][0], state[name][1] = add_to_hessian(state[name][0], state[name][1], x.reshape(-1, x.shape[-1]))
-
-        handles.append(layer.register_forward_hook(hook))
-    try:
-        with torch.no_grad():
-            for batch in batches:
-                compute_logits(model, batch)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    by_key = {}
-    for name in quantized:
-        rotation = reads_r1.get(name)
-        key = (tuple(_weight_2d(moduledict[name]).shape), None if rotation is None else id(rotation))
-        by_key.setdefault(key, (rotation, []))[1].append(name)
-    groups = []
-    for (shape, _), (rotation, names) in by_key.items():
-        per_group = max(1, max_elements // max(shape[0] * shape[1], shape[1] * shape[1]))
-        for start in range(0, len(names), per_group):
-            chunk = names[start:start + per_group]
-            hessians = torch.stack([state.pop(name)[0] for name in chunk])
-            groups.append((chunk, rotation, hessians if rotation is not None else gptq_factors_batched(hessians, percdamp)))
-            del hessians
-    return groups
-
-
 def _search_r1_for_weight_quantization(
     model, path, layers_to_rotate, compute_logits, train_loader, reference_batch, reference_logits, tolerance,
     R1, R2s, r1_signs, write_r1, multi_stream, hadamard_block_size, online_hadamard_layers, hadamard_signs,
@@ -1668,25 +1616,12 @@ def _search_r1_for_weight_quantization(
     unquantized fold is checked against the original logits, and the full-precision logits of every
     calibration batch are computed from it once, on the CPU in float16.
 
-    With ``method="rtn"`` the weights are rounded with round_weight, the RTN quantizer's grid. With
-    ``method="gptq"`` they are GPTQ-quantized with the GPTQ quantizer's solver, on Hessians collected once
-    (see _collect_hessians): a layer reading the rotated residual stream sees ``X @ R1``, so its Hessian for a
-    candidate is ``R1.T @ H @ R1`` and is factored per candidate; every other layer's input does not depend on
-    R1, so its factors are computed once. Layers of one shape are quantized together by the batched solver,
-    whose column loop is shared by the whole group. The Hessians come from the full-precision model's inputs rather than
-    from the partly quantized model a sequential GPTQ pass would see.
+    The weights are rounded with round_weight, the RTN quantizer's grid, which is what a candidate is scored
+    against whatever quantizer the experiment itself uses.
     """
     moduledict = dict(model.named_modules())
     rotated = [name for group in layers_to_rotate for name, _ in group[2]]
     quantized = list(weight_quantization.get("layers") or rotated)
-    method = weight_quantization.get("method", "rtn")
-    if method not in ("rtn", "gptq"):
-        raise ValueError(f"weight_quantization method must be 'rtn' or 'gptq', got {method!r}")
-    reads_r1 = {
-        name: _group_rotation(R1, group)
-        for group in layers_to_rotate for name, rot_type in group[2]
-        if rot_type in (1, 2, 5)
-    }
     def keep(tensor):
         return tensor.detach().to("cpu", copy=True).pin_memory()
 
@@ -1717,19 +1652,9 @@ def _search_r1_for_weight_quantization(
                 use_r2=learn_r2, fc2_online_hadamard=fc2_online_hadamard, hadamard_sign_seed=hadamard_sign_seed,
             )
             if quantize:
-                if method == "rtn":
-                    for name in quantized:
-                        weight = _weight_2d(moduledict[name])
-                        weight.copy_(round_weight(weight, bits, group_size or -1, symmetric)[0])
-                for names, rotation, hessians_or_factors in gptq_groups:
-                    factors = hessians_or_factors
-                    if rotation is not None:
-                        r1 = rotation.to(hessians_or_factors)
-                        factors = gptq_factors_batched(r1.T @ hessians_or_factors @ r1, percdamp)
-                    weights = torch.stack([_weight_2d(moduledict[name]).float() for name in names])
-                    quantized_weights = gptq_quantize_batched(weights, factors, bits, group_size or -1, symmetric, block_size)
-                    for name, weight in zip(names, quantized_weights):
-                        _weight_2d(moduledict[name]).copy_(weight)
+                for name in quantized:
+                    weight = _weight_2d(moduledict[name])
+                    weight.copy_(round_weight(weight, bits, group_size or -1, symmetric)[0])
 
     fold(r1_signs, quantize=False)
     with exact_float32_arithmetic():
@@ -1742,11 +1667,6 @@ def _search_r1_for_weight_quantization(
             logits, mask = compute_logits(model, batch)
             sample_counts.append(int(mask.shape[0]))
             teachers.append(logits[mask].to(torch.float16).cpu())
-
-    gptq_groups = []
-    percdamp, block_size = weight_quantization.get("percdamp", 0.01), weight_quantization.get("block_size", 128)
-    if method == "gptq":
-        gptq_groups = _collect_hessians(model, batches, compute_logits, quantized, reads_r1, fold, percdamp)
 
     device = next(model.parameters()).device
     applied = {"signs": None}
@@ -1762,7 +1682,7 @@ def _search_r1_for_weight_quantization(
                 total += float(kl_divergence(student_logits[mask], teachers[index].to(device)))
         return total / len(indices)
 
-    print(f"weight-only evolution: W{bits} group {group_size} {'symmetric' if symmetric else 'asymmetric'} {method.upper()} on "
+    print(f"weight-only evolution: W{bits} group {group_size} {'symmetric' if symmetric else 'asymmetric'} RTN on "
           f"{len(quantized)} layers; {sum(sample_counts)} calibration samples in {len(batches)} batches, "
           f"{stage_cost(evolution, sum(sample_counts))} samples scored per generation")
     r1_signs, _ = evolve_signs(r1_signs, fitness, sample_counts, evolution)
@@ -1773,7 +1693,7 @@ def _search_r1_for_weight_quantization(
         search={
             "name": "evolution",
             "quantization": "weights",
-            "weight_quantization": {"method": method, "bits": bits, "group_size": group_size, "symmetric": symmetric},
+            "weight_quantization": {"method": "rtn", "bits": bits, "group_size": group_size, "symmetric": symmetric},
             "R1_signs": {stream: (s1.cpu(), s2.cpu()) for stream, (s1, s2) in r1_signs.items()},
             "settings": evolution.settings(),
             "history": evolution.history,

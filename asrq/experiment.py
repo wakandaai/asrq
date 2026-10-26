@@ -51,9 +51,6 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
         cfg.transform.activation_groupwise_roles = cfg.activation_groupwise_roles
         cfg.transform.wgroup = cfg.quantizer.get("group_size", None)
         cfg.transform.wsymmetric = cfg.quantizer.get("symmetric", True)
-        cfg.transform.wmethod = cfg.quantizer.name
-        cfg.transform.wpercdamp = cfg.quantizer.get("percdamp", 0.01)
-        cfg.transform.wblock_size = cfg.quantizer.get("block_size", 128)
         if cfg.transform.name == "rotation":
             cfg.transform.learn_rotation = learn_rotation
 
@@ -61,7 +58,7 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
 def quantized_model_fingerprint(cfg: DictConfig) -> str:
     """A hash of every setting that determines the quantized weights, for reusing a saved quantized model.
 
-    Covers the model, the whole quantizer config (norm tweaking and block output refitting included), the calibration
+    Covers the model, the whole quantizer config (scale recovery and weight recovery included), the calibration
     set and size, the transform config and the contents of the transform's saved file (a rotation checkpoint or
     scales), so a changed setting or a re-run search never loads stale weights. Evaluation and inference settings are
     left out. Call it after the transform is obtained, when its file exists.
