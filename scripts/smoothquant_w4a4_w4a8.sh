@@ -14,7 +14,7 @@
 #          where one exists, and into an InputScale module after the activation where a nonlinearity sits in
 #          between (fc2, pointwise_conv2). With alpha fixed the scales depend on neither the weight nor the
 #          activation bits, so each model's scales are computed once and shared by its A4 and A8 runs.
-#          Quantization: RTN alone. No rotation, no GPTQ, no scale recovery, no block output refitting, and no
+#          Quantization: RTN alone. No rotation, no GPTQ, no scale recovery, no weight recovery, and no
 #          inserted block-output Linears, which only a rotation creates.
 #          Evaluation: all seven leaderboard datasets, with the activations fake-quantized.
 # Output:  outputs/scaling/smoothquant_alpha0.5_<model>.pt, and

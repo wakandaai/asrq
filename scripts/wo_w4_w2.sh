@@ -3,13 +3,13 @@
 # Weight-only W4 and W2 on all three models, over the full Open ASR Leaderboard.
 #
 # Question: how far does weight-only quantization get at 4 and 2 bits, with an evolutionary Hadamard rotation
-#           searched against the same weight quantizer, GPTQ, scale recovery, and refit block-output layers?
+#           searched against rounded weights, GPTQ, scale recovery, and weight recovery?
 #
 # Varies:  the model (whisper, parakeet, canary_qwen) and the weight width (4, 2).
 # Fixed:   groups of 128, activations in full precision (activation_bits=16).
 #          Rotation: evolutionary search over the signs of R1 = diag(s1) H diag(s2), weight-only fitness with
-#          GPTQ (the quantizer the run uses), 128 calibration utterances -- which are also the Hessians the
-#          search's GPTQ uses -- stages 16/64/128 keeping 8 then 4 children, 32 offspring of which the last is
+#          the candidate's weights rounded by RTN at the run's bits, group size and symmetry, on 128
+#          calibration utterances -- stages 16/64/128 keeping 8 then 4 children, 32 offspring of which the last is
 #          drawn at random, 8 generations. That is 32*16 + 8*64 + 4*128 = 1536 samples scored per generation.
 #          One rotation per model and width, since the fitness depends on the weight grid.
 #          Quantization: GPTQ on 2048 calibration utterances, scale recovery on the transformer blocks, block
@@ -34,7 +34,7 @@ declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
 # asrq/exp.py refuses a rotation searched under a different weight grid.
 declare -A SYMMETRIC=( [4]=True [2]=False )
 # Only the Conformer models have block-output Linears to quantize; Whisper has no such setting at all, and
-# block_output_refit simply finds nothing to refit there.
+# weight_recovery simply finds nothing to refit there.
 declare -A BLOCK_OUT=(
   [parakeet]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
   [canary_qwen]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
@@ -52,7 +52,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
       stamp "$model W$bits rotation search start"
       python -u asrq/rot-exp.py model=$model $grid $EXPERIMENT activation_bits=16 method=search_w$bits \
         calibration.num_samples=128 transform=rotation transform.path=$rotation \
-        transform.weight_only=true transform.weight_only_quantizer=gptq \
+        transform.weight_only=true \
         transform.search=evolution transform.num_samples=128 \
         transform.evolution.stages=1 \
         transform.evolution.offspring=32 \
@@ -65,7 +65,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
 
     stamp "$model W$bits quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=rotation transform.path=$rotation $grid $EXPERIMENT \
-      quantizer.scale_recovery=true quantizer.block_output_refit=true ${BLOCK_OUT[$model]} \
+      quantizer.scale_recovery=true quantizer.weight_recovery=true ${BLOCK_OUT[$model]} \
       activation_bits=16 calibration.num_samples=2048 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False method=wo_w$bits 2>&1 | tr '\r' '\n'
     stamp "$model W$bits quantize and evaluate end"

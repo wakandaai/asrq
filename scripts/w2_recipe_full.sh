@@ -7,7 +7,7 @@
 # Varies:  the model (whisper, parakeet, canary_qwen).
 # Fixed:   W2 asymmetric weights in groups of 128, activations in full precision, the rotation from the
 #          GPTQ-fitness weight-only search, GPTQ on 2048 calibration utterances, and the recovery recipe --
-#          scale recovery for transformer blocks, block output refitting for Conformer blocks.
+#          scale recovery for transformer blocks, weight recovery for Conformer blocks.
 # Output:  results/evaluations/<model>_full_w2_recipe_.../results.csv, one directory per run.
 #
 # Takes about 15 minutes per model for Parakeet and Canary-Qwen and about 40 for Whisper.
@@ -24,7 +24,7 @@ for model in ${MODELS:-parakeet canary_qwen whisper}; do
   stamp "$model W2 recipe start"
   python -u asrq/exp.py model=$model transform=rotation transform.path=outputs/rotation/wo_w2a_${model}_gptqfit.pt \
     quantizer=gptq quantizer.bits=2 quantizer.symmetric=False quantizer.group_size=128 \
-    quantizer.scale_recovery=true quantizer.block_output_refit=true \
+    quantizer.scale_recovery=true quantizer.weight_recovery=true \
     activation_bits=16 calibration.num_samples=2048 quantized_path=null \
     model.eval_batch_size=${BATCH[$model]} "$SPLITS" create_audio_files=False method=full_w2_recipe 2>&1 | tr '\r' '\n'
   stamp "$model W2 recipe end"

@@ -32,7 +32,7 @@ source "$CONDA_ACTIVATE" asrq
 cd "$PROJECT_DIR"
 declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
 # Only the Conformer models have block-output Linears to quantize; Whisper has no such setting at all, and
-# block_output_refit simply finds nothing to refit there.
+# weight_recovery simply finds nothing to refit there.
 declare -A BLOCK_OUT=(
   [parakeet]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
   [canary_qwen]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
@@ -67,7 +67,7 @@ for model in ${MODELS:-whisper canary_qwen}; do
     stamp "$model W4A$abits quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=rotation transform.path=$rotation $GRID $EXPERIMENT \
       $ACTIVATIONS activation_bits=$abits \
-      quantizer.scale_recovery=true quantizer.block_output_refit=true ${BLOCK_OUT[$model]} \
+      quantizer.scale_recovery=true quantizer.weight_recovery=true ${BLOCK_OUT[$model]} \
       calibration.num_samples=2048 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False method=wa_w4a$abits 2>&1 | tr '\r' '\n'
     stamp "$model W4A$abits quantize and evaluate end"

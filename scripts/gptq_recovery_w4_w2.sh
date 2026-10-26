@@ -9,7 +9,7 @@
 # Varies:  the model (whisper, parakeet, canary_qwen) and the weight width (4, 2).
 # Fixed:   groups of 128, W4 symmetric and W2 asymmetric as in the other weight-only runs, activations in full
 #          precision (activation_bits=16), no transform.
-#          Quantization: GPTQ on 2048 calibration utterances with scale recovery and block output refitting on.
+#          Quantization: GPTQ on 2048 calibration utterances with scale recovery and weight recovery on.
 #          Without a rotation there is no Linear after a Conformer block's output norm for the refit to use, so
 #          the refit finds nothing to do, and scale recovery covers every block instead: the norms of Whisper's
 #          encoder and decoder, of Canary-Qwen's LLM, and -- only when unrotated -- the four norms of each
@@ -36,7 +36,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
     stamp "$model W$bits quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=none \
       quantizer=gptq quantizer.bits=$bits quantizer.symmetric=${SYMMETRIC[$bits]} quantizer.group_size=128 \
-      quantizer.scale_recovery=true quantizer.block_output_refit=true \
+      quantizer.scale_recovery=true quantizer.weight_recovery=true \
       $EXPERIMENT activation_bits=16 calibration.num_samples=2048 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False method=gptq_recovery_w$bits \
       2>&1 | tr '\r' '\n'

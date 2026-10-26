@@ -3,7 +3,7 @@
 # SpinQuant-style baseline: Cayley SGD rotations, then plain GPTQ, at W4A4 and W4A8.
 #
 # Question: what do learned dense rotations and GPTQ alone reach, with none of this project's recovery steps?
-#           This is the comparison the scale recovery and block output refit results are measured against, and
+#           This is the comparison the scale recovery and weight recovery results are measured against, and
 #           the closest thing here to SpinQuant: a rotation trained by Cayley SGD on the model's own loss.
 #
 # Varies:  the model (whisper, parakeet, canary_qwen) and the activation width (4, 8).
