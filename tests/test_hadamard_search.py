@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from asrq.quantizers.gptq import GPTQQuantizer
-from asrq.quantizers.gptq_solver import add_to_hessian, gptq_factors, gptq_factors_batched, gptq_quantize, gptq_quantize_batched
+from asrq.quantizers.gptq_solver import add_to_hessian, gptq_factors, gptq_quantize
 from asrq.quantizers.rtn import RTNQuantizer
 from asrq.quantizers.weight_rounding import round_weight
 from asrq.transforms.rotation.hadamard_search import (
@@ -179,21 +179,6 @@ def test_the_gptq_quantizer_is_the_solver_on_its_hessian(symmetric):
     quantizer.add_batch((X, None))
     quantizer()
     assert torch.equal(layer.weight.detach(), expected)
-
-
-@pytest.mark.parametrize("symmetric", [True, False])
-def test_batched_gptq_is_per_layer_gptq(symmetric):
-    torch.manual_seed(0)
-    hessians, weights = [], torch.randn(4, 48, 32)
-    for layer in range(4):
-        X = torch.randn(200, 32)
-        X[:, layer] = 0
-        hessians.append(X.T @ X / 200)
-    hessians = torch.stack(hessians)
-    batched = gptq_quantize_batched(weights, gptq_factors_batched(hessians, 0.01), 2, 8, symmetric, 8)
-    for layer in range(4):
-        single = gptq_quantize(weights[layer], gptq_factors(hessians[layer], 0.01), 2, 8, symmetric, 8)
-        assert torch.allclose(batched[layer], single, atol=1e-6)
 
 
 def test_no_candidate_is_scored_twice_within_or_across_generations():

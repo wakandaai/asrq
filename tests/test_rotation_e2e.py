@@ -1681,9 +1681,8 @@ def test_with_symmetric_quantization_s2_does_not_change_the_kl(model, batches, s
         assert abs(s2_flipped - base) > 1e-3 * base
 
 
-def _weight_only_quantization(symmetric=True, method="rtn"):
-    return {"method": method, "bits": 2, "group_size": ACTIVATION_GROUP, "symmetric": symmetric, "layers": None,
-            "percdamp": 0.01, "block_size": ACTIVATION_GROUP}
+def _weight_only_quantization(symmetric=True):
+    return {"method": "rtn", "bits": 2, "group_size": ACTIVATION_GROUP, "symmetric": symmetric, "layers": None}
 
 
 @pytest.mark.parametrize("symmetric", [True, False])
@@ -1745,62 +1744,6 @@ def test_a_weight_only_search_needs_the_evolutionary_search_and_no_activation_bi
             model, str(tmp_path / "b.pt"), search="evolution", activation_bits=4, activation_group_size=ACTIVATION_GROUP,
             activation_roles=whisper_utils.get_whisper_activation_roles(model), **common,
         )
-
-
-@pytest.mark.parametrize("symmetric", [True, False])
-def test_the_gptq_weight_only_search_scores_gptq_on_the_rotated_hessians(batches, tmp_path, symmetric):
-    """The saved fitness is recomputed with the GPTQ quantizer on Hessians collected in the rotated model.
-
-    The search collects each Hessian once with R1 = I and rotates it as R1.T @ H @ R1 for the layers reading
-    the residual stream, keeping the other layers' factors fixed. Collecting them afresh from the applied
-    rotation must give the same quantized model, up to float rounding in the Hessians.
-    """
-    path = tmp_path / "gptq.pt"
-    searched = _build_model()
-    utils.learn_rotations(
-        searched, str(path),
-        hidden_size=D_MODEL, learning_rate=0.0, compute_logits=whisper_utils.whisper_logits_fn,
-        train_loader=batches, epochs=1, hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
-        search="evolution", evolution=_evolution_settings(generations=4),
-        weight_quantization=_weight_only_quantization(symmetric, method="gptq"),
-        **whisper_utils.get_whisper_rotation_layers(searched),
-    )
-    saved = torch.load(path)
-    assert saved["search"]["weight_quantization"]["method"] == "gptq"
-    trajectory = [record["fitness"] for record in saved["search"]["history"]]
-    assert all(b <= a for a, b in zip(trajectory, trajectory[1:]))
-
-    original = _build_model()
-    references = [_logits(original, batch) for batch in batches]
-    rotated = _build_model()
-    layers = whisper_utils.get_whisper_rotation_layers(rotated)
-    utils.apply_rotations(rotated, str(path), hadamard_block_size=ACTIVATION_GROUP, **layers)
-    modules = dict(rotated.named_modules())
-    names = [name for group in layers["layers_to_rotate"] for name, _ in group[2]]
-    hessians = {name: [torch.zeros(utils._weight_2d(modules[name]).shape[1],) * 0, 0] for name in names}
-    for name in names:
-        width = utils._weight_2d(modules[name]).shape[1]
-        hessians[name][0] = torch.zeros(width, width, device=DEVICE)
-
-    def hook(_module, inputs, _output, name):
-        x = inputs[0].reshape(-1, inputs[0].shape[-1])
-        hessians[name][0], hessians[name][1] = solver.add_to_hessian(hessians[name][0], hessians[name][1], x)
-
-    handles = [modules[name].register_forward_hook(lambda m, i, o, name=name: hook(m, i, o, name)) for name in names]
-    with torch.no_grad():
-        for batch in batches:
-            whisper_utils.whisper_logits_fn(rotated, batch)
-        for handle in handles:
-            handle.remove()
-        for name in names:
-            weight = utils._weight_2d(modules[name])
-            factors = solver.gptq_factors(hessians[name][0], 0.01)
-            weight.copy_(solver.gptq_quantize(weight, factors, 2, ACTIVATION_GROUP, symmetric, ACTIVATION_GROUP))
-        kls = []
-        for batch, reference in zip(batches, references):
-            logits, mask = whisper_utils.whisper_logits_fn(rotated, batch)
-            kls.append(float(utils.masked_kl_divergence(logits, reference, mask)))
-    assert abs(sum(kls) / len(kls) - trajectory[-1]) < 0.02 * trajectory[-1]
 
 
 @pytest.mark.parametrize("channels_first", [False, True])

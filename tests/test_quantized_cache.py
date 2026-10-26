@@ -38,7 +38,7 @@ def _modelq(model):
 
 
 def _quantized(width=16):
-    """A model as quantization leaves it: rounded weights and a norm tweaking gave a scale-free norm a scale."""
+    """A model as quantization leaves it: rounded weights, and a scale recovery gave a scale-free norm a scale."""
     model = _model(width=width)
     with torch.no_grad():
         for block in model.layers:

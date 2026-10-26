@@ -6,14 +6,14 @@ import torch
 import torch.nn as nn
 
 from asrq.core.model import ModelQ
-from asrq.quantizers.output_refit import OutputRefit
+from asrq.quantizers.weight_recovery import WeightRecovery
 
 
 def test_the_refit_recovers_a_linear_map_from_its_statistics():
     torch.manual_seed(0)
     layer = nn.Linear(16, 12).double()
     W, b = torch.randn(12, 16, dtype=torch.float64), torch.randn(12, dtype=torch.float64)
-    refit = OutputRefit(layer)
+    refit = WeightRecovery(layer)
     for _ in range(4):
         z = torch.randn(50, 16, dtype=torch.float64)
         refit.add(z, z @ W.T + b)
@@ -26,7 +26,7 @@ def test_a_large_ridge_keeps_the_current_weights():
     torch.manual_seed(0)
     layer = nn.Linear(8, 8).double()
     start = layer.weight.detach().clone()
-    refit = OutputRefit(layer)
+    refit = WeightRecovery(layer)
     z = torch.randn(100, 8, dtype=torch.float64)
     refit.add(z, torch.randn(100, 8, dtype=torch.float64))
     refit.solve(ridge=1e6)
@@ -52,7 +52,7 @@ def _model_and_samples(width=32):
 
 
 def _modelq(model, **config):
-    modelq = SimpleNamespace(model=model, quant_cfg=SimpleNamespace(block_output_refit_ridge=0.0, **config))
+    modelq = SimpleNamespace(model=model, quant_cfg=SimpleNamespace(weight_recovery_ridge=0.0, **config))
     modelq.block_output_layer = lambda name: ModelQ.block_output_layer(modelq, name)
     return modelq
 
@@ -72,7 +72,7 @@ def test_refitting_a_block_lowers_its_output_error_by_the_reported_amount():
     modelq = _modelq(model)
     assert modelq.block_output_layer("layers.0") == "layers.0.norm_out.1"
     before = error()
-    ModelQ.refit_block_output(modelq, "layers.0", {"layers.0.ff": object()}, lambda i: block(samples[i]), targets)
+    ModelQ.apply_weight_recovery(modelq, "layers.0", {"layers.0.ff": object()}, lambda i: block(samples[i]), targets)
     after = error()
     assert after < 0.8 * before
 
@@ -100,13 +100,13 @@ def test_a_quantized_output_layer_is_refit_and_then_quantized():
             return ("scales", "zeros")
 
     quantizer = Quantizer()
-    modelq = _modelq(model, block_output_refit=True)
+    modelq = _modelq(model, weight_recovery=True)
     modelq.qparams = {}
-    modelq.capture_refit_targets = lambda name: ModelQ.capture_refit_targets(modelq, name)
+    modelq.capture_weight_recovery = lambda name: ModelQ.capture_weight_recovery(modelq, name)
     targets = [torch.randn(1, 40, 32) for _ in samples]
     name = "layers.0.norm_out.1"
-    assert ModelQ.refit_quantizes_output_layer(modelq, "layers.0", {name: quantizer}) == {name}
-    ModelQ.refit_block_output(modelq, "layers.0", {name: quantizer}, lambda i: block(samples[i]), targets)
+    assert ModelQ.weight_recovery_quantizes(modelq, "layers.0", {name: quantizer}) == {name}
+    ModelQ.apply_weight_recovery(modelq, "layers.0", {name: quantizer}, lambda i: block(samples[i]), targets)
     assert quantizer.nsamples == 0 or quantizer.tokens > 0
     assert not torch.equal(quantizer.weight_when_called, start), "the layer was refit before it was quantized"
     assert torch.equal(layer.weight, torch.round(quantizer.weight_when_called * 4) / 4)
