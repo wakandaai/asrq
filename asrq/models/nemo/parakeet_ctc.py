@@ -390,7 +390,7 @@ class ParakeetCTCQ(ModelQ):
             hook.remove()
         
         blocks[0] = blocks[0].module # type: ignore
-        
+
         # quantize the encoder blocks
         for idx, block in enumerate(tqdm(blocks, desc="Quantizing encoder blocks")):
             quantizers = {}
@@ -424,11 +424,16 @@ class ParakeetCTCQ(ModelQ):
             for hook in hooks:
                 hook.remove()
             groups = self.capture_scale_recovery(quantizers)
+            quantizers = self.in_execution_order(quantizers, lambda i: block(**inp_kwargs[i]))
+            recover = self.layer_recovery(
+                block, quantizers, lambda b, i: b(**inp_kwargs[i]), len(self.calibration_samples),
+            )
 
             # quanitze
-            for name in self.quantize_layers(quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers)):
+            for name in self.quantize_layers(
+                quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers), recover,
+            ):
                 tqdm.write(f"Quantized {name}")
-            self.apply_scale_recovery(groups)
             self.apply_weight_recovery(block_name, quantizers, lambda i, block=block: block(**inp_kwargs[i]), recovery_targets)
 
             # get the output of the block and use it as input for the next block

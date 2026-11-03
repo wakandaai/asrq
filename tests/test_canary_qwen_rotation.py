@@ -125,7 +125,7 @@ def test_the_applied_rotation_reproduces_the_original_logits(learned):
     assert entries["perception.encoder.layers.0.input_rotation"].center
     assert not entries["llm.model.layers.0.input_rotation"].center
     assert all(isinstance(layer.mlp.down_proj.input_hadamard, utils.OnlineHadamard) for layer in rotated.llm.model.layers)
-    assert type(rotated.llm.model.layers[0].input_layernorm).__name__ == "_rmsnorm"
+    assert type(rotated.llm.model.layers[0].input_layernorm).__name__ == "_ScaleFreeRMSNorm"
     assert rotated.llm.model.layers[0].input_layernorm.upcast
 
 

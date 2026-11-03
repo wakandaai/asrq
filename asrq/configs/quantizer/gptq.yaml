@@ -23,3 +23,12 @@ scale_recovery_method: lockstep
 # current weights.
 weight_recovery: False
 weight_recovery_ridge: 0.01
+# The same refit on every quantized layer, each one just before it is quantized, with the full-precision
+# output coming from a copy of its block taken before any of it was quantized; see ModelQ.layer_recovery.
+# Independent of weight_recovery, which keeps correcting a Conformer block's whole error at its output
+# layer. This costs two extra block passes over the calibration set per recovered layer, and skips the
+# layers no quantized layer feeds yet, where the refit is the identity. It also makes each block quantize
+# its layers in the order they run rather than the order they are defined, so that every layer is refit
+# against the drift of everything feeding it; see ModelQ.in_execution_order.
+layer_weight_recovery: False
+layer_weight_recovery_ridge: 0.01

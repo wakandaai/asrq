@@ -13,7 +13,9 @@
 #          full-precision model with the activations fake-quantized exactly as evaluation will, 128 calibration
 #          utterances, stages 16/64/128 keeping 16 then 4 children, 32 offspring of which half are drawn at
 #          random, 8 generations. One rotation per model and activation width, since the fitness depends on the
-#          activation quantizer; the weights are not quantized during the search.
+#          activation quantizer; the weights are not quantized during the search. That search has since been
+#          removed from the code, so this script evaluates the saved rotations and skips any model and
+#          activation width whose checkpoint is missing; the header records how the existing ones were made.
 #          Quantization: GPTQ on 2048 calibration utterances, scale recovery on the transformer blocks, block
 #          output refitting on the Conformer blocks, whose inserted output Linears are refit and then quantized
 #          at 4 bits.
@@ -22,7 +24,6 @@
 #          results/evaluations/wa_w4a4_w4a8_<model>_wa_w4a<bits>_.../{results.csv,config.yaml}, one directory
 #          per run. Every run is logged to wandb in the group wa_w4a4_w4a8.
 #
-# A search is skipped when its rotation file already exists, so the script can be re-run after an interruption.
 # Run a subset with MODELS=whisper ABITS=4 bash scripts/wa_w4a4_w4a8.sh
 #
 # Usage: bash scripts/wa_w4a4_w4a8.sh [conda activate script] [project directory]
@@ -50,18 +51,8 @@ for model in ${MODELS:-whisper canary_qwen}; do
     rotation=outputs/rotation/evo128_wa_w4a${abits}_${model}.pt
 
     if [ ! -f $rotation ]; then
-      stamp "$model W4A$abits rotation search start"
-      python -u asrq/rot-exp.py model=$model $GRID $EXPERIMENT $ACTIVATIONS activation_bits=$abits \
-        method=search_w4a$abits calibration.num_samples=128 \
-        transform=rotation transform.path=$rotation \
-        transform.search=evolution transform.num_samples=128 \
-        transform.evolution.stages=1 \
-        transform.evolution.offspring=32 \
-        transform.evolution.random_offspring=32 \
-        transform.evolution.generations=1 2>&1 | tr '\r' '\n'
-      stamp "$model W4A$abits rotation search end"
-    else
-      stamp "$model W4A$abits rotation exists, skipping the search"
+      stamp "$model W4A$abits: no rotation at $rotation, and the evolutionary search that made it was removed"
+      continue
     fi
 
     stamp "$model W4A$abits quantize and evaluate start"

@@ -113,36 +113,16 @@ def test_a_run_carries_the_config_and_closes(fake_wandb):
     cfg = _cfg(tags=["w2"])
     with tracking.start(cfg, "rotation") as run:
         assert tracking.enabled()
-        tracking.log({"search/generation": 1, "search/fitness": 0.5})
-        tracking.summary({"search/final_fitness": 0.4})
+        tracking.log({"search/step": 1, "search/loss": 0.5})
+        tracking.summary({"search/final_loss": 0.4})
         tracking.config_update({"rotation_file": "x.pt"})
     (fake,) = fake_wandb
     assert fake.kwargs["job_type"] == "rotation" and fake.kwargs["tags"] == ["w2"] and fake.kwargs["mode"] == "offline"
     assert fake.kwargs["config"]["model"]["name"] == cfg.model.name
-    assert ("log", {"search/generation": 1, "search/fitness": 0.5}) in fake.rows
-    assert fake.summary["search/final_fitness"] == 0.4
+    assert ("log", {"search/step": 1, "search/loss": 0.5}) in fake.rows
+    assert fake.summary["search/final_loss"] == 0.4
     assert ("config", {"rotation_file": "x.pt"}) in fake.rows
     assert fake.finished and not tracking.enabled()
-
-
-def test_the_evolutionary_search_logs_every_generation(fake_wandb):
-    from asrq.transforms.rotation.hadamard_search import EvolutionConfig, evolve_signs, random_sign_vectors
-
-    target = random_sign_vectors({None: 32}, torch.Generator().manual_seed(1), "cpu")[None][0]
-
-    def fitness(signs, batches):
-        return float((signs[None][0] != target).float().mean())
-
-    with tracking.start(_cfg(), "rotation"):
-        config_ = EvolutionConfig(generations=3, offspring=4, survivors=(2, 1), stage_samples=(4, 4, 8), flips=1,
-                                  mutate="s1")
-        evolve_signs(random_sign_vectors({None: 32}, torch.Generator().manual_seed(0), "cpu"), fitness, [4] * 2,
-                     config_, log=lambda _line: None)
-    (fake,) = fake_wandb
-    generations = [row for kind, row in fake.rows if kind == "log" and "search/generation" in row]
-    assert [row["search/generation"] for row in generations] == [0, 1, 2, 3]
-    assert {"search/fitness", "search/best_child", "search/accepted", "search/candidates_seen"} <= set(generations[-1])
-    assert fake.summary["search/name"] == "evolution" and "search/final_fitness" in fake.summary
 
 
 def test_scale_recovery_and_refit_log_per_group_and_block(fake_wandb):

@@ -14,7 +14,7 @@ projection. The two are separate residual streams of different widths, so each g
   projection writes and the text embeddings both enter through that one hook.
 
 Each Qwen layer rotates q/k (type 1), v (type 2, head-wise R2), o (type 3), gate/up (type 1) and down
-(type 4). Down's input is ``act(gate(x)) * up(x)``, a product rather than one activation's output, so
+(ROT_OUTPUT_R1). Down's input is ``act(gate(x)) * up(x)``, a product rather than one activation's output, so
 its online Hadamard sits at down's own input (an activation name of None in the online Hadamard
 pairs). Grouped-query attention needs nothing special: R2 acts per head on V's key-value heads, the
 same matrix the output projection undoes on every query head that reads them.
@@ -30,15 +30,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from asrq.calibration.data import length_sorted_batches
 from nemo.collections.common.prompts.formatter import PromptFormatter
 from peft import PeftModel
 
 from asrq.transforms.rotation.parakeet_ctc_utils import (
-    ROT_INPUT_R1,
-    ROT_INPUT_R1_OUTPUT_R2,
-    ROT_INPUT_R2_OUTPUT_R1,
-    ROT_OUTPUT_R1,
     attach_parakeet_rotation_hooks,
     get_parakeet_activation_roles,
     get_parakeet_layers_to_rotate,
@@ -46,7 +41,14 @@ from asrq.transforms.rotation.parakeet_ctc_utils import (
     get_parakeet_online_hadamard_layers,
     insert_conformer_block_output_linears,
 )
-from asrq.transforms.rotation.utils import add_residual_stream_entry_hook, add_unrotate_input_hook
+from asrq.transforms.rotation.utils import (
+    ROT_INPUT_R1,
+    ROT_INPUT_R1_OUTPUT_R2,
+    ROT_INPUT_R2_OUTPUT_R1,
+    ROT_OUTPUT_R1,
+    add_residual_stream_entry_hook,
+    add_unrotate_input_hook,
+)
 
 ENCODER = "encoder"
 LLM = "llm"
@@ -90,7 +92,7 @@ def get_canary_qwen_norm_layers(model) -> List[Tuple[str, List[str], List[str]]]
 
 
 def get_canary_qwen_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[str, int]], str]]:
-    """``(attention_name, head_dim, [(layer_name, rot_type), ...], stream)`` for both streams."""
+    """``(attention_name, head_dim, [(layer_name, kind), ...], stream)`` for both streams."""
     groups = [
         (_prefixed(PERCEPTION, attention), head_dim, [(_prefixed(PERCEPTION, n), t) for n, t in layers], ENCODER)
         for attention, head_dim, layers in get_parakeet_layers_to_rotate(model.perception)
@@ -252,16 +254,15 @@ def canary_qwen_loss_fn(model, batch):
 
 
 def build_canary_qwen_dataloader(
-    model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42, sort_by_length: bool = False,
+    model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42,
 ) -> torch.utils.data.DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.DataLoader(
         CanaryQwenCalibrationDataset(model, samples),
-        **(
-            {"batch_sampler": length_sorted_batches(samples, batch_size, seed)} if sort_by_length
-            else {"batch_size": batch_size, "shuffle": True, "generator": generator}
-        ),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
         collate_fn=partial(canary_qwen_collate_fn, pad_id=model.text_pad_id),
         num_workers=0,
     )

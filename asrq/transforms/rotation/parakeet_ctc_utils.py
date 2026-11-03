@@ -16,20 +16,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from asrq.calibration.data import length_sorted_batches
 
 from asrq.transforms.rotation.utils import (
+    ROT_INPUT_R1,
+    ROT_INPUT_R1_OUTPUT_R1,
+    ROT_INPUT_R1_OUTPUT_R2,
+    ROT_INPUT_R2_OUTPUT_R1,
+    ROT_OUTPUT_R1,
     add_residual_stream_entry_hook,
     add_unrotate_input_hook,
     insert_linear_after_norm,
 )
-
-# Rotation types, as learn_rotations dispatches them.
-ROT_INPUT_R1 = 1  # Linear(X R1.T)        -- q, k, the first layer of each feed-forward
-ROT_INPUT_R1_OUTPUT_R2 = 2  # Linear(X R1.T) R2     -- v
-ROT_INPUT_R2_OUTPUT_R1 = 3  # Linear(X R2.T) R1     -- attention output
-ROT_OUTPUT_R1 = 4  # Linear(X) R1          -- layers reading a nonlinearity's output
-ROT_INPUT_R1_OUTPUT_R1 = 5  # Linear(X R1.T) R1     -- the inserted block-output Linear
 
 
 class ParakeetCalibrationDataset(torch.utils.data.Dataset):
@@ -121,17 +118,15 @@ def parakeet_ctc_logits_fn(model, batch):
 
 def build_parakeet_dataloader(
     model, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42,
-    sort_by_length: bool = False,
 ) -> torch.utils.data.DataLoader:
     pad_id = getattr(model.tokenizer, "pad_id", 0)
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.DataLoader(
         ParakeetCalibrationDataset(model, samples),
-        **(
-            {"batch_sampler": length_sorted_batches(samples, batch_size, seed)} if sort_by_length
-            else {"batch_size": batch_size, "shuffle": True, "generator": generator}
-        ),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
         collate_fn=partial(parakeet_ctc_collate_fn, pad_id=pad_id if pad_id > 0 else 0),
         num_workers=0,
         pin_memory=True,
@@ -234,7 +229,7 @@ def get_parakeet_norm_layers(model) -> List[Tuple[str, List[str], List[str]]]:
 
 
 def get_parakeet_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[str, int]]]]:
-    """Return ``(attention_name, head_dim, [(layer_name, rot_type), ...])`` for the encoder.
+    """Return ``(attention_name, head_dim, [(layer_name, kind), ...])`` for the encoder.
 
     One R2 is learned per attention module. A Conformer block holds one, so each block
     contributes a single entry carrying its feed-forward, convolution and block-output layers

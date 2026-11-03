@@ -17,6 +17,7 @@ from asrq.calibration.data import load_calibration_samples
 from asrq.core.linear import ASRQLinear, replace_with_asrq_linear
 from abc import ABC, abstractmethod
 from datasets import load_dataset
+from functools import partial
 from itertools import islice
 from tqdm import tqdm
 from asrq.evaluation.english_text_normalizer import normalizer
@@ -266,37 +267,48 @@ class ModelQ(ABC):
             return []
         return capture_scale_recovery(self.scale_recovery_targets(), quantizers)
 
-    def quantize_layers(self, quantizers: Dict[str, Any], groups: list, skip: Optional[set] = None) -> Iterator[str]:
+    def quantize_layers(
+        self, quantizers: Dict[str, Any], groups: list, skip: Optional[set] = None, recover=None,
+    ) -> Iterator[str]:
         """Quantize a block's layers, recording each one's quantization parameters in qparams, and yield each
         name once its layer is quantized.
 
         The layers a norm feeds are quantized together by quantize_scale_group, when the first of them comes up,
-        which also fits their scale for apply_scale_recovery; every other layer is quantized by its own
+        which also fits their scale; it is folded into the norm straight away, so the rest of the block runs on
+        a model that computes what it will compute at inference. Every other layer is quantized by its own
         quantizer. Names in ``skip`` are left for the caller, as apply_weight_recovery quantizes a block's output
         layer itself, after refitting it.
+
+        ``recover(name)``, from layer_recovery, refits a layer just before it is quantized; the layers a norm
+        feeds are all recovered before the group is quantized, since they share one Hessian and one scale.
         """
         leaders = {group.target.layers[0]: group for group in groups}
         shared = {name for group in groups for name in group.target.layers}
         skip = skip or set()
+        recover = recover or (lambda name: None)
         for name, quantizer in quantizers.items():
             if name in skip:
                 continue
             if name in leaders:
                 group = leaders[name]
+                for layer in group.target.layers:
+                    recover(layer)
                 group.scale, group.ratio, qparams = quantize_scale_group(
                     [quantizers[layer] for layer in group.target.layers], self.quant_cfg.scale_recovery_ridge,
                     self.quant_cfg.scale_recovery_method,
                 )
+                self.apply_scale_recovery([group])
                 for layer, params in zip(group.target.layers, qparams):
                     self.qparams[layer] = params
                     yield layer
             elif name not in shared:
+                recover(name)
                 self.qparams[name] = quantizer()
                 yield name
 
     def apply_scale_recovery(self, captured: list) -> None:
-        """After a block's layers are quantized, fold their scales into the norms; see
-        asrq.quantizers.scale_recovery."""
+        """Fold the scales of groups whose layers are quantized into their norms; see
+        asrq.quantizers.scale_recovery. quantize_layers calls it per group, as each one is quantized."""
         if not captured:
             return
         results = apply_scale_recovery(captured, dict(self.model.named_modules()))
@@ -387,6 +399,147 @@ class ModelQ(ABC):
         if quantizer is not None:
             self.qparams[name] = quantizer()
             tqdm.write(f"Quantized {name} after recovering it")
+
+    def in_execution_order(self, quantizers: Dict[str, Any], run) -> Dict[str, Any]:
+        """The block's quantizers reordered by when their layers run, or unchanged when per-layer weight
+        recovery is off.
+
+        A block loop collects its quantizers from ``block.named_modules()``, which is the order the
+        submodules were assigned in ``__init__``, not the order the forward pass calls them: a Conformer
+        block defines its convolution module before its attention module and runs it after. Plain GPTQ does
+        not care, because every Hessian is collected before any layer is quantized and quantizing one layer
+        leaves the others untouched. layer_recovery does care: a layer can only be refit against the drift
+        that is already at its input, so a layer quantized before the layers that feed it never sees theirs.
+
+        The order is read from the model rather than declared per model: forward hooks fire in the order the
+        layers run, so one pass over one calibration sample gives it exactly, including layers a config
+        skips. A quantized layer the pass never calls keeps its place at the end.
+
+        Args:
+            quantizers: ``{layer name: quantizer}`` for the block, from named_modules.
+            run: ``run(index)`` runs the block on calibration sample ``index``.
+        """
+        if not getattr(self.quant_cfg, "layer_weight_recovery", False):
+            return quantizers
+        order: List[str] = []
+        handles = []
+
+        def hook(_module, _inputs, _output, name=""):
+            if name not in order:
+                order.append(name)
+
+        for name, quantizer in quantizers.items():
+            handles.append(quantizer.module.register_forward_hook(partial(hook, name=name)))
+        try:
+            with torch.no_grad():
+                run(0)
+        finally:
+            for handle in handles:
+                handle.remove()
+        order += [name for name in quantizers if name not in order]
+        return {name: quantizers[name] for name in order}
+
+    def layer_recovery(self, block: nn.Module, quantizers: Dict[str, Any], run, num_samples: int):
+        """``recover(name)`` for quantize_layers, which refits a layer onto its full-precision output just
+        before it is quantized; None when per-layer weight recovery is off.
+
+        Where apply_weight_recovery corrects a Conformer block's whole error at the linear layer it ends in,
+        this corrects one layer at a time, so it needs no such layer and reaches transformer blocks too. A
+        copy of the block, taken before anything in it is quantized, provides each layer's full-precision
+        output Y; the layer's input Z comes from the block as it stands, with the layers quantized so far in
+        place; the layer is refit to map Z onto Y and is quantized afterwards, so GPTQ puts the refit weight
+        on the grid. See asrq.quantizers.weight_recovery.
+
+        Both runs read the same block input, so the fit corrects the error this block's own quantized layers
+        introduce, as the block output refit does; error inherited from earlier blocks sits in Y as much as in
+        Z. Reaching for that inherited error instead was measured worse: a single linear map undoes only the
+        part of it that its own input spans.
+
+        A layer with no quantized layer upstream of it therefore sees Z equal to Y's input, where the fit
+        returns the weights the layer already has, and is skipped. One calibration sample decides that: the
+        two runs are the same computation except where a quantized layer lies between the block input and the
+        layer. Which layers those are depends on the order the block is quantized in; see in_execution_order.
+
+        The layer's Hessian is collected again in the same pass, from the inputs it is about to be quantized
+        on. The one from the calibration pass is stale twice over: refitting a layer and quantizing it both
+        move the inputs of everything downstream of it.
+
+        Args:
+            block: The block being quantized, with none of its layers quantized yet.
+            quantizers: ``{layer name: quantizer}`` for the block, as quantize_layers takes them.
+            run: ``run(block, index)`` runs a given block on calibration sample ``index``.
+            num_samples: The number of calibration samples ``run`` accepts.
+
+        Returns:
+            ``recover(name)``, or None when quantizer.layer_weight_recovery is off.
+        """
+        if not getattr(self.quant_cfg, "layer_weight_recovery", False):
+            return None
+        teacher = copy.deepcopy(block).eval()
+        sub_names = {id(module): name for name, module in block.named_modules()}
+        teacher_modules = dict(teacher.named_modules())
+        teacher_layers = {
+            name: teacher_modules[sub_names[id(quantizer.module)]] for name, quantizer in quantizers.items()
+        }
+
+        def first_input(layer, source):
+            """The layer's input on the first calibration sample, running ``source`` in place of the block."""
+            captured = {}
+
+            def hook(_module, inputs, _output):
+                captured.setdefault("x", inputs[0].detach())
+
+            handle = layer.register_forward_hook(hook)
+            try:
+                with torch.no_grad():
+                    run(source, 0)
+            finally:
+                handle.remove()
+            return captured.get("x")
+
+        def recover(name):
+            quantizer = quantizers[name]
+            layer, teacher_layer = quantizer.module, teacher_layers[name]
+            reference, current = first_input(teacher_layer, teacher), first_input(layer, block)
+            if reference is None or current is None or torch.equal(reference, current):
+                return
+            refit = WeightRecovery(layer)
+            if getattr(quantizer, "H", None) is not None:
+                quantizer.H.zero_()
+                quantizer.nsamples = 0
+            target = {}
+
+            def teacher_hook(_module, _inputs, output):
+                target["y"] = output
+
+            def layer_hook(_module, inputs, output):
+                refit.add(inputs[0], target["y"].to(inputs[0].device))
+                quantizer.add_batch((inputs[0], output))
+
+            handles = [
+                teacher_layer.register_forward_hook(teacher_hook),
+                layer.register_forward_hook(layer_hook),
+            ]
+            try:
+                with torch.no_grad():
+                    for index in range(num_samples):
+                        run(teacher, index)
+                        run(block, index)
+            finally:
+                for handle in handles:
+                    handle.remove()
+            before, after = refit.solve(self.quant_cfg.layer_weight_recovery_ridge)
+            tqdm.write(f"Recovered {name}: output error {before:.3e} -> {after:.3e} (relative to its energy)")
+            tracking.step_metric("layer_weight_recovery", "layer_weight_recovery/layer")
+            self._layer_recovery_layers = getattr(self, "_layer_recovery_layers", 0) + 1
+            tracking.log({
+                "layer_weight_recovery/layer": self._layer_recovery_layers,
+                "layer_weight_recovery/error_before": before,
+                "layer_weight_recovery/error_after": after,
+                "layer_weight_recovery/error_ratio": after / before if before > 0 else 1.0,
+            })
+
+        return recover
 
     def online_hadamard_layers(self) -> Dict[str, str]:
         """``{layer_name: activation_name}`` for layers fed by an online Hadamard module.

@@ -11,12 +11,11 @@ from asrq.quantizers.gptq import GPTQQuantizer
 from asrq.quantizers.gptq_solver import gptq_factors, gptq_quantize, gptq_quantize_columns
 from asrq.quantizers.scale_recovery import (
     ScaleTarget,
-    apply_scale_recovery,
     capture_scale_recovery,
     quantize_scale_group,
     scale_norm_output,
 )
-from asrq.transforms.rotation.utils import _rmsnorm
+from asrq.transforms.rotation.utils import _ScaleFreeRMSNorm
 
 
 @pytest.mark.parametrize("kind", ["layernorm", "scale-free"])
@@ -26,7 +25,7 @@ def test_scaling_a_norm_scales_its_output(kind):
     layer_norm = nn.LayerNorm(width)
     nn.init.normal_(layer_norm.weight, 1.0, 0.1)
     nn.init.normal_(layer_norm.bias, 0.0, 0.1)
-    norm = layer_norm if kind == "layernorm" else _rmsnorm(nn.RMSNorm(width), [nn.Linear(width, 4)])
+    norm = layer_norm if kind == "layernorm" else _ScaleFreeRMSNorm(nn.RMSNorm(width), [nn.Linear(width, 4)])
     x = torch.randn(3, width)
     s = torch.rand(width, dtype=torch.float64) + 0.5
     before = norm(x)
@@ -82,16 +81,22 @@ def test_an_absorbers_layers_are_quantized_together_and_the_tweak_lowers_their_o
     quantizers = {name: GPTQQuantizer(block[name], name, Config()) for name in ("q", "o", "k")}
     for quantizer in quantizers.values():
         quantizer.add_batch((normed, None))
-    modules = dict(block.named_modules())
     captured = capture_scale_recovery([ScaleTarget("norm", ["q", "k"])], quantizers)
-    model = SimpleNamespace(qparams={}, quant_cfg=SimpleNamespace(scale_recovery_ridge=0.0, scale_recovery_method=method))
+    model = SimpleNamespace(qparams={}, model=block, quant_cfg=SimpleNamespace(
+        scale_recovery_ridge=0.0, scale_recovery_method=method,
+    ))
+    model.apply_scale_recovery = lambda groups: ModelQ.apply_scale_recovery(model, groups)
     names = list(ModelQ.quantize_layers(model, quantizers, captured))
     assert sorted(names) == ["k", "o", "q"] and set(model.qparams) == {"k", "o", "q"}
     assert not any(hasattr(quantizer, "H") for quantizer in quantizers.values())
+    # quantize_layers has folded the scale already, so undoing it gives the unscaled error to compare with
+    (group,) = captured
+    s, ratio = group.scale, group.ratio
     with torch.no_grad():
-        untweaked = sum(float((block[n](block["norm"](x)) - full[n]).pow(2).sum()) for n in ("q", "k"))
-        (s, ratio), = apply_scale_recovery(captured, modules).values()
         tweaked = sum(float((block[n](block["norm"](x)) - full[n]).pow(2).sum()) for n in ("q", "k"))
+        block["norm"].weight.div_(s)
+        block["norm"].bias.div_(s)
+        untweaked = sum(float((block[n](block["norm"](x)) - full[n]).pow(2).sum()) for n in ("q", "k"))
     assert ratio < 1 and tweaked < untweaked
     assert abs(tweaked / untweaked - ratio) < 1e-3
 
@@ -143,3 +148,53 @@ def test_conformer_norms_are_recovered_only_when_no_rotation_left_a_layer_to_ref
     assert by_norm["encoder.layers.1.norm_self_att"] == [f"encoder.layers.1.self_attn.linear_{n}" for n in "qkv"]
     assert by_norm["encoder.layers.0.norm_conv"] == ["encoder.layers.0.conv.pointwise_conv1"]
     assert conformer_scale_recovery_targets(_conformer(rotated=True), "encoder.layers", 2) == []
+
+
+class RecordingQuantizer:
+    """A quantizer that only records when it was called."""
+
+    def __init__(self, name, events):
+        self.name, self.events = name, events
+
+    def __call__(self):
+        self.events.append(f"quantize {self.name}")
+        return ("scales", "zeros")
+
+
+def test_a_groups_scale_is_folded_before_the_next_layer_is_quantized(monkeypatch):
+    """layer_recovery reads a layer's drift by running the block, so a scale fitted earlier in the block has to
+    be in its norm by then rather than left for the end of the block."""
+    import asrq.core.model as model_module
+    from asrq.quantizers.scale_recovery import ScaleGroup
+
+    events = []
+    quantizers = {name: RecordingQuantizer(name, events) for name in ("q", "fc")}
+    group = ScaleGroup(ScaleTarget("norm", ["q"]))
+    monkeypatch.setattr(model_module, "quantize_scale_group", lambda *_args, **_kwargs: (
+        torch.ones(4), 0.5, [("scales", "zeros")],
+    ))
+    model = SimpleNamespace(qparams={}, quant_cfg=SimpleNamespace(
+        scale_recovery_ridge=0.0, scale_recovery_method="lockstep",
+    ))
+    model.apply_scale_recovery = lambda groups: events.append(f"fold {groups[0].target.norm}")
+    names = list(ModelQ.quantize_layers(
+        model, quantizers, [group], recover=lambda name: events.append(f"recover {name}"),
+    ))
+    assert names == ["q", "fc"]
+    assert events == ["recover q", "fold norm", "recover fc", "quantize fc"]
+
+
+def test_scale_recovery_is_off_when_the_activations_are_quantized(capsys):
+    """It fits the scale for the weights alone: the activation quantizer would then round the scaled channels,
+    and a rotation's spread of the outliers over those channels is what makes them roundable."""
+    from _pipeline import config
+    from asrq.experiment import prepare_experiment_config
+
+    cfg = config("whisper", ["quantizer.scale_recovery=true", "activation_bits=4", "transform=scaling"])
+    prepare_experiment_config(cfg, learn_rotation=False)
+    assert cfg.quantizer.scale_recovery is False
+    assert "scale_recovery is off" in capsys.readouterr().out
+
+    weight_only = config("whisper", ["quantizer.scale_recovery=true", "activation_bits=16", "transform=scaling"])
+    prepare_experiment_config(weight_only, learn_rotation=False)
+    assert weight_only.quantizer.scale_recovery is True

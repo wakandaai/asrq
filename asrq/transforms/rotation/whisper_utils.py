@@ -15,18 +15,15 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from asrq.calibration.data import length_sorted_batches
 
 from asrq.transforms.rotation.utils import (
+    ROT_INPUT_R1,
+    ROT_INPUT_R1_OUTPUT_R2,
+    ROT_INPUT_R2_OUTPUT_R1,
+    ROT_OUTPUT_R1,
     add_residual_stream_entry_hook,
     add_unrotate_input_hook,
 )
-
-# Rotation types, as learn_rotations dispatches them.
-ROT_INPUT_R1 = 1  # Linear(X R1.T)        -- q, k, fc1
-ROT_INPUT_R1_OUTPUT_R2 = 2  # Linear(X R1.T) R2     -- v
-ROT_INPUT_R2_OUTPUT_R1 = 3  # Linear(X R2.T) R1     -- out_proj
-ROT_OUTPUT_R1 = 4  # Linear(X) R1          -- fc2
 
 
 def build_whisper_decoder_targets(
@@ -154,16 +151,15 @@ def whisper_loss_fn(model, batch):
 
 
 def build_whisper_dataloader(
-    processor, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42, sort_by_length: bool = False,
+    processor, samples: Sequence[Tuple[np.ndarray, str]], batch_size: int = 4, seed: int = 42,
 ) -> torch.utils.data.DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return torch.utils.data.DataLoader(
         WhisperCalibrationDataset(processor, samples),
-        **(
-            {"batch_sampler": length_sorted_batches(samples, batch_size, seed)} if sort_by_length
-            else {"batch_size": batch_size, "shuffle": True, "generator": generator}
-        ),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
         collate_fn=partial(whisper_collate_fn, pad_token_id=processor.tokenizer.pad_token_id),
         num_workers=0,
         pin_memory=True,
@@ -238,7 +234,7 @@ def get_whisper_norm_layers(model) -> List[Tuple[str, List[str], List[str]]]:
 
 
 def _attention_group(prefix: str, attn: str) -> List[Tuple[str, int]]:
-    """The four projections of one attention module, with their rotation types."""
+    """The four projections of one attention module, with their rotation kinds."""
     p = f"{prefix}.{attn}"
     return [
         (f"{p}.q_proj", ROT_INPUT_R1),
@@ -249,14 +245,14 @@ def _attention_group(prefix: str, attn: str) -> List[Tuple[str, int]]:
 
 
 def get_whisper_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[str, int]]]]:
-    """Return ``(attention_name, head_dim, [(layer_name, rot_type), ...])`` for Whisper.
+    """Return ``(attention_name, head_dim, [(layer_name, kind), ...])`` for Whisper.
 
     The key is an attention module because that is what owns an R2: it is a head-dimension
     rotation applied to that module's V projection and undone by its output projection. A
     decoder layer holds two attention modules, whose head rotations are independent, so it
     contributes two entries.
 
-    The feed-forward layers use rotation types 1 and 4, which involve only R1, so they are
+    The feed-forward layers' kinds involve only R1, so they are
     listed under the attention module they share a transformer layer with.
     """
     config = model.config

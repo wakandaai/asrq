@@ -23,6 +23,21 @@ Conventions:
   lines so the log stays line-based; filter it when reading:
 
 ```bash
-tail -f outputs/pipeline/<name>.log | grep -E "^WER|generation |Traceback"   # live
+tail -f outputs/pipeline/<name>.log | grep -E "^WER|  step |Traceback"   # live
 grep -E "^\[|^WER" outputs/pipeline/<name>.log                               # results afterwards
 ```
+
+Recovery after quantization:
+
+- `scale_recovery` (`quantizer.scale_recovery`) gives each layer a transformer block's norms feed a
+  per-input-channel scale, fitted inside GPTQ and folded into the norm.
+- `weight_recovery` (`quantizer.weight_recovery`) refits the Linear a rotation inserts after a Conformer
+  block's output norm, so the quantized block reproduces the full-precision block's output.
+- `layer_weight_recovery` (`quantizer.layer_weight_recovery`) refits every quantized weight the same way, each
+  one just before it is quantized, against the output it had before anything in its block was quantized. It
+  also makes each block quantize its layers in the order they run rather than the order they are defined.
+
+`scale_recovery` only applies to weight-only runs: it folds a per-input-channel scale into a norm, which the
+activation quantizer would then have to round, and where a rotation spread the outliers across those channels a
+per-channel scale pulls them apart again. `asrq/experiment.py` turns it off whenever `activation_bits` is below
+16 and prints that it did, so a run's recorded config says what happened.

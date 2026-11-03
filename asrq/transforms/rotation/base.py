@@ -2,9 +2,7 @@
 
 import os
 
-import torch
-
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from asrq.core.registry import (
     ModelNames,
@@ -17,7 +15,6 @@ from asrq.transforms.rotation.canary_qwen_utils import (
     get_canary_qwen_rotation_inputs,
     get_canary_qwen_rotation_layers,
 )
-from asrq.transforms.rotation.hadamard_search import EvolutionConfig
 from asrq.transforms.rotation.parakeet_ctc_utils import (
     get_parakeet_rotation_inputs,
     get_parakeet_rotation_layers,
@@ -37,26 +34,23 @@ from asrq.transforms.rotation.whisper_utils import (
 # mapping and the layers to rotate.
 _ROTATION_INPUTS_FNS = {
     ModelNames.OPENAI_WHISPER_LARGE_V3: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear, sort_by_length: get_whisper_rotation_inputs(
+        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_whisper_rotation_inputs(
             modelQ.model,
             modelQ.processor,
             modelQ.calibration_samples[:num_samples],
             batch_size=batch_size,
-            sort_by_length=sort_by_length,
         )
     ),
     ModelNames.NVIDIA_PARAKEET_CTC_1_1B: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear, sort_by_length: get_parakeet_rotation_inputs(
+        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_parakeet_rotation_inputs(
             modelQ.model, modelQ.calibration_samples[:num_samples],
             quantize_block_output_linear=quantize_block_output_linear, batch_size=batch_size,
-            sort_by_length=sort_by_length,
         )
     ),
     ModelNames.NVIDIA_CANARY_QWEN_2_5B: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear, sort_by_length: get_canary_qwen_rotation_inputs(
+        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_canary_qwen_rotation_inputs(
             modelQ.model, modelQ.calibration_samples[:num_samples],
             quantize_block_output_linear=quantize_block_output_linear, batch_size=batch_size,
-            sort_by_length=sort_by_length,
         )
     ),
 }
@@ -92,11 +86,12 @@ class RotationTransformConfig(TransformConfig):
         if self.abits is not None and self.abits >= 16:
             self.abits = None
         # "kl" matches the full-precision model's output distribution; "ce" minimises the model's training loss
-        # on the calibration labels, which is what Cayley SGD optimises by default and needs no teacher pass.
-        # "auto" resolves below, once the search is known. See learn_rotations.
+        # on the calibration labels, which needs no teacher pass and is what "auto" selects. See learn_rotations.
         self.objective = cfg.objective
         if self.objective not in ("kl", "ce", "auto"):
             raise ValueError(f"transform.objective must be 'kl', 'ce' or 'auto', got {self.objective!r}")
+        if self.objective == "auto":
+            self.objective = "ce"
         self.activation_group_size = cfg.activation_group_size
         self.activation_symmetric = cfg.activation_symmetric
         # Roles quantized group-wise, the rest per token; see asrq.quantizers.activation. Set
@@ -116,30 +111,13 @@ class RotationTransformConfig(TransformConfig):
         # Conformer models: quantize the inserted block-output Linears' inputs during the search,
         # as evaluation will. Copied from the model config by exp.py and rot-exp.py.
         self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
-        self.search = cfg.get("search", "cayley")
-        if self.search not in ("cayley", "evolution"):
-            raise ValueError(f"transform.search must be 'cayley' or 'evolution', got {self.search!r}")
-        if self.objective == "auto":
-            self.objective = "ce" if self.search == "cayley" else "kl"
-        if self.search == "evolution" and self.objective != "kl":
-            raise ValueError("transform.search=evolution minimises the KL divergence; set transform.objective=kl")
-        self.evolution = cfg.get("evolution", None)
-        # Autocast dtype of the evolutionary search's forward passes; float32 runs them unchanged. The search's
-        # batches are also grouped by audio length, which cuts the padding the model computes on.
-        dtype = str(cfg.get("fitness_dtype", "float32"))
-        if dtype not in ("float32", "bfloat16", "float16"):
-            raise ValueError(f"transform.fitness_dtype must be float32, bfloat16 or float16, got {dtype!r}")
-        self.fitness_dtype = getattr(torch, dtype)
         # Refuse a rotation searched under other quantization settings; see check_rotation_settings.
         self.check_settings = bool(cfg.get("check_settings", True))
-        self.weight_only = bool(cfg.get("weight_only", False))
+        # The run's weight quantization, set from the quantizer by experiment.py. Only checked against a
+        # checkpoint from a weight-only search, which no longer exists but whose rotations still apply.
         self.wbits = cfg.get("wbits", 4)
         self.wgroup = cfg.get("wgroup", None)
         self.wsymmetric = cfg.get("wsymmetric", True)
-        if self.weight_only and self.search != "evolution":
-            raise ValueError("transform.weight_only searches R1 with transform.search=evolution")
-        if self.weight_only:
-            self.abits = None
         if self.abits is not None:
             check_hadamard_matches_groups(
                 self.hadamard_block_size, self.activation_group_size,
@@ -149,10 +127,10 @@ class RotationTransformConfig(TransformConfig):
 
 @register_transform(TransformNames.rotation)
 class RotationTransform(BaseTransform):
-    """QuaRot/SpinQuant-style rotation, learned over the Stiefel manifold or searched over Hadamard signs.
+    """QuaRot/SpinQuant-style rotation, learned over the Stiefel manifold with Cayley SGD.
 
-    obtain_transform searches R1 and R2 against the configured objective (``search``) and saves
-    them; apply_transform folds a saved pair into the weights. Both begin by converting every
+    obtain_transform learns R1 and R2 against the configured objective and saves them;
+    apply_transform folds a saved pair into the weights. Both begin by converting every
     LayerNorm to a scale-free, shift-free normalization, which is what makes the residual
     stream commute with R1 -- so a model that has had the rotation applied has also had its
     norms rewritten, and the two cannot be separated.
@@ -174,7 +152,6 @@ class RotationTransform(BaseTransform):
             num_samples=self.cfg.num_samples,
             batch_size=self.cfg.batch_size,
             quantize_block_output_linear=self.cfg.quantize_block_output_linear,
-            sort_by_length=self.cfg.search == "evolution",
         )
 
     def _rotation_layers(self, modelQ) -> dict:
@@ -202,30 +179,9 @@ class RotationTransform(BaseTransform):
             objective=self.cfg.objective,
             activation_group_size=self.cfg.activation_group_size,
             activation_symmetric=self.cfg.activation_symmetric,
-            search=self.cfg.search,
             model_name=self.cfg.model_name,
-            fitness_dtype=self.cfg.fitness_dtype,
-            weight_quantization=self._weight_quantization(modelQ),
-            evolution=EvolutionConfig.from_mapping(
-                OmegaConf.to_container(self.cfg.evolution, resolve=True) if self.cfg.evolution is not None else None
-            ),
             **self._rotation_inputs(modelQ),
         )
-
-    def _weight_quantization(self, modelQ):
-        """The weight-only search's quantization: RTN at the quantizer's bits, group size and symmetry, on the
-        rotated layers the quantizer quantizes."""
-        if not self.cfg.weight_only:
-            return None
-        model = modelQ.model
-        rotated = [name for group in self._rotation_layers(modelQ)["layers_to_rotate"] for name, _ in group[2]]
-        return {
-            "method": "rtn",
-            "bits": self.cfg.wbits,
-            "group_size": self.cfg.wgroup,
-            "symmetric": self.cfg.wsymmetric,
-            "layers": [name for name in rotated if modelQ.should_quantize_module(name, model.get_submodule(name))],
-        }
 
     def apply_transform(self, modelQ) -> None:
         """Fold the learned rotation in, and check the transcription is unchanged.

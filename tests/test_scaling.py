@@ -38,7 +38,7 @@ def _scale(model, layers_to_scale, head_dim, tmp_path):
     scales = _random_scales(model, layers_to_scale, head_dim)
     path = tmp_path / "scales.pt"
     torch.save(scales, path)
-    scale_model(SimpleNamespace(model=model, processor=None), None, layers_to_scale, head_dim, str(path))
+    scale_model(SimpleNamespace(model=model), layers_to_scale, head_dim, str(path))
     return scales
 
 
@@ -176,7 +176,7 @@ def test_scales_keep_whisper_exact(whisper, tmp_path):
         assert set(scales) == {names[0] for names, _ in layers_to_scale}
         assert all((scale > 0).all() for scale in scales.values())
         assert scales["model.encoder.layers.0.self_attn.out_proj"].numel() == HEAD_DIM
-        scale_model(SimpleNamespace(model=model, processor=None), None, layers_to_scale, HEAD_DIM, str(path))
+        scale_model(SimpleNamespace(model=model), layers_to_scale, HEAD_DIM, str(path))
         after = model(**inputs).logits
     assert (after - before).abs().max() < 1e-3
 

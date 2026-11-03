@@ -12,13 +12,13 @@ from omegaconf import OmegaConf
 from _pipeline import config
 from asrq.core.model import ModelQ
 from asrq.experiment import experiment_run_name, quantized_model_fingerprint, quantized_model_path
-from asrq.transforms.rotation.utils import _rmsnorm
+from asrq.transforms.rotation.utils import _ScaleFreeRMSNorm
 
 
 class Block(nn.Module):
     def __init__(self, width):
         super().__init__()
-        self.norm = _rmsnorm(nn.RMSNorm(width), [nn.Linear(width, width)])
+        self.norm = _ScaleFreeRMSNorm(nn.RMSNorm(width), [nn.Linear(width, width)])
         self.fc = nn.Linear(width, width)
 
     def forward(self, x):

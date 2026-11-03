@@ -35,6 +35,9 @@ class QuantConfig(ABC):
         self.scale_recovery_method = str(cfg.get("scale_recovery_method", "lockstep"))
         self.weight_recovery = bool(cfg.get("weight_recovery", False))
         self.weight_recovery_ridge = float(cfg.get("weight_recovery_ridge", 0.01))
+        # The same refit on every quantized layer, before it is quantized; see ModelQ.layer_recovery.
+        self.layer_weight_recovery = bool(cfg.get("layer_weight_recovery", False))
+        self.layer_weight_recovery_ridge = float(cfg.get("layer_weight_recovery_ridge", 0.01))
 
 
 class LinearQuantConfig(QuantConfig):

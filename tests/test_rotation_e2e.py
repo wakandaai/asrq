@@ -54,7 +54,6 @@ _load("asrq.transforms.rotation.hadamard_utils", _ROTATION / "hadamard_utils.py"
 rounding = _load("asrq.quantizers.weight_rounding", _ROTATION.parents[1] / "quantizers" / "weight_rounding.py")
 solver = _load("asrq.quantizers.gptq_solver", _ROTATION.parents[1] / "quantizers" / "gptq_solver.py")
 cayley = _load("asrq.transforms.rotation.cayley_sgd", _ROTATION / "cayley_sgd.py")
-hadamard_search = _load("asrq.transforms.rotation.hadamard_search", _ROTATION / "hadamard_search.py")
 activation = sys.modules["asrq.quantizers.activation"]
 utils = _load("asrq.transforms.rotation.utils", _ROTATION / "utils.py")
 
@@ -228,7 +227,12 @@ def test_the_verification_catches_a_wrong_rotation_fold(model, batches, tmp_path
     operand goes on which side, so it raises nothing on a square layer and merely returns the
     wrong answer.
     """
-    monkeypatch.setattr(utils, "patch_v_with_rotation", utils.patch_o_with_rotation)
+    rotate = utils._rotate_weight
+    monkeypatch.setattr(utils, "_rotate_weight", lambda weight, bias, kind, R1, R2=None, H=None: rotate(
+        weight, bias,
+        utils.ROT_INPUT_R2_OUTPUT_R1 if kind == utils.ROT_INPUT_R1_OUTPUT_R2 else kind,
+        R1, R2, H,
+    ))
     with pytest.raises(RuntimeError, match="rotation patching changed the model's output"):
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
@@ -559,8 +563,8 @@ def test_the_conv_patch_quantizes_the_channel_axis(monkeypatch):
         linear.bias.copy_(conv.bias)
     R1 = torch.linalg.qr(torch.randn(64, 64, device=DEVICE))[0]
     quantize = utils.make_activation_quantizer(4, 16, False)
-    utils.patch_q_k_fc1_with_rotation(conv, R1, quantize)
-    utils.patch_q_k_fc1_with_rotation(linear, R1, quantize)
+    utils.patch_rotation(conv, utils.ROT_INPUT_R1, R1, quantize_input=quantize)
+    utils.patch_rotation(linear, utils.ROT_INPUT_R1, R1, quantize_input=quantize)
 
     x = torch.randn(2, 64, 10, device=DEVICE)
     with torch.no_grad():
@@ -1574,176 +1578,6 @@ def test_the_search_leaves_no_rotation_modules_behind(model, batches, tmp_path):
         **whisper_utils.get_whisper_rotation_layers(model),
     )
     assert not any(isinstance(m, utils.ResidualStreamRotation) for m in model.modules())
-
-
-def _evolution_settings(**overrides):
-    settings = dict(generations=4, offspring=4, survivors=(2, 1), stage_samples=(2, 4, 6), flips=2, seed=3)
-    return hadamard_search.EvolutionConfig(**{**settings, **overrides})
-
-
-@pytest.mark.parametrize("symmetric", [True, False])
-def test_the_evolutionary_search_saves_a_signed_hadamard_r1_that_applies_exactly(batches, tmp_path, symmetric):
-    """R1 = diag(s1) @ H @ diag(s2) from the saved signs, a non-increasing KL, R2s left random, exact apply.
-
-    The default mutate="auto" leaves s2 at its initial signs under symmetric quantization, which it does
-    not affect, and mutates it under asymmetric quantization.
-    """
-    path = tmp_path / "evolved.pt"
-    searched = _build_model()
-    evolution = _evolution_settings(generations=8)
-    R1, R2s = utils.learn_rotations(
-        searched, str(path),
-        hidden_size=D_MODEL, learning_rate=0.0, compute_logits=whisper_utils.whisper_logits_fn,
-        train_loader=batches, epochs=1, hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
-        activation_bits=2, activation_group_size=ACTIVATION_GROUP, activation_symmetric=symmetric,
-        activation_roles=whisper_utils.get_whisper_activation_roles(searched),
-        search="evolution", evolution=evolution,
-        **whisper_utils.get_whisper_rotation_layers(searched),
-    )
-
-    saved = torch.load(path)
-    assert saved["search"]["name"] == "evolution"
-    assert saved["search"]["settings"]["offspring"] == 4
-    s1, s2 = saved["search"]["R1_signs"][None]
-    expected = hadamard_search.signed_hadamard(hadamard_search.hadamard_basis(D_MODEL, None, "cpu"), s1, s2)
-    assert (saved["R1"].double() - expected).abs().max() < 1e-6
-    trajectory = [record["fitness"] for record in saved["search"]["history"]]
-    assert len(trajectory) == 9 and all(b <= a for a, b in zip(trajectory, trajectory[1:]))
-    initial_s1, initial_s2 = hadamard_search.random_sign_vectors(
-        {None: D_MODEL}, torch.Generator().manual_seed(evolution.seed), "cpu"
-    )[None]
-    assert saved["search"]["settings"]["mutate"] == ("s1" if symmetric else "s1_s2")
-    # Mutations only flip s1 under symmetric quantization, so s2 survives unless a random child was accepted,
-    # which replaces both vectors.
-    accepted_random = any(record["accepted"] and record.get("best_child_random")
-                          for record in saved["search"]["history"][1:])
-    if symmetric and not accepted_random:
-        assert torch.equal(s2, initial_s2)
-    assert not torch.equal(s1, initial_s1)
-    for R2 in saved["R2s"].values():
-        assert (R2.T @ R2 - torch.eye(R2.shape[0])).abs().max() < 1e-5
-
-    fresh = _build_model()
-    before = _logits(fresh, batches[0])
-    utils.apply_rotations(fresh, str(path), hadamard_block_size=ACTIVATION_GROUP,
-                          **whisper_utils.get_whisper_rotation_layers(fresh))
-    after = _logits(fresh, batches[0])
-    assert (after - before).abs().max() / before.abs().max() < TOLERANCE
-
-
-def test_the_evolutionary_search_needs_the_kl_objective(model, batches, tmp_path):
-    with pytest.raises(ValueError, match="objective='kl'"):
-        utils.learn_rotations(
-            model, str(tmp_path / "r.pt"), hidden_size=D_MODEL, learning_rate=0.0,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
-            hadamard_block_size=HADAMARD_BLOCK_SIZE, objective="ce", compute_loss=_cross_entropy,
-            search="evolution", **whisper_utils.get_whisper_rotation_layers(model),
-        )
-
-
-@pytest.mark.parametrize("symmetric", [True, False])
-def test_with_symmetric_quantization_s2_does_not_change_the_kl(model, batches, symmetric):
-    """x @ diag(s1) @ H @ diag(s2): s2 flips rotated coordinates, which a symmetric quantizer commutes with.
-
-    The flips are random: flipping a Walsh pattern of s1 (every other position) permutes H's columns, which a
-    per-token quantizer is blind to as well.
-    """
-    utils.fold_norms(model, whisper_utils.get_whisper_norm_layers(model))
-    groups = whisper_utils.get_whisper_layers_to_rotate(model)
-    H = hadamard_search.hadamard_basis(D_MODEL, None, DEVICE)
-    R1 = torch.zeros(D_MODEL, D_MODEL, device=DEVICE)
-    R2s = {name: utils.random_hadamard_matrix(head_dim, DEVICE).float() for name, head_dim, _ in groups}
-    whisper_utils.attach_whisper_rotation_hooks(model, R1)
-    quantizers = activation.build_activation_quantizers(
-        whisper_utils.get_whisper_activation_roles(model), 4, ACTIVATION_GROUP, symmetric, ["attn_out", "fc2"],
-    )
-    utils.patch_rotations(model, groups, R1, R2s, {}, ACTIVATION_GROUP, quantizers,
-                          {4 * D_MODEL: utils.random_hadamard_signs(4 * D_MODEL, DEVICE)})
-
-    def kl(s1, s2):
-        R1.copy_(hadamard_search.signed_hadamard(H, s1, s2))
-        with torch.no_grad():
-            with activation.quantizers_disabled(quantizers):
-                teacher, mask = whisper_utils.whisper_logits_fn(model, batches[0])
-            student, _ = whisper_utils.whisper_logits_fn(model, batches[0])
-        return float(utils.masked_kl_divergence(student, teacher, mask))
-
-    generator = torch.Generator().manual_seed(0)
-    (s1, s2), = hadamard_search.random_sign_vectors({None: D_MODEL}, generator, DEVICE).values()
-    half = torch.where(torch.randperm(D_MODEL, generator=generator) < D_MODEL // 2, -1.0, 1.0).to(DEVICE)
-    base = kl(s1, s2)
-    s2_flipped = kl(s1, s2 * half)
-    s1_flipped = kl(s1 * half, s2)
-    assert abs(s1_flipped - base) > 1e-2 * base
-    if symmetric:
-        assert abs(s2_flipped - base) < 1e-4 * base
-    else:
-        assert abs(s2_flipped - base) > 1e-3 * base
-
-
-def _weight_only_quantization(symmetric=True):
-    return {"method": "rtn", "bits": 2, "group_size": ACTIVATION_GROUP, "symmetric": symmetric, "layers": None}
-
-
-@pytest.mark.parametrize("symmetric", [True, False])
-def test_the_weight_only_search_scores_the_folded_model_with_rounded_weights(batches, tmp_path, symmetric):
-    """The saved fitness is the KL of apply_rotations' model with RTN weights, recomputed independently.
-
-    The search restores and refolds the weights for every candidate; if a restore missed a layer or a bias,
-    the model it scored would differ from the one the checkpoint applies to.
-    """
-    path = tmp_path / "weight_only.pt"
-    searched = _build_model()
-    evolution = _evolution_settings(generations=6)
-    utils.learn_rotations(
-        searched, str(path),
-        hidden_size=D_MODEL, learning_rate=0.0, compute_logits=whisper_utils.whisper_logits_fn,
-        train_loader=batches, epochs=1, hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
-        search="evolution", evolution=evolution, weight_quantization=_weight_only_quantization(symmetric),
-        **whisper_utils.get_whisper_rotation_layers(searched),
-    )
-    saved = torch.load(path)
-    assert saved["search"]["quantization"] == "weights"
-    assert saved["search"]["weight_quantization"] == {
-        "method": "rtn", "bits": 2, "group_size": ACTIVATION_GROUP, "symmetric": symmetric,
-    }
-    assert saved["activation_quantization"]["bits"] is None
-    assert saved["search"]["settings"]["mutate"] == "s1_s2"
-    trajectory = [record["fitness"] for record in saved["search"]["history"]]
-    assert all(b <= a for a, b in zip(trajectory, trajectory[1:]))
-
-    original = _build_model()
-    references = [_logits(original, batch) for batch in batches]
-    rotated = _build_model()
-    layers = whisper_utils.get_whisper_rotation_layers(rotated)
-    utils.apply_rotations(rotated, str(path), hadamard_block_size=ACTIVATION_GROUP, **layers)
-    modules = dict(rotated.named_modules())
-    with torch.no_grad():
-        for group in layers["layers_to_rotate"]:
-            for name, _ in group[2]:
-                weight = utils._weight_2d(modules[name])
-                weight.copy_(rounding.round_weight(weight, 2, ACTIVATION_GROUP, symmetric)[0])
-        kls = []
-        for batch, reference in zip(batches, references):
-            logits, mask = whisper_utils.whisper_logits_fn(rotated, batch)
-            kls.append(float(utils.masked_kl_divergence(logits, reference, mask)))
-    assert abs(sum(kls) / len(kls) - trajectory[-1]) < 1e-3 * trajectory[-1]
-    assert trajectory[0] > 0
-
-
-def test_a_weight_only_search_needs_the_evolutionary_search_and_no_activation_bits(model, batches, tmp_path):
-    common = dict(
-        hidden_size=D_MODEL, learning_rate=0.0, compute_logits=whisper_utils.whisper_logits_fn,
-        train_loader=batches, epochs=1, hadamard_block_size=ACTIVATION_GROUP,
-        weight_quantization=_weight_only_quantization(), **whisper_utils.get_whisper_rotation_layers(model),
-    )
-    with pytest.raises(ValueError, match="search='evolution'"):
-        utils.learn_rotations(model, str(tmp_path / "a.pt"), **common)
-    with pytest.raises(ValueError, match="activation_bits=None"):
-        utils.learn_rotations(
-            model, str(tmp_path / "b.pt"), search="evolution", activation_bits=4, activation_group_size=ACTIVATION_GROUP,
-            activation_roles=whisper_utils.get_whisper_activation_roles(model), **common,
-        )
 
 
 @pytest.mark.parametrize("channels_first", [False, True])

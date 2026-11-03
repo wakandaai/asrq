@@ -59,7 +59,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
       python -u asrq/rot-exp.py model=$model $GRID $EXPERIMENT $ACTIVATIONS activation_bits=$abits \
         ${DETERMINISTIC[$model]} method=cayley_w4a$abits calibration.num_samples=800 \
         transform=rotation transform.path=$rotation \
-        transform.search=cayley transform.num_samples=800 transform.epochs=1 \
+        transform.num_samples=800 transform.epochs=1 \
         transform.learning_rate=0.5 2>&1 | tr '\r' '\n'
       stamp "$model W4A$abits Cayley rotation end"
     else

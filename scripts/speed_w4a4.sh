@@ -12,7 +12,8 @@
 #          it excludes model loading, quantization and data loading.
 #          fp16 arm: no transform and quantize=false, so nothing is quantized and the activations stay in 16
 #          bits -- the model as it would be served.
-#          W4A4 arm: the evolutionary A4 rotation (its recorded activation settings match this run's), GPTQ W4
+#          W4A4 arm: the saved A4 rotation in $ROTATION (its recorded activation settings match this run's,
+#          and it predates the removal of the search that produced it), GPTQ W4
 #          symmetric in groups of 128 on 128 calibration utterances, scale recovery and weight recovery, the
 #          inserted Conformer output Linears quantized at 4 bits, activations 4-bit symmetric per token except
 #          attn_out and fc2 at one scale per group of 128. inference=humming replaces every

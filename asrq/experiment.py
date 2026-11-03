@@ -32,15 +32,29 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
     settings are the ones evaluation uses; the rotation search gets the same ones, so a rotation is
     learned against the quantization it will be evaluated with.
 
+    Scale recovery is turned off here when the activations are quantized, so the config the run records
+    and fingerprints says what actually happened. It gives a quantized layer's input channels a scale and
+    folds it into the norm feeding them, which is free for the weights and not free for the activations:
+    the activation quantizer then rounds the scaled channels, and where a rotation spread the outliers
+    over the channels to make them roundable, a per-channel scale pulls them back apart. See
+    asrq/quantizers/scale_recovery.py. Weight recovery is unaffected -- it refits a whole weight matrix
+    rather than rescaling a norm's output.
+
     Args:
         cfg: The composed experiment config (quantizer, model, transform groups and top-level settings).
         learn_rotation: For the rotation transform, whether obtain_transform searches a rotation
-            (rot-exp.py) or only a saved one is applied (exp.py). ``transform.search`` chooses how.
+            (rot-exp.py) or only a saved one is applied (exp.py).
     """
     quantize_block_output_linear = cfg.model.get("quantize_block_output_linear", False)
     with open_dict(cfg.quantizer):
         cfg.quantizer.exclude_modules = cfg.model.exclude_modules
         cfg.quantizer.quantize_block_output_linear = quantize_block_output_linear
+        if cfg.activation_bits < 16 and cfg.quantizer.get("scale_recovery", False):
+            print(
+                f"scale_recovery is off: activation_bits={cfg.activation_bits} quantizes the activations, "
+                f"and the scale it folds into a norm is fitted for the weights alone"
+            )
+            cfg.quantizer.scale_recovery = False
     with open_dict(cfg.transform):
         cfg.transform.model_name = cfg.model.name
         cfg.transform.quantize_block_output_linear = quantize_block_output_linear

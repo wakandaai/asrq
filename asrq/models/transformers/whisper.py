@@ -564,8 +564,16 @@ class WhisperQ(ModelQ):
         for h in hooks:
             h.remove()
         groups = self.capture_scale_recovery(quant_methods)
+        quant_methods = self.in_execution_order(
+            quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]),
+        )
+        recover = self.layer_recovery(
+            block, quant_methods, lambda b, i: b(*inp_args[i], **inp_kwargs[i]), num_samples,
+        )
         # quantize layers
-        for name in self.quantize_layers(quant_methods, groups, self.weight_recovery_quantizes(block_name, quant_methods)):
+        for name in self.quantize_layers(
+            quant_methods, groups, self.weight_recovery_quantizes(block_name, quant_methods), recover,
+        ):
             # quantize_layers (e.g. RTNQuantizer) only fake-quantizes:
             # it writes a rounded-then-dequantized fp16 weight back into
             # submodules[name].weight.data for calibration/qparams
@@ -577,7 +585,6 @@ class WhisperQ(ModelQ):
             if isinstance(module, ASRQLinear):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
-        self.apply_scale_recovery(groups)
         self.apply_weight_recovery(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), recovery_targets)
 
         # get input into the next block
@@ -741,8 +748,16 @@ class WhisperQ(ModelQ):
         for h in hooks:
             h.remove()
         groups = self.capture_scale_recovery(quant_methods)
+        quant_methods = self.in_execution_order(
+            quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]),
+        )
+        recover = self.layer_recovery(
+            block, quant_methods, lambda b, i: b(*inp_args[i], **inp_kwargs[i]), num_samples,
+        )
         # quantize layers
-        for name in self.quantize_layers(quant_methods, groups, self.weight_recovery_quantizes(block_name, quant_methods)):
+        for name in self.quantize_layers(
+            quant_methods, groups, self.weight_recovery_quantizes(block_name, quant_methods), recover,
+        ):
             # quantize_layers (e.g. RTNQuantizer) only fake-quantizes:
             # it writes a rounded-then-dequantized fp16 weight back into
             # submodules[name].weight.data for calibration/qparams
@@ -754,7 +769,6 @@ class WhisperQ(ModelQ):
             if isinstance(module, ASRQLinear):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
-        self.apply_scale_recovery(groups)
         self.apply_weight_recovery(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), recovery_targets)
 
         # get input into the next block

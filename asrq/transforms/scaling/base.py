@@ -2,7 +2,6 @@
 
 from omegaconf import DictConfig
 from asrq.core.registry import TransformNames, register_transform, register_transform_config, ModelNames
-from asrq.core.types import Processor
 from asrq.transforms.base import BaseTransform, TransformConfig
 from asrq.transforms.rotation.canary_qwen_utils import canary_qwen_logits_fn
 from asrq.transforms.scaling.canary_qwen_utils import get_canary_qwen_layers_to_scale
@@ -108,11 +107,6 @@ def _is_attention_output(name: str) -> bool:
     return any(key in name for key in ATTENTION_OUTPUTS)
 
 
-def _input_width_scale(scale: torch.Tensor, in_features: int) -> torch.Tensor:
-    """A head-wise scale (``head_dim`` channels, shared by every head) tiled over a layer's input."""
-    return scale.repeat(in_features // scale.numel())
-
-
 def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, type="smoothquant", alpha=0.5):
     """Compute one smoothing scale per entry of ``layers_to_scale`` and save ``{entry's first layer: scale}``.
 
@@ -194,73 +188,56 @@ def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, typ
     torch.save(final_scales, scale_path)
 
 
-def scale_model(modelQ, audio, layers_to_scale, head_dim, scale_path):
+def scale_model(modelQ, layers_to_scale, head_dim, scale_path):
     """Move each entry's scale from its layers' input into their weights, in place.
 
     Each entry is ``(layer_names, prev)``: the layers' weights are multiplied by the scale over their
-    input channels and the reciprocal is folded into ``prev`` -- the output rows of a linear or pointwise
-    conv, a norm's weight and bias -- or, when ``prev`` is an activation with no weight to absorb it,
-    applied by an InputScale inserted after that activation.
+    input channels and the reciprocal is folded into ``prev`` -- the output rows of a linear, a norm's
+    weight and bias -- or, when ``prev`` is an activation with no weight to absorb it, applied by an
+    InputScale inserted after that activation. No model's helper names a pointwise conv as a ``prev``.
     """
     model = modelQ.model
-    processor = modelQ.processor
     device = next(model.parameters()).device
-
-    # layers_to_scale = get_canary_qwen_layers_to_scale(model)
     scales = torch.load(scale_path)
     moduledict = dict(model.named_modules())
     for layer_names, prev_name in layers_to_scale:
-        layer_name = layer_names[0]
-        scale = scales[layer_name].to(device)
+        scale = scales[layer_names[0]].to(device)
         scale = scale.where(scale != 0, 1e-3) # avoid scaling by 0
-        for layer_name in layer_names:
-            module = moduledict[layer_name]
-            if "linear_out" in layer_name or "o_proj" in layer_name or "out_proj" in layer_name:
-                w = module.weight.data.clone()
-                w = w.reshape(-1, head_dim) * scale.unsqueeze(0)
-                module.weight.data.copy_(w.reshape_as(module.weight.data))
-            elif isinstance(module, torch.nn.Conv1d):
-                # (out, in, k): the scale indexes input channels, i.e. dim 1.
-                module.weight.data *= scale.view(1, -1, 1)
-            else:
-                module.weight.data *= scale.unsqueeze(0)
+        # A head-wise scale, which only an attention output takes, has head_dim channels rather than one per
+        # input; every layer of an entry reads the same input, so one flag covers the entry and its prev.
+        head_wise = _is_attention_output(layer_names[0])
+        with torch.no_grad():
+            for layer_name in layer_names:
+                module = moduledict[layer_name]
+                if head_wise:
+                    w = module.weight.reshape(-1, head_dim) * scale.unsqueeze(0)
+                    module.weight.copy_(w.reshape_as(module.weight))
+                elif isinstance(module, torch.nn.Conv1d):
+                    # (out, in, k): the scale indexes input channels, i.e. dim 1.
+                    module.weight.mul_(scale.view(1, -1, 1))
+                else:
+                    module.weight.mul_(scale.unsqueeze(0))
 
-        # scale the prev layer
-        if isinstance(prev_name, str):
-            prev_names = [prev_name]
-        else:
-            prev_names = prev_name
-        for prev_name in prev_names:
+            # scale the prev layer
             prev_module = model.get_submodule(prev_name)
-            # for linear layers
-            if isinstance(prev_module, torch.nn.Conv1d):
-                # A pointwise conv feeding another layer: its output channels are the
-                # consumer's input channels, i.e. dim 0 of (out, in, k).
-                prev_module.weight.data /= scale.view(-1, 1, 1)
-                if prev_module.bias is not None:
-                    prev_module.bias.data /= scale
-            elif isinstance(prev_module, torch.nn.Linear):
-                if "linear_out" in layer_name or "o_proj" in layer_name or "out_proj" in layer_name:
+            if isinstance(prev_module, torch.nn.Linear):
+                if head_wise:
                     # prev_module is v_proj: shape (num_heads * head_dim, embed_dim).
                     # Row i must be divided by scale[i % head_dim], so tile the scale.
-                    num_repeats = prev_module.weight.shape[0] // scale.shape[0]
-                    scale_expanded = scale.repeat(num_repeats)  # (num_heads * head_dim,)
-                    prev_module.weight.data /= scale_expanded.unsqueeze(1)
+                    rows = scale.repeat(prev_module.weight.shape[0] // scale.shape[0])
+                    prev_module.weight.div_(rows.unsqueeze(1))
+                    if prev_module.bias is not None:
+                        prev_module.bias.div_(scale.repeat(prev_module.bias.shape[0] // scale.shape[0]))
                 else:
-                    prev_module.weight.data /= scale.unsqueeze(1)
-                if prev_module.bias is not None:
-                    if "linear_out" in layer_name or "o_proj" in layer_name or "out_proj" in layer_name:
-                        num_repeats = prev_module.bias.shape[0] // scale.shape[0]
-                        scale_expanded = scale.repeat(num_repeats)
-                        prev_module.bias.data /= scale_expanded
-                    else:
-                        prev_module.bias.data /= scale
+                    prev_module.weight.div_(scale.unsqueeze(1))
+                    if prev_module.bias is not None:
+                        prev_module.bias.div_(scale)
             elif getattr(prev_module, "weight", None) is not None:
                 # It has to be a normalization layer
                 # We scale the weight
-                prev_module.weight.data /= scale
-                if hasattr(prev_module, "bias") and prev_module.bias is not None:
-                    prev_module.bias.data /= scale
+                prev_module.weight.div_(scale)
+                if getattr(prev_module, "bias", None) is not None:
+                    prev_module.bias.div_(scale)
             else:
                 insert_input_scale_after_activation(model, prev_name, moduledict[layer_names[0]], scale)
 
@@ -301,8 +278,7 @@ class ScalingTransform(BaseTransform):
         """Apply the scaling transformation to the given model."""
         layers_to_scale, transcribe_fn, _, head_dim = self.prepare_for_transform(modelQ)
         original_text = transcribe_fn()
-        scale_model(modelQ, self.audio, layers_to_scale, head_dim, self.cfg.path)
-        # scale_whisper_model(modelQ, self.audio, self.sr, self.cfg.path, alpha=0.5, device="cuda")
+        scale_model(modelQ, layers_to_scale, head_dim, self.cfg.path)
         text_after_scaling = transcribe_fn()
         assert original_text == text_after_scaling, "Model output changed after scaling"
         

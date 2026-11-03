@@ -8,7 +8,7 @@
 # Varies:  the model (parakeet, canary_qwen, whisper).
 # Fixed:   W2 asymmetric weights in groups of 128. Activations 8-bit symmetric, per token, except attn_out and
 #          fc2, which keep one scale per group of 128 (activation_groupwise_roles).
-#          Rotation: the weight-only W2 GPTQ-fitness rotation, reused with transform.check_settings=false --
+#          Rotation: the saved weight-only W2 rotation, reused with transform.check_settings=false --
 #          its weight grid is exactly this run's (gptq, 2 bits, groups of 128, asymmetric), but it was searched
 #          with activations in full precision, so the check that a rotation matches the run's quantizer has to
 #          be turned off. No rotation has been searched against an 8-bit activation quantizer.

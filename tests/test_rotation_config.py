@@ -13,16 +13,9 @@ def _rotation_cfg(*overrides):
     return RotationTransformConfig(cfg.transform)
 
 
-@pytest.mark.parametrize("search, objective, resolved", [
-    ("cayley", "auto", "ce"), ("evolution", "auto", "kl"), ("cayley", "kl", "kl"), ("cayley", "ce", "ce"),
-])
-def test_auto_picks_the_objective_each_search_uses(search, objective, resolved):
-    assert _rotation_cfg(f"transform.search={search}", f"transform.objective={objective}").objective == resolved
-
-
-def test_the_evolutionary_search_refuses_the_cross_entropy_objective():
-    with pytest.raises(ValueError, match="minimises the KL divergence"):
-        _rotation_cfg("transform.search=evolution", "transform.objective=ce")
+@pytest.mark.parametrize("objective, resolved", [("auto", "ce"), ("kl", "kl"), ("ce", "ce")])
+def test_auto_resolves_to_the_objective_cayley_sgd_uses(objective, resolved):
+    assert _rotation_cfg(f"transform.objective={objective}").objective == resolved
 
 
 def test_an_unknown_objective_is_rejected():
@@ -36,13 +29,10 @@ def test_an_unknown_objective_is_rejected():
     ("canary_qwen_utils", "build_canary_qwen_dataloader"),
 ])
 def test_every_loader_takes_the_arguments_the_rotation_transform_passes(module, builder):
-    """The transform passes batch_size and sort_by_length to whichever loader the model uses, and an evolution
-    search is the only caller that sets sort_by_length, so a missing parameter only surfaces there."""
+    """The transform passes batch_size to whichever loader the model uses, through a per-model lambda, so a
+    missing parameter only surfaces at search time."""
     import importlib
     import inspect
 
     function = getattr(importlib.import_module(f"asrq.transforms.rotation.{module}"), builder)
-    parameters = inspect.signature(function).parameters
-    assert {"batch_size", "seed", "sort_by_length"} <= set(parameters)
-    source = inspect.getsource(function)
-    assert "length_sorted_batches" in source and "sort_by_length" in source
+    assert {"batch_size", "seed"} <= set(inspect.signature(function).parameters)

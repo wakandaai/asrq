@@ -166,9 +166,16 @@ class CanaryQwenQ(ModelQ):
             for hook in hooks:
                 hook.remove()
             groups = self.capture_scale_recovery(quantizers)
-            for name in self.quantize_layers(quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers)):
+            quantizers = self.in_execution_order(
+                quantizers, lambda i: block(*args_list[i], **kwargs_list[i]),
+            )
+            recover = self.layer_recovery(
+                block, quantizers, lambda b, i: b(*args_list[i], **kwargs_list[i]), len(args_list),
+            )
+            for name in self.quantize_layers(
+                quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers), recover,
+            ):
                 tqdm.write(f"Quantized {name}")
-            self.apply_scale_recovery(groups)
 
             def run(i, block=block):
                 return block(*args_list[i], **kwargs_list[i])

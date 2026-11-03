@@ -40,7 +40,6 @@ _load("asrq.transforms.rotation.hadamard_utils", _ROTATION / "hadamard_utils.py"
 _load("asrq.quantizers.weight_rounding", _ROTATION.parents[1] / "quantizers" / "weight_rounding.py")
 _load("asrq.quantizers.gptq_solver", _ROTATION.parents[1] / "quantizers" / "gptq_solver.py")
 _load("asrq.transforms.rotation.cayley_sgd", _ROTATION / "cayley_sgd.py")
-hadamard_search = _load("asrq.transforms.rotation.hadamard_search", _ROTATION / "hadamard_search.py")
 utils = _load("rotation_utils", _ROTATION / "utils.py")
 
 DTYPE = torch.float64
@@ -115,7 +114,7 @@ def test_weight_2d_rejects_grouped_conv():
 
 
 # --------------------------------------------------------------------------------------
-# _RMSNorm / _rmsnorm  (LayerNorm -> RMSNorm -> pure normalization)
+# _RMSNormWithScale / _ScaleFreeRMSNorm  (LayerNorm -> RMSNorm -> pure normalization)
 # --------------------------------------------------------------------------------------
 
 
@@ -142,7 +141,7 @@ def make_layer_norm(dim):
 @pytest.mark.parametrize("kind_out", LAYER_KINDS)
 @pytest.mark.parametrize("kind_in", LAYER_KINDS)
 def test_rmsnorm_conversion_preserves_layer_norm_output(kind_in, kind_out):
-    """_RMSNorm folds centering into the previous layer, the shift into the next one."""
+    """_RMSNormWithScale folds centering into the previous layer, the shift into the next one."""
     dim = 8
     ln = make_layer_norm(dim)
     previous_layer, next_layer = make_layer(kind_in, 5, dim), make_layer(kind_out, dim, 3)
@@ -153,7 +152,7 @@ def test_rmsnorm_conversion_preserves_layer_norm_output(kind_in, kind_out):
     x = torch.randn(4, 5, 7, dtype=DTYPE)
     expected = run_norm_block(kind_in, kind_out, ref_previous_layer, ref_ln, ref_next_layer, x)
 
-    norm = utils._RMSNorm(ln, [previous_layer], [next_layer])
+    norm = utils._RMSNormWithScale(ln, [previous_layer], [next_layer])
     got = run_norm_block(kind_in, kind_out, previous_layer, norm, next_layer, x)
 
     torch.testing.assert_close(got, expected, atol=ATOL, rtol=0)
@@ -162,7 +161,7 @@ def test_rmsnorm_conversion_preserves_layer_norm_output(kind_in, kind_out):
 @pytest.mark.parametrize("kind_out", LAYER_KINDS)
 @pytest.mark.parametrize("kind_in", LAYER_KINDS)
 def test_full_chain_to_scale_free_normalization(kind_in, kind_out):
-    """LayerNorm -> _RMSNorm -> _rmsnorm leaves a norm with no learnable state at all."""
+    """LayerNorm -> _RMSNormWithScale -> _ScaleFreeRMSNorm leaves a norm with no learnable state at all."""
     dim = 8
     ln = make_layer_norm(dim)
     previous_layer, next_layer = make_layer(kind_in, 5, dim), make_layer(kind_out, dim, 3)
@@ -173,7 +172,7 @@ def test_full_chain_to_scale_free_normalization(kind_in, kind_out):
     x = torch.randn(4, 5, 7, dtype=DTYPE)
     expected = run_norm_block(kind_in, kind_out, ref_previous_layer, ref_ln, ref_next_layer, x)
 
-    norm = utils._rmsnorm(utils._RMSNorm(ln, [previous_layer], [next_layer]), [next_layer])
+    norm = utils._ScaleFreeRMSNorm(utils._RMSNormWithScale(ln, [previous_layer], [next_layer]), [next_layer])
     got = run_norm_block(kind_in, kind_out, previous_layer, norm, next_layer, x)
 
     torch.testing.assert_close(got, expected, atol=ATOL, rtol=0)
@@ -181,7 +180,7 @@ def test_full_chain_to_scale_free_normalization(kind_in, kind_out):
 
 
 def test_rmsnorm_accepts_torch_rmsnorm():
-    """_rmsnorm also folds the scale of a stock nn.RMSNorm."""
+    """_ScaleFreeRMSNorm also folds the scale of a stock nn.RMSNorm."""
     dim = 8
     rms = nn.RMSNorm(dim, eps=1e-6).to(DTYPE)
     nn.init.normal_(rms.weight, mean=1.0, std=0.1)
@@ -190,7 +189,7 @@ def test_rmsnorm_accepts_torch_rmsnorm():
 
     x = torch.randn(4, dim, dtype=DTYPE)
     expected = ref_next_layer(ref_rms(x))
-    got = next_layer(utils._rmsnorm(rms, [next_layer])(x))
+    got = next_layer(utils._ScaleFreeRMSNorm(rms, [next_layer])(x))
 
     torch.testing.assert_close(got, expected, atol=ATOL, rtol=0)
 
@@ -207,7 +206,7 @@ def test_rmsnorm_conversion_with_several_next_layers():
     x = torch.randn(4, 5, dtype=DTYPE)
     expected = [m(ref_ln(ref_previous(x))) for m in ref_next]
 
-    norm = utils._rmsnorm(utils._RMSNorm(ln, [previous_layer], next_layers), next_layers)
+    norm = utils._ScaleFreeRMSNorm(utils._RMSNormWithScale(ln, [previous_layer], next_layers), next_layers)
     got = [m(norm(previous_layer(x))) for m in next_layers]
 
     for g, e in zip(got, expected):
@@ -226,7 +225,7 @@ def test_rmsnorm_conversion_with_several_previous_layers():
     x = torch.randn(4, 5, dtype=DTYPE)
     expected = ref_next(ref_ln(sum(m(x) for m in ref_previous)))
 
-    norm = utils._rmsnorm(utils._RMSNorm(ln, previous_layers, [next_layer]), [next_layer])
+    norm = utils._ScaleFreeRMSNorm(utils._RMSNormWithScale(ln, previous_layers, [next_layer]), [next_layer])
     got = next_layer(norm(sum(m(x) for m in previous_layers)))
 
     torch.testing.assert_close(got, expected, atol=ATOL, rtol=0)
@@ -242,7 +241,7 @@ def test_rmsnorm_conversion_with_no_next_layers_keeps_the_shift():
     x = torch.randn(4, 5, dtype=DTYPE)
     expected = ref_ln(ref_previous(x))
 
-    norm = utils._RMSNorm(ln, [previous_layer], [])
+    norm = utils._RMSNormWithScale(ln, [previous_layer], [])
     torch.testing.assert_close(norm(previous_layer(x)), expected, atol=ATOL, rtol=0)
     assert norm.shift is not None
 
@@ -254,20 +253,20 @@ def test_rmsnorm_conversion_with_no_previous_layers_leaves_them_alone():
     previous_layer = make_layer("linear", 5, dim)
     before = previous_layer.weight.detach().clone()
 
-    norm = utils._RMSNorm(ln, [], [make_layer("linear", dim, 3)])
+    norm = utils._RMSNormWithScale(ln, [], [make_layer("linear", dim, 3)])
 
     torch.testing.assert_close(previous_layer.weight, before, atol=0, rtol=0)
     assert norm.shift is None
 
 
 def test_scale_fold_requires_next_layers():
-    """_rmsnorm cannot drop a scale that has nowhere to go."""
+    """_ScaleFreeRMSNorm cannot drop a scale that has nowhere to go."""
     dim = 8
-    norm = utils._RMSNorm(
+    norm = utils._RMSNormWithScale(
         make_layer_norm(dim), [make_layer("linear", 5, dim)], [make_layer("linear", dim, 3)]
     )
     with pytest.raises(ValueError, match="nowhere to fold"):
-        utils._rmsnorm(norm, [])
+        utils._ScaleFreeRMSNorm(norm, [])
 
 
 def test_RMSNorm_shift_fold_uses_the_unscaled_next_layer_weight():
@@ -277,7 +276,7 @@ def test_RMSNorm_shift_fold_uses_the_unscaled_next_layer_weight():
     previous_layer, next_layer = make_layer("linear", 5, dim), make_layer("linear", dim, 3)
     expected_bias = next_layer.bias.detach() + ln.bias.detach() @ next_layer.weight.detach().T
 
-    utils._RMSNorm(ln, [previous_layer], [next_layer])
+    utils._RMSNormWithScale(ln, [previous_layer], [next_layer])
 
     torch.testing.assert_close(next_layer.bias, expected_bias, atol=ATOL, rtol=0)
 
@@ -354,12 +353,12 @@ def test_inserted_linear_absorbs_the_next_norms_centering():
     inserted = dict(model.named_modules())[linear_name]
 
     # norm_out first, so its shift folds using the inserted Linear's pre-centering weight
-    converted = utils._rmsnorm(
-        utils._RMSNorm(model.norm_out[0], [model.ff2], [inserted]), [inserted]
+    converted = utils._ScaleFreeRMSNorm(
+        utils._RMSNormWithScale(model.norm_out[0], [model.ff2], [inserted]), [inserted]
     )
     model.norm_out[0] = converted
-    model.norm_ff1 = utils._rmsnorm(
-        utils._RMSNorm(model.norm_ff1, [inserted], [model.ff1]), [model.ff1]
+    model.norm_ff1 = utils._ScaleFreeRMSNorm(
+        utils._RMSNormWithScale(model.norm_ff1, [inserted], [model.ff1]), [model.ff1]
     )
 
     torch.testing.assert_close(model(x), expected, atol=ATOL, rtol=0)
@@ -423,17 +422,17 @@ def test_entry_centering_covers_a_first_norm_with_no_previous_layer():
     utils.replace_module(
         model,
         "b0_norm",
-        utils._rmsnorm(utils._RMSNorm(model.b0_norm, [], [model.b0_in]), [model.b0_in]),
+        utils._ScaleFreeRMSNorm(utils._RMSNormWithScale(model.b0_norm, [], [model.b0_in]), [model.b0_in]),
     )
     utils.replace_module(
         model,
         "b1_norm",
-        utils._rmsnorm(
-            utils._RMSNorm(model.b1_norm, [model.b0_out], [model.b1_in]), [model.b1_in]
+        utils._ScaleFreeRMSNorm(
+            utils._RMSNormWithScale(model.b1_norm, [model.b0_out], [model.b1_in]), [model.b1_in]
         ),
     )
     utils.replace_module(
-        model, "final_norm", utils._RMSNorm(model.final_norm, [model.b1_out], [])
+        model, "final_norm", utils._RMSNormWithScale(model.final_norm, [model.b1_out], [])
     )
 
     centered = x - x.mean(-1, keepdim=True)
@@ -520,7 +519,7 @@ def test_fold_q_k_fc1(kind, d_in, d_out):
 
     expected = ref(rotate_features(kind, x, R1, transpose=True))
     original_bias = layer.bias.detach().clone()
-    utils.fold_rotation_into_Q_K_FC1(layer, R1)
+    utils.fold_rotation(layer, utils.ROT_INPUT_R1, R1)
 
     torch.testing.assert_close(layer(x), expected, atol=ATOL, rtol=0)
     torch.testing.assert_close(layer.bias, original_bias, atol=0, rtol=0)
@@ -536,7 +535,7 @@ def test_fold_v(d_in, d_out, bias):
     x = make_input("linear", d_in)
 
     expected = ref(x @ R1.T) @ R2
-    utils.fold_rotation_into_V(layer, R1, R2)
+    utils.fold_rotation(layer, utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
 
     torch.testing.assert_close(layer(x), expected, atol=ATOL, rtol=0)
 
@@ -551,7 +550,7 @@ def test_fold_o(d_in, d_out, bias):
     x = make_input("linear", d_in)
 
     expected = ref(x @ R2.T) @ R1
-    utils.fold_rotation_into_O(layer, R1, R2)
+    utils.fold_rotation(layer, utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
 
     torch.testing.assert_close(layer(x), expected, atol=ATOL, rtol=0)
 
@@ -567,28 +566,28 @@ def test_fold_fc2(kind, d_in, d_out, bias):
     x = make_input(kind, d_in)
 
     expected = rotate_features(kind, ref(x), R1)
-    utils.fold_rotation_into_FC2(layer, R1)
+    utils.fold_rotation(layer, utils.ROT_OUTPUT_R1, R1)
 
     torch.testing.assert_close(layer(x), expected, atol=ATOL, rtol=0)
 
 
 def fold_v_o_pair(v, o, R1, R2):
-    utils.fold_rotation_into_V(v, R1, R2)
-    utils.fold_rotation_into_O(o, R1, R2)
+    utils.fold_rotation(v, utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
+    utils.fold_rotation(o, utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
     return lambda x: o(v(x))
 
 
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("kind", LAYER_KINDS)
 @pytest.mark.parametrize(
-    "fold,n_rotations",
+    "rot_kind,n_rotations",
     [
-        (utils.fold_rotation_into_Q_K_FC1, 1),
-        (utils.fold_rotation_into_FC2, 1),
+        (utils.ROT_INPUT_R1, 1),
+        (utils.ROT_OUTPUT_R1, 1),
     ],
     ids=["q_k_fc1", "fc2"],
 )
-def test_fold_preserves_weight_dtype_and_shape(fold, n_rotations, kind, weight_dtype):
+def test_fold_preserves_weight_dtype_and_shape(rot_kind, n_rotations, kind, weight_dtype):
     """A float64 rotation must not promote the layer it is folded into.
 
     The folds write through Tensor.copy_, which casts into existing storage; switching any of
@@ -598,7 +597,7 @@ def test_fold_preserves_weight_dtype_and_shape(fold, n_rotations, kind, weight_d
     layer = make_layer(kind, dim, dim).to(weight_dtype)
     weight_shape, bias_shape = layer.weight.shape, layer.bias.shape
 
-    fold(layer, *[rot(dim) for _ in range(n_rotations)])
+    utils.fold_rotation(layer, rot_kind, *[rot(dim) for _ in range(n_rotations)])
 
     assert layer.weight.dtype == weight_dtype
     assert layer.bias.dtype == weight_dtype
@@ -610,13 +609,15 @@ def test_fold_preserves_weight_dtype_and_shape(fold, n_rotations, kind, weight_d
 
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize(
-    "fold", [utils.fold_rotation_into_V, utils.fold_rotation_into_O], ids=["v", "o"]
+    "rot_kind",
+    [utils.ROT_INPUT_R1_OUTPUT_R2, utils.ROT_INPUT_R2_OUTPUT_R1],
+    ids=["v", "o"],
 )
-def test_two_sided_fold_preserves_weight_dtype(fold, weight_dtype):
+def test_two_sided_fold_preserves_weight_dtype(rot_kind, weight_dtype):
     dim = 8
     layer = make_layer("linear", dim, dim).to(weight_dtype)
 
-    fold(layer, rot(dim), rot(dim))
+    utils.fold_rotation(layer, rot_kind, rot(dim), rot(dim))
 
     assert layer.weight.dtype == weight_dtype
     assert layer.bias.dtype == weight_dtype
@@ -624,13 +625,13 @@ def test_two_sided_fold_preserves_weight_dtype(fold, weight_dtype):
 
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.float16])
 def test_rmsnorm_conversion_preserves_neighbour_dtypes(weight_dtype):
-    """_RMSNorm assigns to .data rather than using copy_, so this pins the dtypes."""
+    """_RMSNormWithScale assigns to .data rather than using copy_, so this pins the dtypes."""
     dim = 8
     ln = nn.LayerNorm(dim).to(weight_dtype)
     previous_layer = make_layer("linear", 5, dim).to(weight_dtype)
     next_layer = make_layer("linear", dim, 3).to(weight_dtype)
 
-    utils._RMSNorm(ln, [previous_layer], [next_layer])
+    utils._RMSNormWithScale(ln, [previous_layer], [next_layer])
 
     assert previous_layer.weight.dtype == weight_dtype
     assert previous_layer.bias.dtype == weight_dtype
@@ -652,7 +653,7 @@ def test_fold_v_applies_R2_per_head(d_model, num_heads):
     x = make_input("linear", d_model)
 
     expected = ref(x @ R1.T) @ head_blockdiag(R2, num_heads)
-    utils.fold_rotation_into_V(layer, R1, R2)
+    utils.fold_rotation(layer, utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
 
     torch.testing.assert_close(layer(x), expected, atol=ATOL, rtol=0)
 
@@ -666,7 +667,7 @@ def test_fold_o_applies_R2_per_head(d_model, num_heads):
     x = make_input("linear", d_model)
 
     expected = ref(x @ head_blockdiag(R2, num_heads).T) @ R1
-    utils.fold_rotation_into_O(layer, R1, R2)
+    utils.fold_rotation(layer, utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
 
     torch.testing.assert_close(layer(x), expected, atol=ATOL, rtol=0)
 
@@ -684,8 +685,8 @@ def test_head_wise_R2_cancels_between_v_and_o(d_model, num_heads):
     for _ in range(2):
         R2 = rot(head_dim)
         vi, oi = copy.deepcopy(v), copy.deepcopy(o)
-        utils.fold_rotation_into_V(vi, R1, R2)
-        utils.fold_rotation_into_O(oi, R1, R2)
+        utils.fold_rotation(vi, utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
+        utils.fold_rotation(oi, utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
         outputs.append(oi(vi(x)))
 
     torch.testing.assert_close(outputs[0], expected, atol=ATOL, rtol=0)
@@ -697,32 +698,29 @@ def test_head_wise_patches_match_their_folds(d_model, num_heads):
     head_dim = d_model // num_heads
     R1, R2 = rot(d_model), rot(head_dim)
     x = make_input("linear", d_model)
-    for fold, patch in [
-        (utils.fold_rotation_into_V, utils.patch_v_with_rotation),
-        (utils.fold_rotation_into_O, utils.patch_o_with_rotation),
-    ]:
+    for rot_kind in (utils.ROT_INPUT_R1_OUTPUT_R2, utils.ROT_INPUT_R2_OUTPUT_R1):
         base = make_layer("linear", d_model, d_model)
         folded, patched = copy.deepcopy(base), copy.deepcopy(base)
-        fold(folded, R1, R2)
-        patch(patched, R1, R2)
+        utils.fold_rotation(folded, rot_kind, R1, R2)
+        utils.patch_rotation(patched, rot_kind, R1, R2)
         torch.testing.assert_close(patched(x), folded(x), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize("d_model", [8, 64, 128])
-def test_rotation_type_5_via_patch_o_with_R2_equal_to_R1(d_model, bias):
+def test_rotation_kind_input_r1_output_r1(d_model, bias):
     """A layer inside the residual stream: rotated input and rotated output.
 
-    learn_rotations dispatches rotation type 5 to patch_o_with_rotation with R2 set to R1. That
-    works because _rotate_heads with a head_dim as wide as the axis is a single block, so the
-    head-wise fold degenerates to the full-width one.
+    _rotate_weight serves this kind by substituting R2 = R1. That works because _rotate_heads
+    with a head_dim as wide as the axis is a single block, so the head-wise fold degenerates to
+    the full-width one.
     """
     layer = make_layer("linear", d_model, d_model, bias=bias)
     ref = copy.deepcopy(layer)
     R1 = rot(d_model)
     x = make_input("linear", d_model)
 
-    utils.patch_o_with_rotation(layer, R1, R1)
+    utils.patch_rotation(layer, utils.ROT_INPUT_R1_OUTPUT_R1, R1)
 
     torch.testing.assert_close(layer(x @ R1), ref(x) @ R1, atol=ATOL, rtol=0)
 
@@ -774,14 +772,14 @@ def test_v_and_o_rotations_cancel_regardless_of_R2():
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize("d_in,d_out", [(8, 8), (8, 5)])
 @pytest.mark.parametrize("kind", LAYER_KINDS)
-def test_patch_q_k_fc1_matches_fold(kind, d_in, d_out, bias):
+def test_patch_input_r1_matches_fold(kind, d_in, d_out, bias):
     layer = make_layer(kind, d_in, d_out, bias=bias)
     folded, patched = copy.deepcopy(layer), copy.deepcopy(layer)
     R1 = rot(d_in)
     x = make_input(kind, d_in)
 
-    utils.fold_rotation_into_Q_K_FC1(folded, R1)
-    utils.patch_q_k_fc1_with_rotation(patched, R1)
+    utils.fold_rotation(folded, utils.ROT_INPUT_R1, R1)
+    utils.patch_rotation(patched, utils.ROT_INPUT_R1, R1)
 
     torch.testing.assert_close(patched(x), folded(x), atol=0, rtol=0)
     torch.testing.assert_close(patched.weight, layer.weight, atol=0, rtol=0)
@@ -795,8 +793,8 @@ def test_patch_v_matches_fold(d_in, d_out, bias):
     R1, R2 = rot(d_in), rot(d_out)
     x = make_input("linear", d_in)
 
-    utils.fold_rotation_into_V(folded, R1, R2)
-    utils.patch_v_with_rotation(patched, R1, R2)
+    utils.fold_rotation(folded, utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
+    utils.patch_rotation(patched, utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
 
     torch.testing.assert_close(patched(x), folded(x), atol=0, rtol=0)
 
@@ -809,8 +807,8 @@ def test_patch_o_matches_fold(d_in, d_out, bias):
     R1, R2 = rot(d_out), rot(d_in)
     x = make_input("linear", d_in)
 
-    utils.fold_rotation_into_O(folded, R1, R2)
-    utils.patch_o_with_rotation(patched, R1, R2)
+    utils.fold_rotation(folded, utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
+    utils.patch_rotation(patched, utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
 
     torch.testing.assert_close(patched(x), folded(x), atol=0, rtol=0)
 
@@ -824,15 +822,15 @@ def test_patch_fc2_matches_fold(kind, d_in, d_out, bias):
     R1 = rot(d_out)
     x = make_input(kind, d_in)
 
-    utils.fold_rotation_into_FC2(folded, R1)
-    utils.patch_fc2_with_rotation(patched, R1)
+    utils.fold_rotation(folded, utils.ROT_OUTPUT_R1, R1)
+    utils.patch_rotation(patched, utils.ROT_OUTPUT_R1, R1)
 
     torch.testing.assert_close(patched(x), folded(x), atol=0, rtol=0)
 
 
 def test_patch_rejects_non_pointwise_conv():
     with pytest.raises(ValueError, match="pointwise"):
-        utils.patch_q_k_fc1_with_rotation(nn.Conv1d(8, 8, kernel_size=3), rot(8))
+        utils.patch_rotation(nn.Conv1d(8, 8, kernel_size=3), utils.ROT_INPUT_R1, rot(8))
 
 
 def patch_whole_block(dim, R1, R2):
@@ -842,10 +840,10 @@ def patch_whole_block(dim, R1, R2):
         layer.weight.requires_grad_(False)
         layer.bias.requires_grad_(False)
     for name in ("q", "k", "fc1"):
-        utils.patch_q_k_fc1_with_rotation(layers[name], R1)
-    utils.patch_v_with_rotation(layers["v"], R1, R2)
-    utils.patch_o_with_rotation(layers["o"], R1, R2)
-    utils.patch_fc2_with_rotation(layers["fc2"], R1)
+        utils.patch_rotation(layers[name], utils.ROT_INPUT_R1, R1)
+    utils.patch_rotation(layers["v"], utils.ROT_INPUT_R1_OUTPUT_R2, R1, R2)
+    utils.patch_rotation(layers["o"], utils.ROT_INPUT_R2_OUTPUT_R1, R1, R2)
+    utils.patch_rotation(layers["fc2"], utils.ROT_OUTPUT_R1, R1)
     return layers
 
 
@@ -877,7 +875,7 @@ def test_patched_layer_tracks_in_place_updates_to_the_rotation():
     dim = 8
     R1 = nn.Parameter(rot(dim))
     layer = make_layer("linear", dim, dim)
-    utils.patch_q_k_fc1_with_rotation(layer, R1)
+    utils.patch_rotation(layer, utils.ROT_INPUT_R1, R1)
 
     x = make_input("linear", dim)
     before = layer(x).clone()
@@ -888,16 +886,16 @@ def test_patched_layer_tracks_in_place_updates_to_the_rotation():
 
 
 @pytest.mark.parametrize(
-    "patch,rotations",
+    "rot_kind,rotations",
     [
-        (lambda layer, r: utils.patch_q_k_fc1_with_rotation(layer, r[0]), 1),
-        (lambda layer, r: utils.patch_v_with_rotation(layer, r[0], r[1]), 2),
-        (lambda layer, r: utils.patch_o_with_rotation(layer, r[0], r[1]), 2),
-        (lambda layer, r: utils.patch_fc2_with_rotation(layer, r[0]), 1),
+        (utils.ROT_INPUT_R1, 1),
+        (utils.ROT_INPUT_R1_OUTPUT_R2, 2),
+        (utils.ROT_INPUT_R2_OUTPUT_R1, 2),
+        (utils.ROT_OUTPUT_R1, 1),
     ],
     ids=["q_k_fc1", "v", "o", "fc2"],
 )
-def test_rotation_matmul_runs_in_the_promoted_dtype(patch, rotations):
+def test_rotation_matmul_runs_in_the_promoted_dtype(rot_kind, rotations):
     """A float64 rotation over a float32 model must not be downcast for the matmul.
 
     Compared against a float64 reference: casting R to float32 first would round the rotation
@@ -908,9 +906,9 @@ def test_rotation_matmul_runs_in_the_promoted_dtype(patch, rotations):
     layer = nn.Linear(dim, dim).to(torch.float32)
     exact, rounded = copy.deepcopy(layer).to(DTYPE), copy.deepcopy(layer)
 
-    patch(layer, rots)
-    patch(exact, rots)
-    patch(rounded, [r.to(torch.float32) for r in rots])
+    utils.patch_rotation(layer, rot_kind, *rots)
+    utils.patch_rotation(exact, rot_kind, *rots)
+    utils.patch_rotation(rounded, rot_kind, *[r.to(torch.float32) for r in rots])
 
     x = torch.randn(4, dim, dtype=torch.float32)
     got, ref = layer(x), exact(x.to(DTYPE))
@@ -921,16 +919,16 @@ def test_rotation_matmul_runs_in_the_promoted_dtype(patch, rotations):
 
 
 @pytest.mark.parametrize(
-    "fold,patch,n_rotations",
+    "rot_kind,n_rotations",
     [
-        (utils.fold_rotation_into_Q_K_FC1, utils.patch_q_k_fc1_with_rotation, 1),
-        (utils.fold_rotation_into_V, utils.patch_v_with_rotation, 2),
-        (utils.fold_rotation_into_O, utils.patch_o_with_rotation, 2),
-        (utils.fold_rotation_into_FC2, utils.patch_fc2_with_rotation, 1),
+        (utils.ROT_INPUT_R1, 1),
+        (utils.ROT_INPUT_R1_OUTPUT_R2, 2),
+        (utils.ROT_INPUT_R2_OUTPUT_R1, 2),
+        (utils.ROT_OUTPUT_R1, 1),
     ],
     ids=["q_k_fc1", "v", "o", "fc2"],
 )
-def test_fold_reproduces_patch_in_mixed_precision(fold, patch, n_rotations):
+def test_fold_reproduces_patch_in_mixed_precision(rot_kind, n_rotations):
     """Baking a searched float64 rotation into a float32 model must not change its output.
 
     Both paths promote to float64 for the product and round once, so the folded model is
@@ -941,8 +939,8 @@ def test_fold_reproduces_patch_in_mixed_precision(fold, patch, n_rotations):
     layer = nn.Linear(dim, dim).to(torch.float32)
     folded, patched = copy.deepcopy(layer), copy.deepcopy(layer)
 
-    fold(folded, *rots)
-    patch(patched, *rots)
+    utils.fold_rotation(folded, rot_kind, *rots)
+    utils.patch_rotation(patched, rot_kind, *rots)
 
     x = torch.randn(4, dim, dtype=torch.float32)
     torch.testing.assert_close(folded(x), patched(x), atol=0, rtol=0)
@@ -955,7 +953,7 @@ def test_gradient_reaches_rotation_through_a_dtype_cast():
     layer = make_layer("linear", dim, dim)
     layer.weight.requires_grad_(False)
     layer.bias.requires_grad_(False)
-    utils.patch_q_k_fc1_with_rotation(layer, R1)
+    utils.patch_rotation(layer, utils.ROT_INPUT_R1, R1)
 
     layer(make_input("linear", dim)).pow(2).sum().backward()
 
@@ -968,7 +966,7 @@ def test_deepcopy_of_patched_layer_uses_its_own_weights():
     dim = 8
     R1 = nn.Parameter(rot(dim))
     layer = make_layer("linear", dim, dim)
-    utils.patch_q_k_fc1_with_rotation(layer, R1)
+    utils.patch_rotation(layer, utils.ROT_INPUT_R1, R1)
 
     duplicate = copy.deepcopy(layer)
     with torch.no_grad():
@@ -984,7 +982,7 @@ def test_patching_one_layer_does_not_affect_other_instances():
     dim = 8
     original_forward = nn.Linear.forward
     patched, untouched = make_layer("linear", dim, dim), make_layer("linear", dim, dim)
-    utils.patch_q_k_fc1_with_rotation(patched, rot(dim))
+    utils.patch_rotation(patched, utils.ROT_INPUT_R1, rot(dim))
 
     x = make_input("linear", dim)
     torch.testing.assert_close(

@@ -3,8 +3,7 @@
 Runs asrq.experiment's learn_rotation_experiment and run_experiment (the bodies of asrq/rot-exp.py and
 asrq/exp.py) on the real model: a rotation is learned and saved, then applied, GPTQ-quantized and
 evaluated with fake W4A4, and again with humming ASRQLinear layers, CUDA-graph generation and float16.
-rot-exp.py also runs the evolutionary sign search for a few generations, against quantized activations and
-against quantized weights only. The scaling transform goes through exp.py the same two ways, at W4A8: scales searched, saved and applied
+The scaling transform goes through exp.py the same two ways, at W4A8: scales searched, saved and applied
 (an InputScale after each fc2's activation), GPTQ, evaluation. See tests/_pipeline.py for the scale and
 skip conditions.
 
@@ -152,36 +151,3 @@ def test_exp_with_scaling_humming_layers_and_cuda_graph_generation(scaled_experi
     finally:
         del modelQ
         _free()
-
-
-def test_rot_exp_with_the_evolutionary_search(tmp_path):
-    path = tmp_path / "evolved.pt"
-    torch.manual_seed(0)
-    modelQ = learn_rotation_experiment(config("whisper", [
-        *SMALL, f"transform.path={path}", "transform.search=evolution", "transform.evolution.generations=2",
-        "transform.evolution.offspring=2", "transform.evolution.survivors=[1,1]",
-    ]))
-    del modelQ
-    _free()
-    checkpoint = torch.load(path, weights_only=False)
-    assert checkpoint["search"]["name"] == "evolution"
-    trajectory = [record["fitness"] for record in checkpoint["search"]["history"]]
-    assert len(trajectory) == 3 and all(b <= a for a, b in zip(trajectory, trajectory[1:]))
-    R1 = checkpoint["R1"].double()
-    assert (R1.T @ R1 - torch.eye(1280, dtype=torch.float64)).abs().max() < 1e-4
-
-
-def test_rot_exp_with_the_weight_only_evolutionary_search(tmp_path):
-    path = tmp_path / "weight_only.pt"
-    torch.manual_seed(0)
-    modelQ = learn_rotation_experiment(config("whisper", [
-        *SMALL, f"transform.path={path}", "transform.search=evolution", "transform.weight_only=true", "transform.evolution.generations=2", "transform.evolution.offspring=2",
-        "transform.evolution.survivors=[1,1]",
-    ]))
-    del modelQ
-    _free()
-    checkpoint = torch.load(path, weights_only=False)
-    assert checkpoint["search"]["quantization"] == "weights"
-    assert checkpoint["search"]["weight_quantization"] == {"method": "gptq", "bits": 4, "group_size": 128, "symmetric": True}
-    trajectory = [record["fitness"] for record in checkpoint["search"]["history"]]
-    assert len(trajectory) == 3 and all(b <= a for a, b in zip(trajectory, trajectory[1:]))
