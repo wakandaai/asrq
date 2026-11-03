@@ -33,6 +33,12 @@
 #              them instead -- see conformer_scale_recovery_targets. This run does not enable that refit, so
 #              Parakeet is a layer-recovery-only run. Add quantizer.weight_recovery=true for the refit, or
 #              compare against wo_w4_w2.sh, which has it.
+#          The Conformer models' inserted block-output Linears are quantized at the run's own width, leaving
+#          block_output_linear_bits null rather than pinning them to 4 bits as wo_w4_w2.sh does, so nothing in
+#          the model is wider than the width being measured. With no block output refit enabled, nothing claims
+#          those layers, so they are quantized in the block loop and refit by layer recovery like any other
+#          layer. At W2 that puts them on the 2-bit grid as well, and their error reaches the residual stream
+#          with only that refit between it and the block's output.
 #          Evaluation: all seven leaderboard datasets.
 # Output:  outputs/rotation/hadamard_<model>.pt, and
 #          results/evaluations/hadamard_recovery_<model>_hadamard_recovery_w<bits>_.../{results.csv,config.yaml},
@@ -51,6 +57,13 @@ declare -A SYMMETRIC=( [4]=True [2]=False )
 # Parakeet's objective is the CTC loss, whose backward has no deterministic CUDA kernel. No step is taken
 # here, but the flag costs nothing and keeps the command the same as the searching scripts'.
 declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
+# Only the Conformer models have block-output Linears. block_output_linear_bits is left null, which gives them
+# the run's own bits; see ModelQ.layer_quant_cfg. Whisper has no such setting.
+declare -A BLOCK_OUT=(
+  [parakeet]="model.quantize_block_output_linear=true"
+  [canary_qwen]="model.quantize_block_output_linear=true"
+  [whisper]=""
+)
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 EXPERIMENT="exp_name=hadamard_recovery wandb.enabled=true"
 RECOVERY="quantizer.scale_recovery=true quantizer.layer_weight_recovery=true"
@@ -73,7 +86,7 @@ for model in ${MODELS:-whisper canary_qwen parakeet}; do
     grid="quantizer=gptq quantizer.bits=$bits quantizer.symmetric=${SYMMETRIC[$bits]} quantizer.group_size=128"
     stamp "$model W$bits quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=rotation transform.path=$rotation $grid $EXPERIMENT \
-      $RECOVERY activation_bits=16 calibration.num_samples=2048 quantized_path=null \
+      $RECOVERY ${BLOCK_OUT[$model]} activation_bits=16 calibration.num_samples=2048 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False \
       method=hadamard_recovery_w$bits 2>&1 | tr '\r' '\n'
     stamp "$model W$bits quantize and evaluate end"
