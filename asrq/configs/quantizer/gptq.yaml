@@ -12,6 +12,10 @@ scale_recovery_ridge: 0.01
 # How the layers a norm feeds share s: lockstep (quantized as one stacked matrix, one s fitted over all their
 # rows) or average (each layer quantized alone, then the column-energy weighted average of their scales).
 scale_recovery_method: lockstep
+# Scale recovery is switched off when the activations are quantized (activation_bits < 16): its scale is fitted
+# against weight error alone, and folding it into a norm changes what the activation quantizer rounds. True keeps
+# it on in that case, to measure the effect.
+scale_recovery_with_quantized_activations: False
 # Weight recovery: after each Conformer block's GPTQ, refit the weight and bias of its output linear layer (the
 # identity Linear a rotation inserts after the block's output norm) in closed form, so the quantized block
 # reproduces the full-precision block's output; see asrq/quantizers/weight_recovery.py. Transformer blocks have no

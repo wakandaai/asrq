@@ -19,6 +19,19 @@ def test_the_default_config_builds_and_resolves_its_off_values():
     assert _rotation_cfg("transform.r1_block_size=128").r1_block_size == 128
 
 
+def _prepared(*overrides):
+    cfg = config("whisper", ["quantizer.scale_recovery=true", *overrides])
+    prepare_experiment_config(cfg, learn_rotation=False)
+    return cfg
+
+
+def test_scale_recovery_is_switched_off_with_quantized_activations_unless_kept_on():
+    assert _prepared("activation_bits=16").quantizer.scale_recovery
+    assert not _prepared("activation_bits=4").quantizer.scale_recovery
+    kept = _prepared("activation_bits=4", "quantizer.scale_recovery_with_quantized_activations=true")
+    assert kept.quantizer.scale_recovery
+
+
 @pytest.mark.parametrize("module, builder", [
     ("whisper_utils", "build_whisper_dataloader"),
     ("parakeet_ctc_utils", "build_parakeet_dataloader"),

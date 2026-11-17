@@ -37,7 +37,8 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
     the activation quantizer then rounds the scaled channels, and where a rotation spread the outliers
     over the channels to make them roundable, a per-channel scale pulls them back apart. See
     asrq/quantizers/scale_recovery.py. Weight recovery is unaffected -- it refits a whole weight matrix
-    rather than rescaling a norm's output.
+    rather than rescaling a norm's output. quantizer.scale_recovery_with_quantized_activations keeps scale
+    recovery on regardless, to measure what that costs.
 
     Args:
         cfg: The composed experiment config (quantizer, model, transform groups and top-level settings).
@@ -46,10 +47,12 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
     """
     with open_dict(cfg.quantizer):
         cfg.quantizer.exclude_modules = cfg.model.exclude_modules
-        if cfg.activation_bits < 16 and cfg.quantizer.get("scale_recovery", False):
+        keep = cfg.quantizer.get("scale_recovery_with_quantized_activations", False)
+        if cfg.activation_bits < 16 and cfg.quantizer.get("scale_recovery", False) and not keep:
             print(
                 f"scale_recovery is off: activation_bits={cfg.activation_bits} quantizes the activations, "
-                f"and the scale it folds into a norm is fitted for the weights alone"
+                f"and the scale it folds into a norm is fitted for the weights alone. Set "
+                f"quantizer.scale_recovery_with_quantized_activations=true to keep it on."
             )
             cfg.quantizer.scale_recovery = False
     with open_dict(cfg.transform):
