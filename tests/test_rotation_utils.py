@@ -35,6 +35,7 @@ def _load(name, path):
 # siblings directly. Drop this once `import asrq` works and load utils normally.
 for _pkg in ("asrq", "asrq.transforms", "asrq.transforms.rotation", "asrq.quantizers"):
     sys.modules.setdefault(_pkg, _types.ModuleType(_pkg))
+sys.modules["asrq"].tracking = _load("asrq.tracking", _ROTATION.parents[1] / "tracking.py")
 _load("asrq.quantizers.activation", _ROTATION.parents[1] / "quantizers" / "activation.py")
 _load("asrq.transforms.rotation.hadamard_utils", _ROTATION / "hadamard_utils.py")
 _load("asrq.quantizers.weight_rounding", _ROTATION.parents[1] / "quantizers" / "weight_rounding.py")
@@ -737,6 +738,131 @@ def test_rotate_heads_rejects_an_indivisible_axis():
         utils._rotate_heads(torch.randn(4, 30, dtype=DTYPE), rot(16))
 
 
+# --------------------------------------------------------------------------------------
+# the online Hadamard
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", [1, 2, 8, 128])
+def test_sylvester_hadamard_is_symmetric_orthogonal_and_flat(size):
+    H = utils.sylvester_hadamard_matrix(size)
+    assert H.dtype == DTYPE
+    torch.testing.assert_close(H, H.T, atol=0, rtol=0)
+    torch.testing.assert_close(H @ H.T, torch.eye(size, dtype=DTYPE), atol=ATOL, rtol=0)
+    torch.testing.assert_close(H.abs(), torch.full((size, size), size ** -0.5, dtype=DTYPE), atol=ATOL, rtol=0)
+
+
+def test_sylvester_hadamard_follows_the_recursion():
+    small, large = utils.sylvester_hadamard_matrix(8), utils.sylvester_hadamard_matrix(16)
+    reference = torch.cat((torch.cat((small, small), 1), torch.cat((small, -small), 1))) / 2 ** 0.5
+    torch.testing.assert_close(large, reference, atol=ATOL, rtol=0)
+
+
+@pytest.mark.parametrize("size", [0, 3, 12])
+def test_sylvester_hadamard_rejects_a_size_that_is_not_a_power_of_two(size):
+    with pytest.raises(ValueError, match="power-of-two"):
+        utils.sylvester_hadamard_matrix(size)
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("shape", [(48,), (5, 48), (2, 3, 48)])
+def test_block_hadamard_matches_the_dense_block_diagonal_matrix(shape, signed):
+    x = torch.randn(*shape, dtype=DTYPE)
+    signs = utils.random_hadamard_signs(48, "cpu") if signed else None
+    H = utils.online_hadamard_matrix(48, 8, "cpu", DTYPE)
+    reference = (x if signs is None else x * signs.to(DTYPE)) @ H
+    torch.testing.assert_close(utils.block_hadamard(x, 8, signs), reference, atol=ATOL, rtol=0)
+
+
+def test_block_hadamard_only_mixes_channels_within_a_block():
+    x = torch.zeros(48, dtype=DTYPE)
+    x[8:16] = torch.randn(8, dtype=DTYPE)
+    out = utils.block_hadamard(x, 8)
+    assert out[:8].abs().max() == 0 and out[16:].abs().max() == 0
+    torch.testing.assert_close(out.norm(), x.norm(), atol=ATOL, rtol=0)
+
+
+def test_block_hadamard_rejects_an_indivisible_axis():
+    with pytest.raises(ValueError, match="not divisible by block_size"):
+        utils.block_hadamard(torch.randn(4, 30, dtype=DTYPE), 16)
+
+
+def test_block_hadamard_is_differentiable():
+    x = torch.randn(3, 16, dtype=DTYPE, requires_grad=True)
+    utils.block_hadamard(x, 8).pow(2).sum().backward()
+    torch.testing.assert_close(x.grad, 2 * x.detach(), atol=ATOL, rtol=0)
+
+
+@pytest.mark.parametrize("signed", [False, True])
+@pytest.mark.parametrize("kind", LAYER_KINDS)
+def test_absorbed_and_online_hadamard_reconstruct_the_layer(kind, signed):
+    """(X @ D @ H) @ (W @ D @ H).T + b == X @ W.T + b, with a block size whose tile is not exact in float32."""
+    layer = make_layer(kind, 48, 20)
+    x = make_input(kind, 48)
+    reference = layer(x)
+    signs = utils.random_hadamard_signs(48, "cpu") if signed else None
+    weight = utils._weight_2d(layer).clone()
+
+    utils.absorb_hadamard_rotation_into_fc2(layer, 8, signs)
+    hadamard = utils.OnlineHadamard(8, channels_first=kind == "conv", signs=signs)
+
+    D = torch.eye(48, dtype=DTYPE) if signs is None else torch.diag(signs.to(DTYPE))
+    H = utils.online_hadamard_matrix(48, 8, "cpu", DTYPE)
+    torch.testing.assert_close(utils._weight_2d(layer), weight @ D @ H, atol=ATOL, rtol=0)
+    torch.testing.assert_close(layer(hadamard(x)), reference, atol=ATOL, rtol=0)
+
+
+def test_online_hadamard_matches_the_dense_matrix_a_learning_patches_in():
+    """patch_rotation with the dense D @ H and the folded layer behind an OnlineHadamard agree."""
+    signs = utils.random_hadamard_signs(48, "cpu")
+    R1 = rot(20)
+    patched, folded = make_layer("linear", 48, 20), make_layer("linear", 48, 20)
+    folded.load_state_dict(patched.state_dict())
+    x = make_input("linear", 48)
+
+    H = signs.to(DTYPE).unsqueeze(1) * utils.online_hadamard_matrix(48, 8, "cpu", DTYPE)
+    utils.patch_rotation(patched, utils.ROT_OUTPUT_R1, R1, H=H)
+    utils.fold_rotation(folded, utils.ROT_OUTPUT_R1, R1)
+    utils.absorb_hadamard_rotation_into_fc2(folded, 8, signs)
+    hadamard = utils.OnlineHadamard(8, signs=signs)
+
+    torch.testing.assert_close(folded(hadamard(x)), patched(x), atol=ATOL, rtol=0)
+
+
+def test_online_hadamard_tile_is_not_saved_and_survives_a_half_precision_round_trip():
+    signs = utils.seeded_hadamard_signs(7, 48, "cpu")
+    hadamard = utils.OnlineHadamard(8, signs=signs)
+    assert set(hadamard.state_dict()) == {"signs"}
+    tile = hadamard.hadamard.clone()
+    hadamard.half().float()
+    assert hadamard.hadamard.dtype == torch.float32 and torch.equal(hadamard.hadamard, tile)
+
+    restored = utils.OnlineHadamard(8, signs=torch.ones(48))
+    restored.load_state_dict(hadamard.state_dict())
+    x = torch.randn(4, 48)
+    torch.testing.assert_close(copy.deepcopy(restored)(x), hadamard(x), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_online_hadamard_in_half_precision_stays_at_the_rounding_floor(dtype):
+    """The transform runs in the input's dtype; its error must be that of rounding the exact result."""
+    x = nn.functional.gelu(torch.randn(8, 50, 256)).to(dtype)
+    exact = utils.block_hadamard(x.double(), 64)
+    floor = (exact.to(dtype).double() - exact).norm()
+    out = utils.OnlineHadamard(64)(x)
+    assert out.dtype == dtype
+    assert (out.double() - exact).norm() < 1.5 * floor
+
+
+def test_seeded_signs_are_reproducible_on_any_device_argument():
+    first = utils.seeded_hadamard_signs(7, 48, "cpu")
+    assert first.dtype == torch.float32 and set(first.unique().tolist()) == {-1.0, 1.0}
+    assert torch.equal(utils.seeded_hadamard_signs(7, 48, "cpu"), first)
+    assert not torch.equal(utils.seeded_hadamard_signs(8, 48, "cpu"), first)
+    with pytest.raises(ValueError, match="must be positive"):
+        utils.seeded_hadamard_signs(0, 48, "cpu")
+
+
 def test_v_and_o_compose_to_the_original_pair_in_the_rotated_basis():
     """o_new(v_new(x)) == o(v(x @ R1.T)) @ R1: only the residual rotation survives."""
     dim = 8
@@ -765,7 +891,7 @@ def test_v_and_o_rotations_cancel_regardless_of_R2():
 
 
 # --------------------------------------------------------------------------------------
-# rotation patches  (forward-time equivalents, for searching R with Cayley SGD)
+# rotation patches  (forward-time equivalents, for learning R with Cayley SGD)
 # --------------------------------------------------------------------------------------
 
 
@@ -929,10 +1055,10 @@ def test_rotation_matmul_runs_in_the_promoted_dtype(rot_kind, rotations):
     ids=["q_k_fc1", "v", "o", "fc2"],
 )
 def test_fold_reproduces_patch_in_mixed_precision(rot_kind, n_rotations):
-    """Baking a searched float64 rotation into a float32 model must not change its output.
+    """Baking a learned float64 rotation into a float32 model must not change its output.
 
     Both paths promote to float64 for the product and round once, so the folded model is
-    bit-identical to the patched model that was searched.
+    bit-identical to the patched model that was learned.
     """
     dim = 8
     rots = [rot(dim) for _ in range(n_rotations)]  # float64
@@ -995,22 +1121,20 @@ def test_patching_one_layer_does_not_affect_other_instances():
     assert "forward" not in untouched.__dict__
 
 
-def _checkpoint(activation=None, search=None, model=None):
-    return {"R1": torch.eye(4), "R2s": {}, "activation_quantization": activation, "search": search, "model": model}
+def _checkpoint(activation=None, model=None):
+    return {"R1": torch.eye(4), "R2s": {}, "activation_quantization": activation, "model": model}
 
 
-def test_settings_matching_the_search_are_accepted():
+def test_settings_matching_the_learning_are_accepted():
     check_rotation_settings = utils.check_rotation_settings
 
     activation = {"bits": 4, "group_size": 128, "symmetric": True, "groupwise_roles": ["attn_out", "fc2"]}
     checkpoint = _checkpoint(activation)
     check_rotation_settings("x.pt", dict(activation), checkpoint=checkpoint)
     check_rotation_settings("x.pt", {**activation, "groupwise_roles": ["fc2", "attn_out"]}, checkpoint=checkpoint)
-    weights = {"bits": 2, "group_size": 128, "symmetric": False}
-    weight_only = _checkpoint({"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None},
-                              {"quantization": "weights", "weight_quantization": dict(weights)})
+    unquantized = _checkpoint({"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None})
     check_rotation_settings("x.pt", {"bits": 16, "group_size": 128, "symmetric": True, "groupwise_roles": None},
-                            weights, checkpoint=weight_only)
+                            checkpoint=unquantized)
 
 
 @pytest.mark.parametrize("override, message", [
@@ -1019,7 +1143,7 @@ def test_settings_matching_the_search_are_accepted():
     ({"group_size": 64}, "activation group_size"),
     ({"groupwise_roles": ["fc2"]}, "group-wise roles"),
 ])
-def test_a_rotation_searched_under_other_activation_settings_is_refused(override, message):
+def test_a_rotation_learned_under_other_activation_settings_is_refused(override, message):
     check_rotation_settings = utils.check_rotation_settings
 
     activation = {"bits": 4, "group_size": 128, "symmetric": True, "groupwise_roles": ["attn_out", "fc2"]}
@@ -1027,22 +1151,12 @@ def test_a_rotation_searched_under_other_activation_settings_is_refused(override
         check_rotation_settings("x.pt", {**activation, **override}, checkpoint=_checkpoint(activation))
 
 
-def test_a_weight_only_rotation_is_refused_for_another_weight_grid():
-    check_rotation_settings = utils.check_rotation_settings
-
-    checkpoint = _checkpoint({"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None},
-                             {"quantization": "weights", "weight_quantization": {"bits": 2, "group_size": 128, "symmetric": False}})
-    activation = {"bits": 16, "group_size": 128, "symmetric": True, "groupwise_roles": None}
-    with pytest.raises(ValueError, match="weight bits"):
-        check_rotation_settings("x.pt", activation, {"bits": 4, "group_size": 128, "symmetric": False}, checkpoint=checkpoint)
-
-
-def test_a_rotation_searched_for_another_model_is_refused():
+def test_a_rotation_learned_for_another_model_is_refused():
     check_rotation_settings = utils.check_rotation_settings
 
     activation = {"bits": None, "group_size": 128, "symmetric": True, "groupwise_roles": None}
     checkpoint = _checkpoint(activation, model="nvidia/parakeet-ctc-1.1b")
     check_rotation_settings("x.pt", dict(activation), checkpoint=checkpoint, model_name="nvidia/parakeet-ctc-1.1b")
     check_rotation_settings("x.pt", dict(activation), checkpoint=_checkpoint(activation), model_name="openai/whisper-large-v3")
-    with pytest.raises(ValueError, match="was searched for nvidia/parakeet-ctc-1.1b"):
+    with pytest.raises(ValueError, match="was learned for nvidia/parakeet-ctc-1.1b"):
         check_rotation_settings("x.pt", dict(activation), checkpoint=checkpoint, model_name="openai/whisper-large-v3")

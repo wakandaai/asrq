@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# SmoothQuant-style baseline: searched scaling, then round-to-nearest weights, at W4A4 and W4A8.
+# SmoothQuant-style baseline: learned scaling, then round-to-nearest weights, at W4A4 and W4A8.
 #
 # Question: what do smoothing scales and plain RTN reach, with no rotation, no GPTQ and none of this project's
 #           recovery steps? The weakest baseline of the set, and the one that isolates what the rotation buys.
@@ -10,7 +10,7 @@
 #          attn_out and fc2, which keep one scale per group of 128 (activation_groupwise_roles).
 #          Transform: smoothquant scales with SmoothQuant's own migration strength, alpha = 0.5 for every
 #          entry, s = amax^0.5 / wmax^0.5, from the per-channel input maxima over every calibration utterance
-#          and the per-channel weight maxima -- no search. They are folded in: into the previous layer's rows
+#          and the per-channel weight maxima -- no learning. They are folded in: into the previous layer's rows
 #          where one exists, and into an InputScale module after the activation where a nonlinearity sits in
 #          between (fc2, pointwise_conv2). With alpha fixed the scales depend on neither the weight nor the
 #          activation bits, so each model's scales are computed once and shared by its A4 and A8 runs.
@@ -21,7 +21,7 @@
 #          results/evaluations/smoothquant_<model>_smoothquant_w4a<bits>_.../{results.csv,config.yaml}, one
 #          directory per run. Every run is logged to wandb in the group smoothquant.
 #
-# A scale file that already exists is reused rather than searched again, so the script can be re-run after an
+# A scale file that already exists is reused rather than learned again, so the script can be re-run after an
 # interruption. Run a subset with MODELS=whisper ABITS=4 bash scripts/smoothquant_w4a4_w4a8.sh
 #
 # Usage: bash scripts/smoothquant_w4a4_w4a8.sh [conda activate script] [project directory]

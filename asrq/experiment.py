@@ -29,7 +29,7 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
 
     The model config supplies the modules to leave unquantized and, for Conformer models, whether the
     Linear a rotation inserts after each block's output norm is quantized. The top-level activation
-    settings are the ones evaluation uses; the rotation search gets the same ones, so a rotation is
+    settings are the ones evaluation uses; rotation learning gets the same ones, so a rotation is
     learned against the quantization it will be evaluated with.
 
     Scale recovery is turned off here when the activations are quantized, so the config the run records
@@ -42,7 +42,7 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
 
     Args:
         cfg: The composed experiment config (quantizer, model, transform groups and top-level settings).
-        learn_rotation: For the rotation transform, whether obtain_transform searches a rotation
+        learn_rotation: For the rotation transform, whether obtain_transform learns a rotation
             (rot-exp.py) or only a saved one is applied (exp.py).
     """
     quantize_block_output_linear = cfg.model.get("quantize_block_output_linear", False)
@@ -74,7 +74,7 @@ def quantized_model_fingerprint(cfg: DictConfig) -> str:
 
     Covers the model, the whole quantizer config (scale recovery and weight recovery included), the calibration
     set and size, the transform config and the contents of the transform's saved file (a rotation checkpoint or
-    scales), so a changed setting or a re-run search never loads stale weights. Evaluation and inference settings are
+    scales), so a changed setting or a re-run learning never loads stale weights. Evaluation and inference settings are
     left out. Call it after the transform is obtained, when its file exists.
     """
     transform = OmegaConf.to_container(cfg.transform, resolve=True)
@@ -110,17 +110,14 @@ def quantized_model_path(cfg: DictConfig) -> Tuple[Optional[str], str]:
 
 
 def transform_record(cfg: DictConfig) -> dict:
-    """What the applied rotation checkpoint records about its own search, for the run's config."""
+    """What the applied rotation checkpoint records about how it was learned, for the run's config."""
     path = cfg.transform.get("path", "")
     if not path or not os.path.isfile(path):
         return {}
     checkpoint = torch.load(path, map_location="cpu")
-    search = checkpoint.get("search") or {}
     return {
         "rotation_file": path,
         "rotation_model": checkpoint.get("model"),
-        "rotation_search": search.get("name"),
-        "rotation_search_settings": search.get("settings"),
         "rotation_activation_quantization": checkpoint.get("activation_quantization"),
     }
 
@@ -224,11 +221,11 @@ def learn_rotation_experiment(cfg: DictConfig, reseed: Optional[Callable[[], Non
 
     Args:
         cfg: The composed experiment config with the rotation transform; prepared in place.
-        reseed: Called after the model is loaded and moved to the GPU, so the search's initial rotation
+        reseed: Called after the model is loaded and moved to the GPU, so the initial rotation
             and dataloader shuffle do not depend on what loading consumed from the random generators.
 
     Returns:
-        The ModelQ, holding the model the search ran on.
+        The ModelQ, holding the model the rotation was learned on.
     """
     if cfg.transform.name != "rotation":
         raise ValueError(f"rotation learning needs the rotation transform, got '{cfg.transform.name}'")

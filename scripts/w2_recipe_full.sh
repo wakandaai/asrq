@@ -6,7 +6,7 @@
 #
 # Varies:  the model (whisper, parakeet, canary_qwen).
 # Fixed:   W2 asymmetric weights in groups of 128, activations in full precision, the rotation from the
-#          GPTQ-fitness weight-only search, GPTQ on 2048 calibration utterances, and the recovery recipe --
+#          GPTQ-fitness weight-only learning, GPTQ on 2048 calibration utterances, and the recovery recipe --
 #          scale recovery for transformer blocks, weight recovery for Conformer blocks.
 # Output:  results/evaluations/<model>_full_w2_recipe_.../results.csv, one directory per run.
 #

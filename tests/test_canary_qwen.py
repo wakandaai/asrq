@@ -3,8 +3,7 @@
 Runs asrq.experiment's learn_rotation_experiment and run_experiment (the bodies of asrq/rot-exp.py and
 asrq/exp.py) on the real model: a rotation with one R1 per residual stream (Conformer encoder, Qwen LLM)
 is learned and saved, then applied with the LoRA adapters merged, GPTQ-quantized and evaluated with fake
-W4A4, and again with humming ASRQLinear layers. The scaling transform goes through exp.py the same two
-ways, at W4A8: scales searched, saved and applied (InputScales in the encoder, down_proj's folded into
+W4A4. The scaling transform goes through exp.py the same way, at W4A8: scales searched, saved and applied (InputScales in the encoder, down_proj's folded into
 up_proj), GPTQ, evaluation. See tests/_pipeline.py for the scale and skip conditions.
 
 The evaluation set holds the first 8 test-clean utterances, its longest (30.6-35.0 s), whose transcripts
@@ -20,7 +19,6 @@ import torch
 
 import asrq.evaluation.openasr as openasr
 from _pipeline import EVALUATE_8_UTTERANCES, SCALING_SMALL, SMALL, config, requirements, results
-from asrq.core.linear import ASRQLinear
 from asrq.experiment import learn_rotation_experiment, run_experiment
 from asrq.models.nemo.canary_qwen import CanaryQwenQ
 from asrq.transforms.rotation.utils import OnlineHadamard, ResidualStreamRotation
@@ -93,25 +91,6 @@ def test_exp_rotates_merges_quantizes_with_gptq_and_evaluates(learned_rotation, 
         _free()
 
 
-def test_exp_with_humming_layers(learned_rotation, unquantized_wer, tmp_path):
-    modelQ, results_file = run_experiment(
-        config("canary_qwen", [
-            *SMALL, *EVALUATE_8_UTTERANCES, f"transform.path={learned_rotation}", "inference=humming",
-            "eval_dtype=float16",
-        ]),
-        results_dir=str(tmp_path),
-    )
-    try:
-        layers = {n: m for n, m in modelQ.model.named_modules() if isinstance(m, ASRQLinear)}
-        assert len(layers) == len(modelQ.activation_quantization_roles())
-        assert sum(n.endswith("mlp.down_proj") and m.hadamard_block_size is not None for n, m in layers.items()) == 28
-        (row,) = results(results_file)
-        assert float(row["wer"]) < unquantized_wer + WER_MARGIN
-    finally:
-        del modelQ
-        _free()
-
-
 @pytest.fixture(scope="module")
 def scaled_experiment(tmp_path_factory):
     """exp.py with the scaling transform: scales searched and saved, applied, GPTQ W4, fake A8."""
@@ -133,24 +112,3 @@ def test_exp_searches_applies_scales_quantizes_with_gptq_and_evaluates(scaled_ex
     (row,) = rows
     assert (row["transform"], row["abits"]) == ("scaling", "8")
     assert float(row["wer"]) < unquantized_wer + WER_MARGIN
-
-
-def test_exp_with_scaling_and_humming_layers(scaled_experiment, unquantized_wer, tmp_path):
-    scales, _, _ = scaled_experiment
-    modelQ, results_file = run_experiment(
-        config("canary_qwen", [
-            *SCALING_SMALL, *EVALUATE_8_UTTERANCES, f"transform.path={scales}", "transform.obtain_scales=False",
-            "inference=humming", "eval_dtype=float16",
-        ]),
-        results_dir=str(tmp_path),
-    )
-    try:
-        modules = list(modelQ.model.modules())
-        layers = [m for m in modules if isinstance(m, ASRQLinear)]
-        assert len(layers) == len(modelQ.activation_quantization_roles())
-        assert sum(isinstance(m, InputScale) for m in modules) == 3 * 32
-        (row,) = results(results_file)
-        assert float(row["wer"]) < unquantized_wer + WER_MARGIN
-    finally:
-        del modelQ
-        _free()

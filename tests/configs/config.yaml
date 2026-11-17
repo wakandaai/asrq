@@ -6,8 +6,8 @@ defaults:
 
 output_dir: ./outputs
 seed: 42
-# rot-exp.py refuses operations without a deterministic implementation, so a search is reproducible. false warns
-# instead, which a Cayley search on Parakeet needs: its CE objective is the CTC loss, whose backward has no
+# rot-exp.py refuses operations without a deterministic implementation, so a learning run is reproducible. false warns
+# instead, which Cayley SGD on Parakeet needs: its CE objective is the CTC loss, whose backward has no
 # deterministic CUDA kernel.
 deterministic: True
 
@@ -23,8 +23,8 @@ method: "test"
 # Name of the experiment these runs belong to; it groups the runs in wandb and prefixes their results directory.
 exp_name: null
 create_audio_files: False
-# Activation quantization, read by evaluation and passed to the rotation search, so a rotation is
-# searched against exactly the quantization it is evaluated with. 16 or more disables it.
+# Activation quantization, read by evaluation and passed to rotation learning, so a rotation is
+# learned against exactly the quantization it is evaluated with. 16 or more disables it.
 activation_bits: 16
 # Group size for the roles in activation_groupwise_roles; every other role is quantized per token.
 activation_group_size: 128
@@ -60,7 +60,7 @@ eval_batches: null
 # (1.19x in float16, 0.97-1.04x in bfloat16); use float16 when measuring humming speed.
 eval_dtype: bfloat16
 # Weights & Biases logging (asrq/tracking.py, dev/docs/wandb_logging.md). rot-exp.py logs one run per rotation
-# search, exp.py one per quantization and evaluation; both store the whole config. Off by default, and a no-op
+# learning, exp.py one per quantization and evaluation; both store the whole config. Off by default, and a no-op
 # when wandb is not installed.
 wandb:
   enabled: False

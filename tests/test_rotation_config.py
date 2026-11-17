@@ -1,4 +1,4 @@
-"""The rotation transform's config: what each setting resolves to before a search runs."""
+"""The rotation transform's config: what each setting resolves to before a rotation is learned."""
 
 import pytest
 
@@ -13,14 +13,10 @@ def _rotation_cfg(*overrides):
     return RotationTransformConfig(cfg.transform)
 
 
-@pytest.mark.parametrize("objective, resolved", [("auto", "ce"), ("kl", "kl"), ("ce", "ce")])
-def test_auto_resolves_to_the_objective_cayley_sgd_uses(objective, resolved):
-    assert _rotation_cfg(f"transform.objective={objective}").objective == resolved
-
-
-def test_an_unknown_objective_is_rejected():
-    with pytest.raises(ValueError, match="must be 'kl', 'ce' or 'auto'"):
-        _rotation_cfg("transform.objective=mse")
+def test_the_default_config_builds_and_resolves_its_off_values():
+    cfg = _rotation_cfg()
+    assert cfg.r1_block_size is None and not hasattr(cfg, "objective")
+    assert _rotation_cfg("transform.r1_block_size=128").r1_block_size == 128
 
 
 @pytest.mark.parametrize("module, builder", [
@@ -30,7 +26,7 @@ def test_an_unknown_objective_is_rejected():
 ])
 def test_every_loader_takes_the_arguments_the_rotation_transform_passes(module, builder):
     """The transform passes batch_size to whichever loader the model uses, through a per-model lambda, so a
-    missing parameter only surfaces at search time."""
+    missing parameter only surfaces at learning time."""
     import importlib
     import inspect
 

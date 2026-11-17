@@ -30,12 +30,11 @@ from asrq.transforms.rotation.utils import (
 
 
 class ParakeetCalibrationDataset(torch.utils.data.Dataset):
-    """Calibration utterances as CTC batches for the rotation search.
+    """Calibration utterances as CTC batches for rotation learning.
 
     Takes the ``(waveform, text)`` pairs asrq.calibration.data loads, whose text is the
-    full-precision model's own transcript. The KL objective reads only the audio; the tokens
-    are for the ``"ce"`` objective's CTC loss, which then targets what the model itself emits
-    rather than reference text in another format.
+    full-precision model's own transcript. The tokens are for the CTC loss learning minimises,
+    which then targets what the model itself emits rather than reference text in another format.
     """
 
     def __init__(self, model, samples: Sequence[Tuple[np.ndarray, str]]):
@@ -82,7 +81,7 @@ def parakeet_ctc_collate_fn(batch, pad_id: int):
 
 
 def parakeet_ctc_loss_fn(model, batch):
-    """CTC loss against the batch's tokens: the training loss for the ``"ce"`` objective."""
+    """CTC loss against the batch's tokens: the training loss learn_rotations minimises."""
     device = next(model.parameters()).device
     log_probs, encoded_len, _ = model(
         input_signal=batch["audios"].to(device),
@@ -97,11 +96,10 @@ def parakeet_ctc_loss_fn(model, batch):
 
 
 def parakeet_ctc_logits_fn(model, batch):
-    """Per-frame CTC log-probabilities, and the frames the rotation objective counts.
+    """Per-frame CTC log-probabilities, and the frames rotation learning counts.
 
     The mask keeps each utterance's frames up to its encoded length, so padding frames do not
-    enter the KL divergence. Log-probabilities are valid logits for it: log_softmax leaves them
-    unchanged.
+    enter the comparison that verifies the rewrites.
 
     Returns:
         ``(log_probs, mask)`` with log_probs ``(batch, frames, vocab)`` and mask
@@ -267,7 +265,7 @@ def get_parakeet_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[str,
 def get_parakeet_activation_roles(model, quantize_block_output_linear: bool = False) -> Dict[str, str]:
     """Return ``{layer_name: role}`` for every layer whose input is activation-quantized.
 
-    The single definition used by both the rotation search and evaluation. The convolution
+    The single definition used by both rotation learning and evaluation. The convolution
     module's pointwise convs take the feed-forward roles: pointwise_conv1 reads the residual
     stream like fc1, and pointwise_conv2 reads a nonlinearity's output like fc2, behind its own
     online Hadamard.
@@ -343,7 +341,7 @@ def attach_parakeet_rotation_hooks(model, R1, persistent: bool = False) -> List:
         model: A model whose ``.encoder`` is a ConformerEncoder.
         R1: The residual-stream rotation.
         persistent: Attach the transforms as ResidualStreamRotation modules that are saved with
-            the model, for a final rotation; the search leaves this False.
+            the model, for a final rotation; learning leaves this False.
 
     Returns:
         Hook handles, each with a ``.remove()``.
@@ -380,7 +378,7 @@ def get_parakeet_rotation_inputs(
 
     samples are the ``(waveform, transcript)`` calibration pairs, the same ones GPTQ uses.
     quantize_block_output_linear also quantizes the inputs of the inserted block-output Linears
-    during the search, as evaluation will; see get_parakeet_activation_roles.
+    during learning, as evaluation will; see get_parakeet_activation_roles.
     """
     layers = get_parakeet_rotation_layers(model)
     return {

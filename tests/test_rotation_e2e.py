@@ -148,13 +148,13 @@ def test_norm_folding_alone_is_not_equivalent(model, batches):
 
 
 def test_learn_rotations_verifies_and_saves(model, batches, tmp_path):
-    """The whole search runs, both internal checks pass, and the rotations stay orthogonal."""
+    """The whole learning runs, both internal checks pass, and the rotations stay orthogonal."""
     path = tmp_path / "rotations.pt"
     R1, R2s = utils.learn_rotations(
         model, str(path),
         hidden_size=D_MODEL,
         learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
         train_loader=batches,
         epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE,
@@ -176,13 +176,14 @@ def test_learn_rotations_verifies_and_saves(model, batches, tmp_path):
 def test_apply_rotations_reproduces_the_unrotated_output(batches, tmp_path):
     """A model with the rotation folded into its weights computes the original function."""
     path = tmp_path / "rotations.pt"
-    searched = _build_model()
+    learned = _build_model()
     utils.learn_rotations(
-        searched, str(path),
+        learned, str(path),
         hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
-        **whisper_utils.get_whisper_rotation_layers(searched),
+        **whisper_utils.get_whisper_rotation_layers(learned),
     )
 
     fresh = _build_model()
@@ -202,13 +203,14 @@ def test_apply_rotations_reproduces_the_unrotated_output(batches, tmp_path):
 def test_apply_rotations_rejects_a_mismatched_hadamard_block_size(batches, tmp_path):
     """The absorbed and the online Hadamard have to be the same matrix."""
     path = tmp_path / "rotations.pt"
-    searched = _build_model()
+    learned = _build_model()
     utils.learn_rotations(
-        searched, str(path),
+        learned, str(path),
         hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
-        **whisper_utils.get_whisper_rotation_layers(searched),
+        **whisper_utils.get_whisper_rotation_layers(learned),
     )
 
     fresh = _build_model()
@@ -237,7 +239,8 @@ def test_the_verification_catches_a_wrong_rotation_fold(model, batches, tmp_path
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
             hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
             **whisper_utils.get_whisper_rotation_layers(model),
         )
@@ -254,16 +257,17 @@ def test_the_verification_catches_a_dropped_next_layer(model, batches, tmp_path)
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
             hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE, **structure,
         )
 
 
 def test_the_loss_is_invariant_to_the_rotation(model, batches):
-    """With no quantizer in the loss, the objective does not depend on R1 or R2 at all.
+    """With no quantizer in the loss, the loss does not depend on R1 or R2 at all.
 
     The rewrite is an exact reparameterisation, which is what every other test here asserts --
-    and that is exactly why the search needs activation quantization: without it the loss is
+    and that is exactly why learning needs activation quantization: without it the loss is
     flat along the manifold. test_activation_quantization_makes_the_loss_depend_on_the_rotation
     is the counterpart with quantization switched on.
     """
@@ -346,14 +350,15 @@ def test_online_hadamard_applies_the_matrix_absorbed_into_fc2(channels_first):
 
 
 def _rotated_whisper(batches, tmp_path):
-    searched = _build_model()
+    learned = _build_model()
     path = tmp_path / "rotations.pt"
     utils.learn_rotations(
-        searched, str(path),
+        learned, str(path),
         hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
-        **whisper_utils.get_whisper_rotation_layers(searched),
+        **whisper_utils.get_whisper_rotation_layers(learned),
     )
     fresh = _build_model()
     utils.apply_rotations(
@@ -406,7 +411,8 @@ def test_a_type_4_layer_without_an_online_hadamard_is_rejected(model, batches, t
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
             hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE, **structure,
         )
 
@@ -478,12 +484,13 @@ def test_parakeet_apply_rotations_with_a_shared_feed_forward_activation(tmp_path
     expected = encode(reference)
 
     path = tmp_path / "rotations.pt"
-    searched = build()
+    learned = build()
     utils.learn_rotations(
-        searched, str(path),
+        learned, str(path),
         hidden_size=D_MODEL, learning_rate=1e-3, compute_logits=compute_logits,
+        compute_loss=lambda m, b: compute_logits(m, b)[0].float().pow(2).mean(),
         train_loader=batches, epochs=1, hadamard_block_size=HADAMARD_BLOCK_SIZE,
-        tolerance=TOLERANCE, **parakeet_utils.get_parakeet_rotation_layers(searched),
+        tolerance=TOLERANCE, **parakeet_utils.get_parakeet_rotation_layers(learned),
     )
 
     fresh = build()
@@ -584,7 +591,7 @@ def test_activation_quantization_makes_the_loss_depend_on_the_rotation(model, ba
 
     The mirror of test_the_loss_is_invariant_to_the_rotation: the same patched model, the same
     rotations, but with the inputs of the rotated layers fake-quantized. This is the property
-    the search relies on.
+    learning relies on.
     """
     utils.fold_norms(model, whisper_utils.get_whisper_norm_layers(model))
     groups = whisper_utils.get_whisper_layers_to_rotate(model)
@@ -621,11 +628,10 @@ def test_activation_quantization_makes_the_loss_depend_on_the_rotation(model, ba
 def test_learn_rotations_with_activation_quantization_moves_the_rotation(
     model, batches, tmp_path
 ):
-    """The search changes R1, stays on the manifold, and records its quantization.
+    """Learning changes R1, stays on the manifold, and records its quantization.
 
-    A randomly initialised model's output distribution is close to uniform, so its KL to full
-    precision is tiny at 4 bits (2e-4) and so is the gradient. 2-bit activations and a large
-    learning rate give this toy model a signal comparable to a trained one's at 4 bits.
+    2-bit activations give this randomly initialised toy model a quantization error large enough
+    for the training loss to depend clearly on the rotation.
     """
     init = utils.random_hadamard_matrix
     seen_inits = []
@@ -639,8 +645,9 @@ def test_learn_rotations_with_activation_quantization_moves_the_rotation(
     try:
         R1, _ = utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
-            hidden_size=D_MODEL, learning_rate=20.0,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=_batches(6), epochs=2,
+            hidden_size=D_MODEL, learning_rate=0.5,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=_batches(6), epochs=2,
             hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
             activation_bits=2, activation_group_size=ACTIVATION_GROUP, activation_symmetric=True,
             activation_roles=whisper_utils.get_whisper_activation_roles(model),
@@ -658,7 +665,7 @@ def test_learn_rotations_with_activation_quantization_moves_the_rotation(
     assert saved["activation_quantization"] == {
         "bits": 2, "group_size": 16, "symmetric": True, "groupwise_roles": None,
     }
-    assert saved["objective"] == "kl"
+    assert saved["objective"] == "ce"
     assert saved["activation_quantization"]["groupwise_roles"] is None
 
 
@@ -672,24 +679,8 @@ def test_activation_quantizer_switches_off_inside_disabled():
     assert torch.equal(quantizer(x), quantized)
 
 
-def test_masked_kl_divergence_matches_a_direct_reference():
-    torch.manual_seed(0)
-    student = torch.randn(2, 6, 50, device=DEVICE, dtype=torch.float16)
-    teacher = torch.randn(2, 6, 50, device=DEVICE, dtype=torch.float16)
-    mask = torch.rand(2, 6, device=DEVICE) > 0.4
-
-    p = F.softmax(teacher.double(), -1)[mask]
-    expected = (p * (p.log() - F.log_softmax(student.double(), -1)[mask])).sum(-1).mean()
-    got = utils.masked_kl_divergence(student, teacher, mask)
-    assert abs(float(got) - float(expected)) < 1e-4
-
-
-def test_the_logit_check_is_not_vacuous_for_a_distillation_objective(model, batches):
-    """The check compares against the original logits, so a broken model cannot pass it.
-
-    A KL divergence between the model and itself is zero whatever the model computes, which is
-    why the verification compares logits rather than the search objective.
-    """
+def test_the_logit_check_is_not_vacuous(model, batches):
+    """The check compares against the original logits, so a broken model cannot pass it."""
     with torch.no_grad():
         reference, _ = whisper_utils.whisper_logits_fn(model, batches[0])
     utils.fold_norms(model, whisper_utils.get_whisper_norm_layers(model))
@@ -698,35 +689,6 @@ def test_the_logit_check_is_not_vacuous_for_a_distillation_objective(model, batc
             model, whisper_utils.whisper_logits_fn, batches[0], reference, "norm folding",
             TOLERANCE,
         )
-
-
-def test_the_search_objective_starts_at_zero_without_quantization(model, batches):
-    """With quantization off the teacher and student coincide, so the KL is exactly zero."""
-    utils.fold_norms(model, whisper_utils.get_whisper_norm_layers(model))
-    groups = whisper_utils.get_whisper_layers_to_rotate(model)
-    R1 = torch.linalg.qr(torch.randn(D_MODEL, D_MODEL, device=DEVICE))[0]
-    R2s = {
-        name: torch.linalg.qr(torch.randn(head_dim, head_dim, device=DEVICE))[0]
-        for name, head_dim, _ in groups
-    }
-    quantizer = utils.ActivationQuantizer(4, 16, True)
-    whisper_utils.attach_whisper_rotation_hooks(model, R1)
-    utils.patch_rotations(
-        model, groups, R1, R2s, {}, HADAMARD_BLOCK_SIZE,
-        {name: quantizer for name in whisper_utils.get_whisper_activation_roles(model)},
-    )
-
-    with torch.no_grad():
-        with quantizer.disabled():
-            teacher, mask = whisper_utils.whisper_logits_fn(model, batches[0])
-            same = utils.masked_kl_divergence(
-                whisper_utils.whisper_logits_fn(model, batches[0])[0], teacher, mask
-            )
-        quantized = utils.masked_kl_divergence(
-            whisper_utils.whisper_logits_fn(model, batches[0])[0], teacher, mask
-        )
-    assert float(same) < 1e-6
-    assert float(quantized) > 1e-4
 
 
 @pytest.fixture(scope="module")
@@ -802,15 +764,8 @@ def test_the_logits_mask_covers_only_the_text_and_end_of_text(model):
     assert torch.equal(logits, direct)
 
 
-def test_the_ce_objective_trains_on_the_training_loss_not_the_kl(
-    model, batches, tmp_path, monkeypatch
-):
-    """objective="ce" moves the rotation through compute_loss and never builds a teacher."""
-
-    def no_teacher(*args, **kwargs):
-        raise AssertionError("the ce objective must not compute a KL divergence")
-
-    monkeypatch.setattr(utils, "masked_kl_divergence", no_teacher)
+def test_the_learning_trains_on_the_training_loss(model, batches, tmp_path):
+    """compute_loss is called once in full precision, once at the initialisation, and once per step."""
     losses = []
 
     def recording_loss(student, batch):
@@ -822,7 +777,7 @@ def test_the_ce_objective_trains_on_the_training_loss_not_the_kl(
         model, str(tmp_path / "rotations.pt"),
         hidden_size=D_MODEL, learning_rate=0.5,
         compute_logits=whisper_utils.whisper_logits_fn, compute_loss=recording_loss,
-        objective="ce", train_loader=_batches(6), epochs=2,
+        train_loader=_batches(6), epochs=2,
         hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
         activation_bits=4, activation_group_size=ACTIVATION_GROUP, activation_symmetric=True,
         activation_roles=whisper_utils.get_whisper_activation_roles(model),
@@ -833,27 +788,6 @@ def test_the_ce_objective_trains_on_the_training_loss_not_the_kl(
     assert len(losses) == 2 + 6 * 2
     assert (R1.data.T @ R1.data - identity).abs().max() < 1e-4
     assert torch.load(tmp_path / "rotations.pt")["objective"] == "ce"
-
-
-@pytest.mark.parametrize(
-    "overrides, message",
-    [
-        ({"objective": "mse"}, "objective must be 'kl' or 'ce'"),
-        ({"objective": "ce"}, "objective='ce' needs compute_loss"),
-    ],
-)
-def test_a_bad_objective_is_rejected_before_the_model_is_touched(
-    model, batches, tmp_path, overrides, message
-):
-    with pytest.raises(ValueError, match=message):
-        utils.learn_rotations(
-            model, str(tmp_path / "rotations.pt"),
-            hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
-            hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
-            **overrides, **whisper_utils.get_whisper_rotation_layers(model),
-        )
-    assert any(isinstance(m, nn.LayerNorm) for m in model.modules())
 
 
 def test_whisper_loss_fn_is_cross_entropy_over_the_counted_positions(model, batches):
@@ -884,7 +818,8 @@ def test_the_equivalence_checks_run_without_tf32_and_restore_it(
     utils.learn_rotations(
         model, str(tmp_path / "rotations.pt"),
         hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
         **whisper_utils.get_whisper_rotation_layers(model),
     )
@@ -930,7 +865,7 @@ def test_whisper_roles_cover_every_attention_projection_and_both_feed_forward_la
                       "attn_out": n_enc + 2 * n_dec, "fc1": n_enc + n_dec, "fc2": n_enc + n_dec}
 
 
-def test_the_search_quantizes_each_layer_by_role(model, batches):
+def test_the_learning_quantizes_each_layer_by_role(model, batches):
     """Every rotated layer is quantized by the quantizer named for it, fc2 behind its Hadamard."""
     utils.fold_norms(model, whisper_utils.get_whisper_norm_layers(model))
     groups = whisper_utils.get_whisper_layers_to_rotate(model)
@@ -954,11 +889,12 @@ def test_the_search_quantizes_each_layer_by_role(model, batches):
                     "fc1": {D_MODEL}, "fc2": {4 * D_MODEL}}
 
 
-def test_the_search_records_which_roles_were_groupwise(model, batches, tmp_path):
+def test_the_learning_records_which_roles_were_groupwise(model, batches, tmp_path):
     utils.learn_rotations(
         model, str(tmp_path / "rotations.pt"),
         hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
         activation_bits=4, activation_group_size=ACTIVATION_GROUP,
         groupwise_roles=["fc2", "attn_out"],
@@ -974,17 +910,18 @@ def test_activation_quantization_without_roles_is_rejected(model, batches, tmp_p
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
             hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, activation_bits=4,
             **whisper_utils.get_whisper_rotation_layers(model),
         )
 
 
 @pytest.mark.parametrize("groupwise_roles", [None, [], ["attn_out", "fc2"]])
-def test_evaluation_quantizes_the_same_tensors_as_the_search(batches, tmp_path, groupwise_roles):
-    """Evaluation quantizes the same tensor at every layer as the search did.
+def test_evaluation_quantizes_the_same_tensors_as_the_learning(batches, tmp_path, groupwise_roles):
+    """Evaluation quantizes the same tensor at every layer as learning did.
 
-    The search quantizes inside patched forwards with a dense online Hadamard; evaluation folds
+    Learning quantizes inside patched forwards with a dense online Hadamard; evaluation folds
     the rotation, runs humming's Hadamard as a module and quantizes through pre-hooks. The
     capturing quantizers record their input and pass it through unquantized. With quantization
     active the paths still agree to float32 rounding, but a value sitting exactly on a
@@ -993,15 +930,16 @@ def test_evaluation_quantizes_the_same_tensors_as_the_search(batches, tmp_path, 
     from that. Both paths build their quantizers with the same function and settings.
     """
     path = tmp_path / "rotations.pt"
-    searched = _build_model()
-    roles = whisper_utils.get_whisper_activation_roles(searched)
+    learned = _build_model()
+    roles = whisper_utils.get_whisper_activation_roles(learned)
     R1, R2s = utils.learn_rotations(
-        searched, str(path),
+        learned, str(path),
         hidden_size=D_MODEL, learning_rate=0.5,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
         activation_bits=4, activation_group_size=ACTIVATION_GROUP, groupwise_roles=groupwise_roles,
-        activation_roles=roles, **whisper_utils.get_whisper_rotation_layers(searched),
+        activation_roles=roles, **whisper_utils.get_whisper_rotation_layers(learned),
     )
     def capturing(store, name):
         def quantize(x):
@@ -1009,13 +947,13 @@ def test_evaluation_quantizes_the_same_tensors_as_the_search(batches, tmp_path, 
             return x
         return quantize
 
-    search_inputs, eval_inputs = {}, {}
+    learning_inputs, eval_inputs = {}, {}
     utils.patch_rotations(
-        searched, whisper_utils.get_whisper_layers_to_rotate(searched), R1, R2s, {},
-        ACTIVATION_GROUP, {name: capturing(search_inputs, name) for name in roles},
+        learned, whisper_utils.get_whisper_layers_to_rotate(learned), R1, R2s, {},
+        ACTIVATION_GROUP, {name: capturing(learning_inputs, name) for name in roles},
         {4 * D_MODEL: utils.seeded_hadamard_signs(torch.load(path)["hadamard_sign_seed"], 4 * D_MODEL, DEVICE)},
     )
-    _logits(searched, batches[0])
+    _logits(learned, batches[0])
 
     evaluated = _build_model()
     utils.apply_rotations(evaluated, str(path), hadamard_block_size=ACTIVATION_GROUP,
@@ -1026,9 +964,9 @@ def test_evaluation_quantizes_the_same_tensors_as_the_search(batches, tmp_path, 
     _logits(evaluated, batches[0])
 
     assert len(handles) == len(roles)
-    assert set(search_inputs) == set(eval_inputs) == set(roles)
+    assert set(learning_inputs) == set(eval_inputs) == set(roles)
     for name in roles:
-        a, b = search_inputs[name], eval_inputs[name]
+        a, b = learning_inputs[name], eval_inputs[name]
         assert a.shape == b.shape, name
         assert (a - b).abs().max() / a.abs().max() < 1e-5, name
 
@@ -1112,8 +1050,9 @@ def test_learn_rotations_with_a_block_r1_stays_block_diagonal(model, tmp_path):
     try:
         R1, _ = utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
-            hidden_size=D_MODEL, learning_rate=20.0,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=_batches(6), epochs=2,
+            hidden_size=D_MODEL, learning_rate=0.5,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=_batches(6), epochs=2,
             hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE,
             activation_bits=2, activation_group_size=ACTIVATION_GROUP, r1_block_size=16,
             activation_roles=whisper_utils.get_whisper_activation_roles(model),
@@ -1135,7 +1074,8 @@ def test_a_block_size_that_does_not_divide_the_width_is_rejected_first(model, ba
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"),
             hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, r1_block_size=24,
             **whisper_utils.get_whisper_rotation_layers(model),
         )
@@ -1175,14 +1115,14 @@ def test_random_signs_keep_a_non_zero_mean_from_becoming_one_spike_per_block():
         assert group_crest(randomized(x)) < 3.5
 
 
-def test_the_search_saves_a_sign_seed_and_apply_uses_it(batches, tmp_path):
+def test_the_learning_saves_a_sign_seed_and_apply_uses_it(batches, tmp_path):
     model = _rotated_whisper(batches, tmp_path)
     checkpoint = torch.load(tmp_path / "rotations.pt")
     seed = checkpoint["hadamard_sign_seed"]
     assert seed > 0 and "hadamard_signs" not in checkpoint
     expected = utils.seeded_hadamard_signs(seed, 4 * D_MODEL, DEVICE)
     hadamards = [m for m in model.modules() if isinstance(m, utils.OnlineHadamard)]
-    assert hadamards and all(h.sign_seed == seed and torch.equal(h.signs, expected) for h in hadamards)
+    assert hadamards and all(torch.equal(h.signs, expected) for h in hadamards)
 
 
 def test_a_checkpoint_with_stored_sign_vectors_still_applies_exactly(batches, tmp_path):
@@ -1200,19 +1140,20 @@ def test_a_checkpoint_with_stored_sign_vectors_still_applies_exactly(batches, tm
                           **whisper_utils.get_whisper_rotation_layers(fresh))
     after = _logits(fresh, batches[0])
     hadamards = [m for m in fresh.modules() if isinstance(m, utils.OnlineHadamard)]
-    assert hadamards and all(h.sign_seed == 0 and torch.equal(h.signs.cpu(), signs) for h in hadamards)
+    assert hadamards and all(torch.equal(h.signs.cpu(), signs) for h in hadamards)
     assert (after - before).abs().max() / before.abs().max() < TOLERANCE
 
 
 def test_a_checkpoint_without_signs_applies_the_plain_hadamard(batches, tmp_path):
-    """Rotations searched before random signs existed still apply exactly as they were searched."""
+    """Rotations learned before random signs existed still apply exactly as they were learned."""
     path = tmp_path / "rotations.pt"
-    searched = _build_model()
+    learned = _build_model()
     utils.learn_rotations(
-        searched, str(path), hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        learned, str(path), hidden_size=D_MODEL, learning_rate=1e-3,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE, hadamard_random_signs=False,
-        **whisper_utils.get_whisper_rotation_layers(searched),
+        **whisper_utils.get_whisper_rotation_layers(learned),
     )
     checkpoint = torch.load(path)
     assert checkpoint["hadamard_sign_seed"] is None
@@ -1231,7 +1172,8 @@ def test_a_checkpoint_without_signs_applies_the_plain_hadamard(batches, tmp_path
 def _learn_r1_only(model, path, batches, **extra):
     return utils.learn_rotations(
         model, str(path), hidden_size=D_MODEL, learning_rate=0.5,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
         activation_bits=4, activation_group_size=16, groupwise_roles=["attn_out", "fc2"],
         activation_roles=whisper_utils.get_whisper_activation_roles(model),
@@ -1240,7 +1182,7 @@ def _learn_r1_only(model, path, batches, **extra):
     )
 
 
-def test_r1_only_search_optimises_nothing_but_r1(model, batches, tmp_path, monkeypatch):
+def test_r1_only_learning_optimises_nothing_but_r1(model, batches, tmp_path, monkeypatch):
     optimised = []
     original = utils.SGDG
 
@@ -1301,11 +1243,11 @@ def test_r1_only_apply_leaves_out_proj_and_fc2_inputs_unrotated(batches, tmp_pat
             assert difference > 1e-2, (name, difference)
 
 
-def test_r1_only_evaluation_quantizes_the_same_tensors_as_the_search(batches, tmp_path):
+def test_r1_only_evaluation_quantizes_the_same_tensors_as_the_learning(batches, tmp_path):
     path = tmp_path / "rotations.pt"
-    searched = _build_model()
-    roles = whisper_utils.get_whisper_activation_roles(searched)
-    R1, _ = _learn_r1_only(searched, path, batches)
+    learned = _build_model()
+    roles = whisper_utils.get_whisper_activation_roles(learned)
+    R1, _ = _learn_r1_only(learned, path, batches)
 
     def capturing(store, name):
         def record(x):
@@ -1313,13 +1255,13 @@ def test_r1_only_evaluation_quantizes_the_same_tensors_as_the_search(batches, tm
             return x
         return record
 
-    search_inputs, eval_inputs = {}, {}
+    learning_inputs, eval_inputs = {}, {}
     utils.patch_rotations(
-        searched, whisper_utils.get_whisper_layers_to_rotate(searched), R1, None, {},
-        HADAMARD_BLOCK_SIZE, {name: capturing(search_inputs, name) for name in roles},
+        learned, whisper_utils.get_whisper_layers_to_rotate(learned), R1, None, {},
+        HADAMARD_BLOCK_SIZE, {name: capturing(learning_inputs, name) for name in roles},
         use_r2=False, fc2_online_hadamard=False,
     )
-    _logits(searched, batches[0])
+    _logits(learned, batches[0])
 
     evaluated = _build_model()
     utils.apply_rotations(evaluated, str(path), hadamard_block_size=HADAMARD_BLOCK_SIZE,
@@ -1329,9 +1271,9 @@ def test_r1_only_evaluation_quantizes_the_same_tensors_as_the_search(batches, tm
     )
     _logits(evaluated, batches[0])
 
-    assert set(search_inputs) == set(eval_inputs) == set(roles)
+    assert set(learning_inputs) == set(eval_inputs) == set(roles)
     for name in roles:
-        a, b = search_inputs[name], eval_inputs[name]
+        a, b = learning_inputs[name], eval_inputs[name]
         assert (a - b).abs().max() / a.abs().max() < 1e-5, name
 
 
@@ -1351,16 +1293,17 @@ def test_r1_only_works_on_a_conformer_with_pointwise_convs(tmp_path):
             return model.encoder(audio_signal=batches[0]["x"], length=batches[0]["length"])[0]
 
     expected = encode(build())
-    searched = build()
+    learned = build()
     path = tmp_path / "rotations.pt"
     utils.learn_rotations(
-        searched, str(path), hidden_size=D_MODEL, learning_rate=0.5, compute_logits=compute_logits,
+        learned, str(path), hidden_size=D_MODEL, learning_rate=0.5, compute_logits=compute_logits,
+        compute_loss=lambda m, b: compute_logits(m, b)[0].float().pow(2).mean(),
         train_loader=batches, epochs=1, hadamard_block_size=HADAMARD_BLOCK_SIZE,
         tolerance=TOLERANCE, activation_bits=4, activation_group_size=16,
         groupwise_roles=["attn_out", "fc2"],
-        activation_roles=parakeet_utils.get_parakeet_activation_roles(searched),
+        activation_roles=parakeet_utils.get_parakeet_activation_roles(learned),
         learn_r2=False, fc2_online_hadamard=False,
-        **parakeet_utils.get_parakeet_rotation_layers(searched),
+        **parakeet_utils.get_parakeet_rotation_layers(learned),
     )
     fresh = build()
     utils.apply_rotations(fresh, str(path), hadamard_block_size=HADAMARD_BLOCK_SIZE,
@@ -1381,8 +1324,8 @@ def test_the_block_output_linears_get_the_block_out_role_only_when_asked():
     assert "block_out" not in parakeet_utils.get_parakeet_activation_roles(model).values()
 
 
-def test_a_search_that_quantizes_the_block_output_linears_still_folds_exactly(tmp_path):
-    """With block_out quantized, the search attaches a quantizer to the rotation-type-5 patch; the
+def test_a_learning_that_quantizes_the_block_output_linears_still_folds_exactly(tmp_path):
+    """With block_out quantized, learning attaches a quantizer to the rotation-type-5 patch; the
     folded model must still compute the original function once quantization is off."""
     parakeet_utils, build = _parakeet()
     torch.manual_seed(1)
@@ -1399,9 +1342,9 @@ def test_a_search_that_quantizes_the_block_output_linears_still_folds_exactly(tm
             return model.encoder(audio_signal=batches[0]["x"], length=batches[0]["length"])[0]
 
     expected = encode(build())
-    searched = build()
-    layers = parakeet_utils.get_parakeet_rotation_layers(searched)
-    roles = parakeet_utils.get_parakeet_activation_roles(searched, quantize_block_output_linear=True)
+    learned = build()
+    layers = parakeet_utils.get_parakeet_rotation_layers(learned)
+    roles = parakeet_utils.get_parakeet_activation_roles(learned, quantize_block_output_linear=True)
     quantized_inputs = {}
     original = utils.patch_rotations
 
@@ -1414,8 +1357,9 @@ def test_a_search_that_quantizes_the_block_output_linears_still_folds_exactly(tm
     utils.patch_rotations = recording_patch
     try:
         utils.learn_rotations(
-            searched, str(tmp_path / "rotations.pt"), hidden_size=D_MODEL, learning_rate=0.5,
-            compute_logits=compute_logits, train_loader=batches, epochs=1,
+            learned, str(tmp_path / "rotations.pt"), hidden_size=D_MODEL, learning_rate=0.5,
+            compute_logits=compute_logits, compute_loss=lambda m, b: compute_logits(m, b)[0].float().pow(2).mean(),
+            train_loader=batches, epochs=1,
             hadamard_block_size=ACTIVATION_GROUP, tolerance=TOLERANCE, activation_bits=4,
             activation_group_size=ACTIVATION_GROUP, groupwise_roles=["attn_out", "fc2"], activation_roles=roles,
             **layers,
@@ -1472,7 +1416,8 @@ def test_learn_rotations_rejects_a_mismatched_hadamard_block_before_touching_the
     with pytest.raises(ValueError, match="hadamard_block_size equal to activation_group_size"):
         utils.learn_rotations(
             model, str(tmp_path / "rotations.pt"), hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, activation_bits=4,
             activation_group_size=HADAMARD_BLOCK_SIZE // 2, groupwise_roles=["fc2"],
             activation_roles=whisper_utils.get_whisper_activation_roles(model),
@@ -1487,7 +1432,8 @@ def _applied(batches, tmp_path):
     path = tmp_path / "rotations.pt"
     utils.learn_rotations(
         _build_model(), str(path), hidden_size=D_MODEL, learning_rate=0.5,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
         **whisper_utils.get_whisper_rotation_layers(_build_model()),
     )
@@ -1553,7 +1499,8 @@ def test_applying_or_learning_without_saying_which_hooks_to_attach_is_an_error(b
     with pytest.raises(TypeError, match="attach_rotation_hooks"):
         utils.learn_rotations(
             fresh, str(tmp_path / "unused.pt"), hidden_size=D_MODEL, learning_rate=1e-3,
-            compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+            compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+            train_loader=batches, epochs=1,
             hadamard_block_size=HADAMARD_BLOCK_SIZE, **layers,
         )
 
@@ -1570,31 +1517,21 @@ def test_removing_a_persistent_rotation_detaches_its_module_and_hook(model):
     assert not hasattr(layer, "input_rotation") and len(layer._forward_pre_hooks) == 0
 
 
-def test_the_search_leaves_no_rotation_modules_behind(model, batches, tmp_path):
+def test_the_learning_leaves_no_rotation_modules_behind(model, batches, tmp_path):
     utils.learn_rotations(
         model, str(tmp_path / "rotations.pt"), hidden_size=D_MODEL, learning_rate=1e-3,
-        compute_logits=whisper_utils.whisper_logits_fn, train_loader=batches, epochs=1,
+        compute_logits=whisper_utils.whisper_logits_fn, compute_loss=whisper_utils.whisper_loss_fn,
+        train_loader=batches, epochs=1,
         hadamard_block_size=HADAMARD_BLOCK_SIZE, tolerance=TOLERANCE,
         **whisper_utils.get_whisper_rotation_layers(model),
     )
     assert not any(isinstance(m, utils.ResidualStreamRotation) for m in model.modules())
 
 
-@pytest.mark.parametrize("channels_first", [False, True])
-def test_a_seeded_online_hadamard_equals_multiplying_by_its_signs(channels_first):
-    """humming generates the seeded signs inside its kernel: the same output as multiplying first, bit for bit."""
-    width, seed = 4 * D_MODEL, 12345
-    signs = utils.seeded_hadamard_signs(seed, width, DEVICE)
-    x = torch.randn(3, width, 7, device=DEVICE) if channels_first else torch.randn(5, width, device=DEVICE)
-    seeded = utils.OnlineHadamard(HADAMARD_BLOCK_SIZE, channels_first=channels_first, signs=signs, sign_seed=seed)
-    multiplied = utils.OnlineHadamard(HADAMARD_BLOCK_SIZE, channels_first=channels_first, signs=signs)
-    assert torch.equal(seeded(x), multiplied(x))
-
-
-def test_seeded_signs_are_balanced_and_differ_between_seeds():
+def test_seeded_signs_are_balanced_reproducible_and_differ_between_seeds():
     first, second = (utils.seeded_hadamard_signs(seed, 4096, "cpu") for seed in (1, 2))
     assert set(first.unique().tolist()) == {-1.0, 1.0}
     assert abs(float(first.mean())) < 0.05 and float((first != second).float().mean()) > 0.4
-    assert torch.equal(utils.seeded_hadamard_signs(1, 64, "cpu"), first[:64])
+    assert torch.equal(utils.seeded_hadamard_signs(1, 4096, "cpu"), first)
     with pytest.raises(ValueError):
         utils.seeded_hadamard_signs(0, 8, "cpu")

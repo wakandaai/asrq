@@ -1,7 +1,7 @@
-"""Activation fake quantization, shared by the rotation search and evaluation.
+"""Activation fake quantization, shared by rotation learning and evaluation.
 
 Both use the same quantizer on the same layers, configured from the same settings, so a rotation is
-searched against exactly the activation quantization it will be evaluated with.
+learned against exactly the activation quantization it will be evaluated with.
 
 Which layers are quantized, and how, is decided by each layer's role:
 
@@ -98,7 +98,7 @@ def make_activation_quantizer(
 class ActivationQuantizer:
     """A switchable fake quantizer.
 
-    Everything holding a reference to one instance -- patched forwards during a rotation search,
+    Everything holding a reference to one instance -- patched forwards during rotation learning,
     input hooks during evaluation -- is switched by flipping ``enabled``, without patching
     again. That is what lets one model act as both sides of a distillation objective: the same
     weights and rotations, once with quantized activations and once without.

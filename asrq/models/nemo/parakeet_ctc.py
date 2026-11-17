@@ -478,6 +478,6 @@ class ParakeetCTCQ(ModelQ):
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Attention projections, feed-forward linears and pointwise convs, fc2-like layers
-        included; the same mapping the rotation search quantizes."""
+        included; the same mapping rotation learning quantizes."""
         return get_parakeet_activation_roles(self.model, self.quant_cfg.quantize_block_output_linear)
 

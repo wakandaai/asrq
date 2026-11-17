@@ -113,14 +113,14 @@ def test_a_run_carries_the_config_and_closes(fake_wandb):
     cfg = _cfg(tags=["w2"])
     with tracking.start(cfg, "rotation") as run:
         assert tracking.enabled()
-        tracking.log({"search/step": 1, "search/loss": 0.5})
-        tracking.summary({"search/final_loss": 0.4})
+        tracking.log({"learning/step": 1, "learning/loss": 0.5})
+        tracking.summary({"learning/final_loss": 0.4})
         tracking.config_update({"rotation_file": "x.pt"})
     (fake,) = fake_wandb
     assert fake.kwargs["job_type"] == "rotation" and fake.kwargs["tags"] == ["w2"] and fake.kwargs["mode"] == "offline"
     assert fake.kwargs["config"]["model"]["name"] == cfg.model.name
-    assert ("log", {"search/step": 1, "search/loss": 0.5}) in fake.rows
-    assert fake.summary["search/final_loss"] == 0.4
+    assert ("log", {"learning/step": 1, "learning/loss": 0.5}) in fake.rows
+    assert fake.summary["learning/final_loss"] == 0.4
     assert ("config", {"rotation_file": "x.pt"}) in fake.rows
     assert fake.finished and not tracking.enabled()
 

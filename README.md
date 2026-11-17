@@ -58,8 +58,8 @@ The two entry points share one Hydra config (`asrq/configs/config.yaml`):
    5. evaluates it.
 
 The same activation settings (`activation_bits`, `activation_group_size`, `activation_symmetric`,
-`activation_groupwise_roles`) and weight settings (`quantizer.*`) are passed to the rotation search and to
-evaluation. So a rotation is searched against the quantization it will be evaluated with. Use the same
+`activation_groupwise_roles`) and weight settings (`quantizer.*`) are passed to rotation learning and to
+evaluation. So a rotation is learned against the quantization it will be evaluated with. Use the same
 overrides for both commands.
 
 ---

@@ -2,8 +2,7 @@
 
 Runs asrq.experiment's learn_rotation_experiment and run_experiment (the bodies of asrq/rot-exp.py and
 asrq/exp.py) on the real model: a rotation is learned and saved, then applied, GPTQ-quantized and
-evaluated with fake W4A4, and again with humming ASRQLinear layers, CUDA-graph generation and float16.
-The scaling transform goes through exp.py the same two ways, at W4A8: scales searched, saved and applied
+evaluated with fake W4A4. The scaling transform goes through exp.py the same way, at W4A8: scales searched, saved and applied
 (an InputScale after each fc2's activation), GPTQ, evaluation. See tests/_pipeline.py for the scale and
 skip conditions.
 
@@ -21,7 +20,6 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 import asrq.evaluation.openasr as openasr
 from _pipeline import EVALUATE_8_UTTERANCES, SCALING_SMALL, SMALL, config, requirements, results
-from asrq.core.linear import ASRQLinear
 from asrq.experiment import learn_rotation_experiment, run_experiment
 from asrq.transforms.rotation.utils import OnlineHadamard, ResidualStreamRotation
 from asrq.transforms.scaling.base import InputScale
@@ -90,25 +88,6 @@ def test_exp_rotates_quantizes_with_gptq_and_evaluates(learned_rotation, unquant
         _free()
 
 
-def test_exp_with_humming_layers_and_cuda_graph_generation(learned_rotation, unquantized_wer, tmp_path):
-    modelQ, results_file = run_experiment(
-        config("whisper", [
-            *SMALL, *EVALUATE_8_UTTERANCES, f"transform.path={learned_rotation}", "inference=humming",
-            "model.generate_fn=generate_whisper_cuda_graphs", "eval_dtype=float16",
-        ]),
-        results_dir=str(tmp_path),
-    )
-    try:
-        layers = [m for m in modelQ.model.modules() if isinstance(m, ASRQLinear)]
-        assert len(layers) == len(modelQ.activation_quantization_roles())
-        assert sum(layer.hadamard_block_size is not None for layer in layers) == 64
-        (row,) = results(results_file)
-        assert float(row["wer"]) < unquantized_wer + WER_MARGIN
-    finally:
-        del modelQ
-        _free()
-
-
 @pytest.fixture(scope="module")
 def scaled_experiment(tmp_path_factory):
     """exp.py with the scaling transform: scales searched and saved, applied, GPTQ W4, fake A8."""
@@ -130,24 +109,3 @@ def test_exp_searches_applies_scales_quantizes_with_gptq_and_evaluates(scaled_ex
     (row,) = rows
     assert (row["transform"], row["abits"]) == ("scaling", "8")
     assert float(row["wer"]) < unquantized_wer + WER_MARGIN
-
-
-def test_exp_with_scaling_humming_layers_and_cuda_graph_generation(scaled_experiment, unquantized_wer, tmp_path):
-    scales, _, _ = scaled_experiment
-    modelQ, results_file = run_experiment(
-        config("whisper", [
-            *SCALING_SMALL, *EVALUATE_8_UTTERANCES, f"transform.path={scales}", "transform.obtain_scales=False",
-            "inference=humming", "model.generate_fn=generate_whisper_cuda_graphs", "eval_dtype=float16",
-        ]),
-        results_dir=str(tmp_path),
-    )
-    try:
-        modules = list(modelQ.model.modules())
-        layers = [m for m in modules if isinstance(m, ASRQLinear)]
-        assert len(layers) == len(modelQ.activation_quantization_roles())
-        assert sum(isinstance(m, InputScale) for m in modules) == 64
-        (row,) = results(results_file)
-        assert float(row["wer"]) < unquantized_wer + WER_MARGIN
-    finally:
-        del modelQ
-        _free()

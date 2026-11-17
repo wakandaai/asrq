@@ -2,7 +2,7 @@
 
 Every stage logs through this module, so nothing else imports wandb and nothing changes when it is off: ``log``
 and ``summary`` are cheap no-ops until ``start`` opens a run. A run covers one script: rot-exp.py logs a
-rotation search, exp.py logs a quantization and its evaluation.
+rotation learning, exp.py logs a quantization and its evaluation.
 
 What each stage logs is documented in dev/docs/wandb_logging.md; the keys are namespaced by stage, and the metrics
 of a stage that repeats (a generation, a block, a split) carry their own counter as the x axis.
@@ -135,7 +135,7 @@ def results_csv(path: str, key: str = "eval/results") -> None:
 
 
 def config_update(data: Dict[str, Any]) -> None:
-    """Add resolved settings the config did not hold, such as a rotation checkpoint's search record."""
+    """Add resolved settings the config did not hold, such as a rotation checkpoint's learning record."""
     if _run is None:
         return
     _run.config.update(data, allow_val_change=True)

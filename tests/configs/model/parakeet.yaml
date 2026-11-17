@@ -4,7 +4,7 @@ name: nvidia/parakeet-ctc-1.1b
 exclude_modules: []
 # A rotation inserts an identity Linear after every Conformer block's output norm (but the last) to
 # carry that norm's scale and shift. True also weight- and activation-quantizes it (role block_out,
-# per token unless listed in activation_groupwise_roles), in the rotation search, GPTQ/RTN,
+# per token unless listed in activation_groupwise_roles), in rotation learning, GPTQ/RTN,
 # evaluation and humming ASRQLinear conversion; False keeps it in full precision.
 quantize_block_output_linear: False
 

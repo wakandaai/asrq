@@ -2,15 +2,13 @@ import types
 from contextlib import contextmanager
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
 
-import numpy as np
 import torch
 
 from asrq import tracking
 import torch.nn as nn
 import torch.nn.functional as F
-from humming import ops
 
-from asrq.quantizers.activation import (  # noqa: F401  re-exported for the rotation search
+from asrq.quantizers.activation import (  # noqa: F401  re-exported for rotation learning
     ActivationQuantizer,
     build_activation_quantizers,
     fake_quantize_activations,
@@ -20,6 +18,12 @@ from asrq.quantizers.activation import (  # noqa: F401  re-exported for the rota
 from asrq.transforms.rotation.cayley_sgd import SGDG
 from asrq.transforms.rotation.hadamard_utils import random_hadamard_matrix
 
+# How a layer's weight and bias absorb the rotations; see _rotate_weight.
+ROT_INPUT_R1 = 1
+ROT_INPUT_R1_OUTPUT_R2 = 2
+ROT_INPUT_R2_OUTPUT_R1 = 3
+ROT_OUTPUT_R1 = 4
+ROT_INPUT_R1_OUTPUT_R1 = 5
 
 
 def _weight_2d(layer: Union[nn.Linear, nn.Conv1d]) -> torch.Tensor:
@@ -54,6 +58,66 @@ def _rotate_heads(t: torch.Tensor, R2: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"axis of size {t.shape[-1]} is not divisible by head_dim {head_dim}")
     blocks = t.reshape(*t.shape[:-1], t.shape[-1] // head_dim, head_dim)
     return (blocks @ R2).reshape(t.shape)
+
+
+def sylvester_hadamard_matrix(size: int, device=None, dtype=torch.float64) -> torch.Tensor:
+    """The normalized Hadamard matrix of Sylvester's construction, H_2n = [[H_n, H_n], [H_n, -H_n]] / sqrt(2).
+
+    It is symmetric and orthogonal, and depends on nothing but its size, so it is never stored: whatever
+    applies it online rebuilds exactly the matrix that was absorbed into a weight.
+
+    Args:
+        size: Width of the matrix, a power of two.
+        device: Device to build the matrix on.
+        dtype: Dtype of the returned matrix. It is built in float64 and rounded once.
+
+    Returns:
+        A ``(size, size)`` matrix with entries +-1 / sqrt(size).
+    """
+    if size < 1 or size & (size - 1):
+        raise ValueError(f"a Sylvester Hadamard matrix needs a power-of-two size, got {size}")
+    H = torch.ones(1, 1, dtype=torch.float64)
+    while H.shape[0] < size:
+        H = torch.cat((torch.cat((H, H), dim=1), torch.cat((H, -H), dim=1)), dim=0)
+    return (H * size ** -0.5).to(dtype).to(device)
+
+
+def block_hadamard(
+    x: torch.Tensor, block_size: int, signs: Optional[torch.Tensor] = None,
+    tile: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Right-multiply x by a block-diagonal Hadamard along its last axis: X @ H, or X @ D @ H with signs.
+
+    H is blockdiag(T, ..., T) with T the block_size-wide Sylvester Hadamard, and D = diag(signs) makes it
+    the randomized Hadamard; see random_hadamard_signs. H is never materialised: the last axis is split into
+    blocks and each is multiplied by T, one batched matmul. This is the one implementation of the online
+    Hadamard -- the weight an FC2 absorbs, the activation transformed at inference and the dense matrix a
+    rotation learning uses all come from it, so they cannot drift apart.
+
+    The product runs in x's dtype. In half precision that costs nothing measurable: on GELU outputs the
+    result is within 15% of the rounding error of casting the exact product to float16, and at it in bfloat16.
+
+    Args:
+        x: Tensor whose last axis holds the features.
+        block_size: Hadamard block size, a power of two dividing the last axis.
+        signs: Optional ``(width,)`` vector of +-1, the diagonal of D.
+        tile: T, if the caller keeps one; built here otherwise.
+
+    Returns:
+        A tensor of x's shape and dtype.
+    """
+    if x.shape[-1] % block_size:
+        raise ValueError(f"axis of size {x.shape[-1]} is not divisible by block_size {block_size}")
+    if tile is None:
+        tile = sylvester_hadamard_matrix(block_size, x.device, x.dtype)
+    if signs is not None:
+        x = x * signs.to(device=x.device, dtype=x.dtype)
+    return _rotate_heads(x, tile.to(device=x.device, dtype=x.dtype))
+
+
+def _is_hf_rmsnorm(module: nn.Module) -> bool:
+    """A Hugging Face-style RMSNorm (e.g. Qwen3RMSNorm): a ``weight`` scale and ``variance_epsilon``."""
+    return hasattr(module, "variance_epsilon") and isinstance(getattr(module, "weight", None), torch.Tensor)
 
 
 class _RMSNormWithScale(nn.Module):
@@ -145,11 +209,6 @@ class _RMSNormWithScale(nn.Module):
 
 
 
-def _is_hf_rmsnorm(module: nn.Module) -> bool:
-    """A Hugging Face-style RMSNorm (e.g. Qwen3RMSNorm): a ``weight`` scale and ``variance_epsilon``."""
-    return hasattr(module, "variance_epsilon") and isinstance(getattr(module, "weight", None), torch.Tensor)
-
-
 class _ScaleFreeRMSNorm(nn.Module):
     """An RMSNorm reduced to pure normalization, with its scale folded into the next layer.
 
@@ -211,13 +270,6 @@ class _ScaleFreeRMSNorm(nn.Module):
             weight = None if weight is None else weight.float()
             return F.rms_norm(x.float(), self.normalized_shape, weight, self.eps).to(x.dtype)
         return F.rms_norm(x, self.normalized_shape, None if weight is None else weight.to(x.dtype), self.eps)
-
-
-ROT_INPUT_R1 = 1
-ROT_INPUT_R1_OUTPUT_R2 = 2
-ROT_INPUT_R2_OUTPUT_R1 = 3
-ROT_OUTPUT_R1 = 4
-ROT_INPUT_R1_OUTPUT_R1 = 5
 
 
 def _rotate_weight(weight, bias, kind, R1, R2=None, H=None):
@@ -298,8 +350,8 @@ def fold_rotation(layer, kind, R1, R2=None):
 
     The inference counterpart of patch_rotation, and numerically equivalent to it: both build the
     rotated weight with _rotate_weight and round it once into the layer's dtype. An FC2's online
-    Hadamard is absorbed separately, by absorb_hadamard_rotation_into_fc2, which applies humming's
-    own kernel instead of a dense matrix.
+    Hadamard is absorbed separately, by absorb_hadamard_rotation_into_fc2, which applies it block
+    by block instead of as a dense matrix.
 
     Args:
         layer: The Linear or pointwise Conv1d to fold into.
@@ -341,20 +393,20 @@ def patch_rotation(layer, kind, R1, R2=None, H=None, quantize_input=None):
     Equivalent to fold_rotation, but the rotated weight is rebuilt every forward, so R1 and R2
     stay parameters an optimiser can move. The layer's own weight is used as a Parameter rather
     than through _weight_2d, so gradients reach it as well; freeze the weights separately if only
-    the rotations are being searched. _weight_2d is still called once here, to reject a
+    the rotations are being learned. _weight_2d is still called once here, to reject a
     non-pointwise Conv1d.
 
     R1 and R2 are captured by reference and are never copied or registered on the layer, so one
     shared nn.Parameter can be patched into every layer that reads the residual stream and
     optimised as a single rotation, as Cayley SGD over the Stiefel manifold needs. Registering
     them per layer would instead give each layer an independent copy that diverges during the
-    search.
+    learning.
 
     The replacement is bound with types.MethodType rather than assigned as a bare closure over
     the layer. Both shadow the class method on this instance only, but a bound method is rebound
     to the copy by copy.deepcopy, whereas a closure would keep pointing at the original layer and
     silently ignore the copy's weights. R1 and R2 stay shared across copies, which is what the
-    search wants.
+    learning wants.
 
     Patching a layer again replaces this forward rather than stacking on it, so calling it a
     second time with a different quantizer replaces the quantizer.
@@ -364,14 +416,13 @@ def patch_rotation(layer, kind, R1, R2=None, H=None, quantize_input=None):
         kind: One of the ROT_* rotation kinds.
         R1: The residual-stream rotation. May be an nn.Parameter.
         R2: The head-dimension rotation, for the kinds that name it. May be an nn.Parameter.
-        H: The online Hadamard applied to the layer's input as X @ H, for ROT_OUTPUT_R1. A dense
-            matrix rather than humming's kernel, which is not differentiable; see
-            online_hadamard_matrix. Fixed, not searched.
+        H: The online Hadamard applied to the layer's input as X @ H, for ROT_OUTPUT_R1, as a
+            dense matrix; see online_hadamard_matrix. Fixed, not learned.
         quantize_input: Optional ``fn(x) -> x`` fake-quantizing the layer's input, features last,
-            so the search sees the quantization error the deployed layer will. That input is
+            so learning sees the quantization error the deployed layer will. That input is
             already in the basis the layer's input quantizer will see: R1's for a layer reading
             the residual stream, R2's for the attention output projection -- which is what makes
-            R2 matter to the search at all -- and H's for an FC2 behind an online Hadamard. See
+            R2 matter to learning at all -- and H's for an FC2 behind an online Hadamard. See
             fake_quantize_activations.
 
     Returns:
@@ -399,18 +450,18 @@ def absorb_hadamard_rotation_into_fc2(
     block_size: int,
     signs: Optional[torch.Tensor] = None,
 ):
-    """Absorb humming's block-diagonal Hadamard into the weight of an FC2 layer.
+    """Absorb the online block-diagonal Hadamard into the weight of an FC2 layer.
 
     Linear(XH.T) = X @ H.T @ W.T + b
                  = X @ (W @ H).T + b
 
-    H is never materialised. The same humming kernel that will run online is applied directly
-    to the weight, whose last axis is in_features, so it computes W @ H by construction. That
-    is what makes the pair exact: the absorbed matrix cannot drift from the one applied online,
-    whatever orientation or normalisation the kernel uses.
+    H is never materialised. block_hadamard, the function that transforms the activation online,
+    is applied directly to the weight, whose last axis is in_features, so it computes W @ H by
+    construction. That is what makes the pair exact: the absorbed matrix cannot drift from the
+    one applied online.
 
-    The product runs in float32, the widest humming accepts, and is rounded once on the way
-    back into the weight, so the layer's dtype is unchanged.
+    The product runs in float64 and is rounded once on the way back into the weight, so the
+    layer's dtype is unchanged.
 
     With signs, the rotation is the randomized Hadamard D @ H, D = diag(signs), and the weight
     becomes W @ D @ H; OnlineHadamard applies the matching X @ D @ H. See random_hadamard_signs
@@ -418,20 +469,16 @@ def absorb_hadamard_rotation_into_fc2(
 
     Args:
         linear: The FC2 layer to absorb the Hadamard into.
-        block_size: Hadamard block size, matching the value used online. humming requires a
-            power of two, at most 512, that divides in_features. Setting it equal to the
-            activation quantization group size gives the best quantization SNR.
+        block_size: Hadamard block size, matching the value used online: a power of two that
+            divides in_features. Setting it equal to the activation quantization group size
+            gives the best quantization SNR.
         signs: Optional ``(in_features,)`` vector of +-1, the diagonal of D.
 
     Returns:
         None. The linear layer's weight is modified in place.
     """
     w = _weight_2d(linear)
-    weight = w.to(torch.float32)
-    if signs is not None:
-        weight = weight * signs.to(device=weight.device, dtype=weight.dtype)
-    rotated, _, _ = ops.process_input(weight.contiguous(), hadamard_block_size=block_size)
-    w.copy_(rotated)
+    w.copy_(block_hadamard(w.to(torch.float64), block_size, signs))
 
 
 def block_random_hadamard_matrix(size: int, block_size: int, device) -> torch.Tensor:
@@ -482,20 +529,17 @@ def get_parent_module(model, module_name):
     return parent_module
 
 def online_hadamard_matrix(in_features: int, block_size: int, device, dtype=torch.float32):
-    """Materialise, as a dense matrix, the block-diagonal Hadamard humming applies online.
+    """Materialise, as a dense matrix, the block-diagonal Hadamard that block_hadamard applies.
 
-    humming's kernel is not differentiable, so a rotation search cannot call it. H is only a
-    constant in the forward pass though, so it can be built once here and applied as a plain
-    matmul while R is being learned, then dropped at inference in favour of the fused kernel.
-    Building it from the kernel rather than independently is what guarantees the searched
-    rotation is optimised against the transform that will actually run.
+    Rotation learning folds H into the weight it rebuilds every forward (see _rotate_weight), which
+    takes a matrix. H is a constant there, so it is built once here; at inference OnlineHadamard
+    applies the same matrix block by block.
 
-    Only the block_size x block_size tile is taken from the kernel; the full matrix is exactly
-    that tile repeated down the diagonal.
+    The full matrix is the block_size x block_size Sylvester tile repeated down the diagonal.
 
     Args:
         in_features: Width of the layer's input.
-        block_size: Hadamard block size. A power of two, at most 512, dividing in_features.
+        block_size: Hadamard block size. A power of two dividing in_features.
         device: Device to build the matrix on.
         dtype: Dtype of the returned matrix.
 
@@ -506,11 +550,8 @@ def online_hadamard_matrix(in_features: int, block_size: int, device, dtype=torc
         raise ValueError(
             f"in_features={in_features} is not divisible by block_size={block_size}"
         )
-    tile, _, _ = ops.process_input(
-        torch.eye(block_size, device=device, dtype=torch.float32),
-        hadamard_block_size=block_size,
-    )
-    return torch.block_diag(*([tile.to(dtype)] * (in_features // block_size)))
+    tile = sylvester_hadamard_matrix(block_size, device, dtype)
+    return torch.block_diag(*([tile] * (in_features // block_size)))
 
 
 
@@ -698,7 +739,7 @@ def add_residual_stream_entry_hook(
 
     Two forms, for the two uses:
 
-    - ``persistent=False``: a closure over R1 itself. The rotation search needs this, since R1 is
+    - ``persistent=False``: a closure over R1 itself. Rotation learning needs this, since R1 is
       an nn.Parameter being optimised and the hook must see its current value.
     - ``persistent=True``: a ResidualStreamRotation child named ``input_rotation`` holding a copy
       of R1, for a rotation that is final. It is saved with the model; see
@@ -859,13 +900,10 @@ def random_sign_seed(generator: Optional[torch.Generator] = None) -> int:
 
 
 def seeded_hadamard_signs(seed: int, width: int, device) -> torch.Tensor:
-    """The +-1 vector humming applies before its Hadamard when called with ``hadamard_sign_seed=seed``.
+    """The +-1 vector random_hadamard_signs draws from a generator seeded with seed.
 
-    Channel j gets -1 when bit 0 of lowbias32(j + seed * 0x9E3779B9 mod 2**32) is set, the hash the input
-    kernel computes (third_party/humming, branch hadamard-sign-seed). The signs are what
-    random_hadamard_signs draws -- see there for why an FC2's Hadamard needs them -- but a single integer
-    reproduces them for every width, so the online transform generates them itself instead of reading and
-    multiplying a stored vector.
+    See random_hadamard_signs for why an FC2's Hadamard needs the signs. A rotation checkpoint stores this one
+    integer instead of a sign vector per FC2 width, and applying the rotation regenerates the vectors from it.
 
     Args:
         seed: A positive seed, as random_sign_seed returns.
@@ -877,17 +915,11 @@ def seeded_hadamard_signs(seed: int, width: int, device) -> torch.Tensor:
     """
     if seed <= 0:
         raise ValueError(f"the sign seed must be positive, got {seed}")
-    x = (np.arange(width, dtype=np.uint64) + np.uint64(seed * 0x9E3779B9 & 0xFFFFFFFF)) & np.uint64(0xFFFFFFFF)
-    x ^= x >> np.uint64(16)
-    x = (x * np.uint64(0x7FEB352D)) & np.uint64(0xFFFFFFFF)
-    x ^= x >> np.uint64(15)
-    x = (x * np.uint64(0x846CA68B)) & np.uint64(0xFFFFFFFF)
-    x ^= x >> np.uint64(16)
-    return torch.from_numpy(np.where(x & np.uint64(1), -1.0, 1.0).astype(np.float32)).to(device)
+    return random_hadamard_signs(width, device, torch.Generator().manual_seed(seed))
 
 
 class OnlineHadamard(nn.Module):
-    """Apply humming's block-diagonal Hadamard to the feature axis: X <- X @ H.
+    """Apply the block-diagonal Hadamard to the feature axis: X <- X @ H; see block_hadamard.
 
     The counterpart of absorb_hadamard_rotation_into_fc2, which folds H.T into the next layer's
     weight. Together they reconstruct the unrotated layer,
@@ -902,30 +934,40 @@ class OnlineHadamard(nn.Module):
     weight actually multiplies. A patched forward would hand such a hook X instead, which is the
     wrong basis for W @ H.
 
-    Inference only: the humming kernel is not differentiable. During a rotation search use
-    patch_rotation with a dense H, which applies the same matrix as a plain matmul.
+    The Hadamard itself is not part of the saved model: the block_size-wide Sylvester tile is a
+    non-persistent buffer, rebuilt from block_size whenever the module is constructed. It stays
+    float32 when the model is cast to half precision, as ResidualStreamRotation's rotation does,
+    and is rounded to the input's dtype in forward, so a cast and a cast back lose nothing.
+
+    Rotation learning does not use this module: it patches the layers with a dense H instead; see
+    patch_rotation.
 
     Args:
-        block_size: Hadamard block size. A power of two, at most 512, dividing the feature
-            width. Must match the value absorbed into the next layer.
+        block_size: Hadamard block size. A power of two dividing the feature width. Must match
+            the value absorbed into the next layer.
         signs: Optional ``(width,)`` +-1 vector; if given the transform is X @ D @ H with
             D = diag(signs), the randomized Hadamard. See random_hadamard_signs.
         channels_first: True for (batch, channels, time) inputs, as a pointwise Conv1d reads;
             the Hadamard is then applied to the channel axis.
-        sign_seed: The seed signs came from (seeded_hadamard_signs), or 0. With a seed humming generates
-            the signs inside its Hadamard kernel instead of this module multiplying by them; signs is
-            then kept for inspection and must equal ``seeded_hadamard_signs(sign_seed, width)``.
     """
 
     def __init__(
         self, block_size: int, channels_first: bool = False, signs: Optional[torch.Tensor] = None,
-        sign_seed: int = 0,
     ):
         super().__init__()
         self.block_size = block_size
         self.channels_first = channels_first
-        self.sign_seed = int(sign_seed)
         self.register_buffer("signs", None if signs is None else signs.detach().clone())
+        self.register_buffer(
+            "hadamard", sylvester_hadamard_matrix(block_size, dtype=torch.float32), persistent=False
+        )
+
+    def _apply(self, fn, recurse=True):
+        hadamard = self._buffers.get("hadamard")
+        super()._apply(fn, recurse)
+        if hadamard is not None:
+            self._buffers["hadamard"] = hadamard.to(device=fn(hadamard).device)
+        return self
 
     def pre_hook(self, _module, args):
         return (self(args[0]), *args[1:])
@@ -933,22 +975,25 @@ class OnlineHadamard(nn.Module):
     def forward(self, x):
         if self.channels_first:
             x = x.transpose(1, 2)
-        if self.signs is not None and not self.sign_seed:
-            x = x * self.signs.to(dtype=x.dtype)
-        rotated, _, _ = ops.process_input(
-            x.contiguous(), hadamard_block_size=self.block_size, hadamard_sign_seed=self.sign_seed
-        )
+        # block_hadamard builds the tile when there is none to hand it: a model pickled before the tile
+        # was a buffer has none, and a float64 input needs more precision than the float32 buffer holds
+        tile = self._buffers.get("hadamard")
+        if tile is not None and torch.promote_types(tile.dtype, x.dtype) != tile.dtype:
+            tile = None
+        rotated = block_hadamard(x, self.block_size, self.signs, tile)
         return rotated.transpose(1, 2) if self.channels_first else rotated
 
     def extra_repr(self) -> str:
-        signs = f"sign_seed={self.sign_seed}" if self.sign_seed else f"random_signs={self.signs is not None}"
-        return f"block_size={self.block_size}, channels_first={self.channels_first}, {signs}"
+        return (
+            f"block_size={self.block_size}, channels_first={self.channels_first}, "
+            f"random_signs={self.signs is not None}"
+        )
 
 
-def _online_hadamard_for(model, fc2_name, block_size, signs, sign_seed):
+def _online_hadamard_for(model, fc2_name, block_size, signs):
     """An FC2 layer and the OnlineHadamard that applies X @ H to its input.
 
-    humming's kernel mixes blocks of block_size, so the width it is applied to has to be a
+    The Hadamard mixes blocks of block_size, so the width it is applied to has to be a
     multiple of it; the layout follows the layer, since a pointwise Conv1d reads
     (batch, channels, time).
     """
@@ -958,15 +1003,13 @@ def _online_hadamard_for(model, fc2_name, block_size, signs, sign_seed):
         raise ValueError(
             f"{fc2_name} has in_features={in_features}, not divisible by block_size={block_size}"
         )
-    hadamard = OnlineHadamard(
-        block_size, channels_first=isinstance(fc2, nn.Conv1d), signs=signs, sign_seed=sign_seed
-    )
+    hadamard = OnlineHadamard(block_size, channels_first=isinstance(fc2, nn.Conv1d), signs=signs)
     return fc2, hadamard
 
 
 def insert_online_hadamard_after_activation(
     model, activation_name: str, fc2_name: str, block_size: int,
-    signs: Optional[torch.Tensor] = None, sign_seed: int = 0,
+    signs: Optional[torch.Tensor] = None,
 ) -> str:
     """Wrap an activation as nn.Sequential(activation, OnlineHadamard), in place.
 
@@ -988,12 +1031,11 @@ def insert_online_hadamard_after_activation(
             to be. Its type decides the layout: a Conv1d reads (batch, channels, time).
         block_size: Hadamard block size, matching the value absorbed into the FC2 layer.
         signs: The random signs absorbed into the FC2 layer, if any.
-        sign_seed: The seed they came from, if any; see OnlineHadamard.
 
     Returns:
         The dotted name of the inserted OnlineHadamard.
     """
-    fc2, hadamard = _online_hadamard_for(model, fc2_name, block_size, signs, sign_seed)
+    fc2, hadamard = _online_hadamard_for(model, fc2_name, block_size, signs)
     parent = get_parent_module(model, activation_name)
     attribute = activation_name.split(".")[-1]
     activation = getattr(parent, attribute)
@@ -1005,7 +1047,7 @@ def insert_online_hadamard_after_activation(
 
 
 def insert_online_hadamard_before_layer(
-    model, fc2_name: str, block_size: int, signs: Optional[torch.Tensor] = None, sign_seed: int = 0,
+    model, fc2_name: str, block_size: int, signs: Optional[torch.Tensor] = None,
 ) -> str:
     """Apply X @ H to an FC2 layer's own input, as an OnlineHadamard child run by a forward pre-hook.
 
@@ -1023,12 +1065,11 @@ def insert_online_hadamard_before_layer(
         fc2_name: Dotted name of the FC2 layer, whose H.T must already be absorbed or be about to be.
         block_size: Hadamard block size, matching the value absorbed into the layer.
         signs: The random signs absorbed into the layer, if any.
-        sign_seed: The seed they came from, if any; see OnlineHadamard.
 
     Returns:
         The dotted name of the inserted OnlineHadamard.
     """
-    fc2, hadamard = _online_hadamard_for(model, fc2_name, block_size, signs, sign_seed)
+    fc2, hadamard = _online_hadamard_for(model, fc2_name, block_size, signs)
     if not hasattr(fc2, "input_hadamard"):
         fc2.add_module("input_hadamard", hadamard)
         fc2.register_forward_pre_hook(hadamard.pre_hook)
@@ -1181,28 +1222,6 @@ def fold_norms(model, norm_layers) -> None:
         replace_module(model, norm_name, converted)
 
 
-def masked_kl_divergence(
-    student_logits: torch.Tensor, teacher_logits: torch.Tensor, mask: torch.Tensor
-) -> torch.Tensor:
-    """Mean KL(teacher || student) over the positions selected by mask.
-
-    Computed in float32 whatever the logits' dtype: a half-precision log-softmax over a vocabulary
-    of tens of thousands underflows for the unlikely tokens and turns their contribution into
-    noise.
-
-    Args:
-        student_logits: ``(..., vocab)`` logits of the model being optimised.
-        teacher_logits: Logits of the same shape from the full-precision model.
-        mask: Boolean tensor over the leading axes; True where the position counts.
-
-    Returns:
-        A scalar: the KL divergence per selected position.
-    """
-    student = F.log_softmax(student_logits[mask].float(), dim=-1)
-    teacher = F.log_softmax(teacher_logits[mask].float(), dim=-1)
-    return F.kl_div(student, teacher, log_target=True, reduction="batchmean")
-
-
 @contextmanager
 def exact_float32_arithmetic():
     """Disable TF32 for cuBLAS matmuls and cuDNN convolutions, restoring both on exit.
@@ -1212,7 +1231,7 @@ def exact_float32_arithmetic():
     pointwise. Rewriting the weights changes where that rounding lands, and on parakeet-ctc-1.1b
     it moved the logits by 1.8e-3 -- as much as a genuinely wrong fold does. With TF32 off the
     same rewrite is exact to 1.5e-6. The equivalence checks therefore run under this, and the
-    search itself keeps whatever the caller configured.
+    learning itself keeps whatever the caller configured.
     """
     matmul, cudnn = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -1274,7 +1293,7 @@ def check_logits_unchanged(
 
 
 def _cached_online_hadamard(hadamards, width, block_size, signs, device):
-    """The dense D @ H a search applies to an FC2 input of this width, built once and kept.
+    """The dense D @ H a learning run applies to an FC2 input of this width, built once and kept.
 
     One matrix per width serves every FC2 of that width, and the signs are the ones absorbed into
     those layers' weights; see random_hadamard_signs.
@@ -1301,7 +1320,7 @@ def patch_rotations(
 ) -> None:
     """Patch the forward pass of every layer in layers_to_rotate to apply its rotation.
 
-    Used while the rotation is being searched: the weights are left untouched and the rotation
+    Used while the rotation is being learned: the weights are left untouched and the rotation
     is recomputed each forward, so gradients reach R1 and the R2s. fold_rotations is the
     counterpart that writes the finished rotation into the weights.
 
@@ -1347,7 +1366,7 @@ def patch_rotations(
 
 def fold_rotations(
     model, layers_to_rotate, R1, R2s, hadamard_block_size, online_hadamard_layers,
-    hadamard_signs=None, use_r2=True, fc2_online_hadamard=True, hadamard_sign_seed=0,
+    hadamard_signs=None, use_r2=True, fc2_online_hadamard=True,
 ) -> None:
     """Fold a finished rotation into the weights of every layer in layers_to_rotate.
 
@@ -1355,7 +1374,7 @@ def fold_rotations(
     the rotated weight with _rotate_weight and round once into the layer's dtype.
 
     Each FC2 gets its online Hadamard's H absorbed as well, after its output rotation, which
-    reproduces the ``R1.T @ W @ H`` the search computed. The matching X @ H is then inserted
+    reproduces the ``R1.T @ W @ H`` learning computed. The matching X @ H is then inserted
     after the activation feeding that FC2, so the FC2 layer is left an ordinary Linear or Conv1d;
     see OnlineHadamard. An FC2 paired with no activation gets it at its own input instead; see
     insert_online_hadamard_before_layer.
@@ -1367,15 +1386,13 @@ def fold_rotations(
         R1: The residual-stream rotation, or ``{stream: R1}`` for a model with several streams.
         R2s: One head-dimension rotation per attention module, keyed by attention_name.
         hadamard_block_size: Block size of the online Hadamard applied to each FC2 input. Must
-            match the value the rotation was searched with.
+            match the value the rotation was learned with.
         online_hadamard_layers: ``(activation_name, fc2_name)`` pairs, one for every ROT_OUTPUT_R1
             layer; an activation_name of None puts the Hadamard at the FC2's own input.
             Unused when fc2_online_hadamard is False.
         hadamard_signs: Optional ``{fc2_input_width: signs}`` for the randomized Hadamard.
         use_r2: Fold R2 into the V and attention output projections; see _effective_kind.
         fc2_online_hadamard: Absorb and insert FC2's online Hadamard; see patch_rotations.
-        hadamard_sign_seed: The seed hadamard_signs came from, if any; the inserted OnlineHadamards
-            then let humming generate the signs; see seeded_hadamard_signs.
     """
     if fc2_online_hadamard:
         _check_online_hadamard_layers(layers_to_rotate, online_hadamard_layers)
@@ -1392,17 +1409,16 @@ def fold_rotations(
 
     for activation_name, fc2_name in online_hadamard_layers if fc2_online_hadamard else ():
         signs = _signs_for(hadamard_signs, get_module(model, fc2_name))
-        seed = hadamard_sign_seed if signs is not None else 0
         if activation_name is None:
-            insert_online_hadamard_before_layer(model, fc2_name, hadamard_block_size, signs, seed)
+            insert_online_hadamard_before_layer(model, fc2_name, hadamard_block_size, signs)
         else:
             insert_online_hadamard_after_activation(
-                model, activation_name, fc2_name, hadamard_block_size, signs, seed
+                model, activation_name, fc2_name, hadamard_block_size, signs
             )
 
 
 def _save_rotations(path, R1, R2s, multi_stream, settings) -> None:
-    """Save a searched rotation in the checkpoint format apply_rotations reads, with its settings."""
+    """Save a learned rotation in the checkpoint format apply_rotations reads, with its settings."""
     torch.save(
         {
             "R1": (
@@ -1417,7 +1433,7 @@ def _save_rotations(path, R1, R2s, multi_stream, settings) -> None:
 
 
 def _init_rotations(widths, multi_stream, r1_block_size, layers_to_rotate, learn_r2, device):
-    """Draw the rotations a search starts from, with the masks that keep R1 block-diagonal.
+    """Draw the rotations a learning run starts from, with the masks that keep R1 block-diagonal.
 
     One R1 per residual stream, from a random Hadamard matrix, and one head-wise R2 per attention
     module. All of them are float32 nn.Parameters for SGDG to move over the Stiefel manifold.
@@ -1468,8 +1484,7 @@ def _fc2_hadamard_signs(model, layers_to_rotate, device):
 
 
 def _cayley_sgd(
-    parameters, masks, loss_fn, train_loader, epochs, learning_rate, objective_name, log_every,
-    device,
+    parameters, masks, loss_fn, train_loader, epochs, learning_rate, log_every, device,
 ):
     """Optimise orthogonal parameters over the Stiefel manifold, and return the last epoch's mean loss.
 
@@ -1482,14 +1497,13 @@ def _cayley_sgd(
         masks: Gradient masks, aligned with the leading parameters, one each; a block-diagonal R1
             stays block-diagonal because SGDG builds its update only from products of a parameter
             and its gradient, so a masked gradient gives a masked step. May be empty.
-        loss_fn: ``fn(batch, grad) -> scalar tensor``, the objective being minimised.
+        loss_fn: ``fn(batch, grad) -> scalar tensor``, the loss being minimised.
         train_loader: Calibration dataloader yielding batches for loss_fn.
         epochs: Number of passes over train_loader.
         learning_rate: Initial learning rate.
-        objective_name: What loss_fn measures, for the printed lines.
         log_every: Summarise every log_every steps with the window's mean, min and max loss, the
             learning rate and the parameters' distance from orthogonality. An epoch average alone
-            hides a search that diverges and recovers. 0 disables it.
+            hides a learning run that diverges and recovers. 0 disables it.
         device: Device the parameters are on.
 
     Returns:
@@ -1523,91 +1537,40 @@ def _cayley_sgd(
                         for p in parameters
                     )
                 print(
-                    f"  step {step}/{num_steps}: {objective_name} {sum(window) / len(window):.6f} "
+                    f"  step {step}/{num_steps}: training loss {sum(window) / len(window):.6f} "
                     f"(min {min(window):.6f}, max {max(window):.6f}), lr {lr:.4g}, "
                     f"|R^T R - I| {drift:.1e}",
                     flush=True,
                 )
-                tracking.step_metric("search", "search/step")
+                tracking.step_metric("learning", "learning/step")
                 tracking.log({
-                    "search/step": step, "search/loss": sum(window) / len(window), "search/loss_min": min(window),
-                    "search/loss_max": max(window), "search/learning_rate": lr, "search/orthogonality_drift": drift,
-                    "search/epoch": epoch + 1,
+                    "learning/step": step, "learning/loss": sum(window) / len(window),
+                    "learning/loss_min": min(window), "learning/loss_max": max(window),
+                    "learning/learning_rate": lr, "learning/orthogonality_drift": drift,
+                    "learning/epoch": epoch + 1,
                 })
                 window = []
         avg_loss = total_loss / max(num_batches, 1)
-        print(f"Epoch {epoch + 1}/{epochs}, average {objective_name}: {avg_loss:.6f}", flush=True)
-        tracking.summary({f"search/epoch_{epoch + 1}_loss": avg_loss, "search/final_loss": avg_loss,
-                          "search/name": "cayley", "search/steps": step})
+        print(f"Epoch {epoch + 1}/{epochs}, average training loss: {avg_loss:.6f}", flush=True)
+        tracking.summary({f"learning/epoch_{epoch + 1}_loss": avg_loss, "learning/final_loss": avg_loss,
+                          "learning/steps": step})
     return avg_loss
 
 
-def _report_initial_objective(loss_fn, objective_name, batch, activation_bits) -> float:
-    """Print and record the objective at the random-Hadamard initialisation.
+def _report_initial_loss(loss_fn, batch, activation_bits) -> float:
+    """Print and record the training loss at the random-Hadamard initialisation.
 
-    The baseline the search has to beat: a random Hadamard is already a good rotation, so a run
+    The baseline learning has to beat: a random Hadamard is already a good rotation, so a run
     whose loss ends near this one learned nothing.
     """
     initial = float(loss_fn(batch, grad=False))
     print(
-        f"{objective_name} with {activation_bits}-bit activations at the random Hadamard "
+        f"training loss with {activation_bits}-bit activations at the random Hadamard "
         f"initialisation: {initial:.6f}"
     )
-    tracking.summary({"rotation/initial_objective": initial, "rotation/objective": objective_name,
+    tracking.summary({"rotation/initial_objective": initial, "rotation/objective": "training loss",
                       "rotation/activation_bits": activation_bits})
     return initial
-
-
-def _search_objective(model, objective, compute_logits, compute_loss, quantizers):
-    """The loss a rotation search minimises, and what to call it in the log.
-
-    Every rewrite the rotation makes is exact, so without quantization every rotation computes the
-    same function and there is nothing to learn. Quantizing the inputs of the rotated layers makes
-    the output depend on how well a rotation spreads outliers, and both objectives measure that
-    dependence:
-
-    - ``"kl"``: the KL divergence from the full-precision model to the same model with
-      fake-quantized activations. It can only be lowered by recovering quantization error, and
-      it uses the teacher's whole distribution at every position. The teacher is the model
-      itself with the activation quantizer switched off, which by the exactness of the rewrite
-      is the original model; see ActivationQuantizer. Its logits are recomputed each step
-      without gradients rather than cached, since a vocabulary-sized tensor per token per
-      sample would not fit.
-    - ``"ce"``: the model's own training loss on the calibration labels, through compute_loss --
-      cross-entropy for Whisper, CTC for Parakeet. It can also be lowered by fitting whatever
-      the labels differ from the model in. With reference text that includes casing,
-      punctuation and normalization, and on Whisper it measurably moved the quantized model
-      further from the full-precision one while the loss fell. With labels taken from the
-      full-precision model's own transcripts that gap closes, but the loss still only sees the
-      top token and still rewards being more confident than the full-precision model.
-
-    Args:
-        model: The patched model, whose rotations the loss is differentiated against.
-        objective: ``"kl"`` or ``"ce"``.
-        compute_logits: ``fn(model, batch) -> (logits, mask)``.
-        compute_loss: ``fn(model, batch) -> scalar tensor``; required for ``"ce"``.
-        quantizers: The activation quantizers the search runs with, which ``full_precision``
-            switches off.
-
-    Returns:
-        ``(loss_fn, name, full_precision)``: ``loss_fn(batch, grad)`` is the objective, name is
-        what it measures, and full_precision is a context manager disabling the quantizers.
-    """
-    def full_precision():
-        return quantizers_disabled(quantizers)
-
-    def loss_fn(batch, grad):
-        if objective == "ce":
-            with torch.set_grad_enabled(grad):
-                return compute_loss(model, batch)
-        with torch.no_grad(), full_precision():
-            teacher_logits, mask = compute_logits(model, batch)
-        with torch.set_grad_enabled(grad):
-            student_logits, _ = compute_logits(model, batch)
-            return masked_kl_divergence(student_logits, teacher_logits, mask)
-
-    name = "KL to full precision" if objective == "kl" else "training loss"
-    return loss_fn, name, full_precision
 
 
 def learn_rotations(
@@ -1618,6 +1581,7 @@ def learn_rotations(
     hidden_size,
     learning_rate,
     compute_logits,
+    compute_loss,
     train_loader,
     epochs,
     hadamard_block_size,
@@ -1629,8 +1593,6 @@ def learn_rotations(
     activation_symmetric=True,
     activation_roles=None,
     groupwise_roles=None,
-    objective="kl",
-    compute_loss=None,
     log_every=25,
     r1_block_size=None,
     hadamard_random_signs=True,
@@ -1638,7 +1600,7 @@ def learn_rotations(
     fc2_online_hadamard=True,
     model_name=None,
 ):
-    """Search the rotations R1 and R2 for a model and save them to disk.
+    """Learn the rotations R1 and R2 for a model and save them to disk.
 
     The model's norms are folded in place before the rotations are patched in, so the saved
     rotations only apply to a model that has had the same folding applied; apply_rotations does
@@ -1649,14 +1611,17 @@ def learn_rotations(
     SGDG keeps them on the Stiefel manifold, which plain SGD would not: a rotation that drifts
     off it stops being orthogonal and the reparameterisation stops being exact.
 
-    Every rewrite is exact, so the search only has something to minimise because the rotated
-    layers' inputs are fake-quantized; see _search_objective for the two objectives.
+    Every rewrite is exact, so learning only has something to minimise because the rotated
+    layers' inputs are fake-quantized. What it minimises is the model's own training loss on the
+    calibration labels, through compute_loss: cross-entropy for Whisper, CTC for Parakeet. The
+    labels should be the full-precision model's own transcripts, so that the loss can only fall
+    by recovering quantization error and not by fitting how reference text differs from the model.
 
     R1 and the R2s start from random Hadamard matrices and are optimised with Cayley SGD over the
     Stiefel manifold, so every iterate stays orthogonal and the reparameterisation stays exact.
 
     The rewrites are checked against the original model's logits on a fixed batch before the
-    search starts, with quantization off; see check_logits_unchanged.
+    learning starts, with quantization off; see check_logits_unchanged.
 
     Args:
         model: The model to learn rotations for.
@@ -1674,16 +1639,18 @@ def learn_rotations(
             to attach_rotation_hooks and saved as ``{stream: R1}``.
         learning_rate: Initial learning rate, decayed linearly to zero over the run.
         compute_logits: ``fn(model, batch) -> (logits, mask)``, where mask selects the
-            positions the objective counts.
-        train_loader: Calibration dataloader yielding batches for compute_logits.
+            positions that count. Used only to verify that the rewrites leave the logits unchanged.
+        compute_loss: ``fn(model, batch) -> scalar tensor``, the model's training loss on the
+            batch's labels, which learning minimises.
+        train_loader: Calibration dataloader yielding batches for compute_loss.
         epochs: Number of passes over train_loader.
         hadamard_block_size: Block size of the online Hadamard applied to each FC2 input.
             Must match the value used at inference, and is best set to the activation
             quantization group size.
         online_hadamard_layers: ``(activation_name, fc2_name)`` pairs, one for every
-            ROT_OUTPUT_R1 layer. The search applies H as a dense matmul inside each FC2's patched
-            forward, so these are not used for the search itself; they are checked here so that
-            a mapping apply_rotations would reject fails before the search rather than after.
+            ROT_OUTPUT_R1 layer. Learning applies H as a dense matmul inside each FC2's patched
+            forward, so these are not used for learning itself; they are checked here so that
+            a mapping apply_rotations would reject fails before learning rather than after.
         attach_rotation_hooks: ``fn(model, R1, persistent=False) -> handles`` called once R1
             exists, for the model-specific hooks that center and rotate each stack's residual
             stream and rotate it back out. Needed because norms whose input is the residual stream
@@ -1692,7 +1659,7 @@ def learn_rotations(
             transform of its own, such as one entered through an embedding R1 can be folded into.
         tolerance: Largest relative logit error accepted at each verification step.
         activation_bits: Bit width of the activation fake quantization applied during the
-            search. None disables it, which leaves the search with nothing to learn.
+            learning. None disables it, which leaves nothing to learn.
         activation_group_size: Features per activation quantization group for the roles in
             groupwise_roles. Set it to the group size used at evaluation.
         activation_symmetric: Symmetric activation quantization if True, else asymmetric.
@@ -1700,9 +1667,6 @@ def learn_rotations(
             same mapping evaluation uses. Required when activation_bits is set.
         groupwise_roles: Roles quantized group-wise; the rest per token. None makes every role
             group-wise. See asrq.quantizers.activation.build_activation_quantizers.
-        objective: ``"kl"`` or ``"ce"``; see _search_objective.
-        compute_loss: ``fn(model, batch) -> scalar tensor``, the model's training loss on the
-            batch's labels. Required for ``objective="ce"``, unused for ``"kl"``.
         hadamard_random_signs: Use the randomized online Hadamard X @ D @ H for every FC2, with the
             signs generated from one random seed (seeded_hadamard_signs), saved with the rotations as
             ``hadamard_sign_seed``. See random_hadamard_signs for why a plain Hadamard hurts FC2.
@@ -1711,25 +1675,21 @@ def learn_rotations(
             input stays unrotated.
         fc2_online_hadamard: Put an online Hadamard on every FC2 input. If False FC2 only
             rotates its output by R1 and its input stays unrotated. With both False only R1 is
-            searched, and the inputs left unrotated are best quantized group-wise.
+            learned, and the inputs left unrotated are best quantized group-wise.
         r1_block_size: If set, R1 is block-diagonal with blocks of this width, initialised from
-            block_random_hadamard_matrix and kept block-diagonal throughout the search by
+            block_random_hadamard_matrix and kept block-diagonal throughout learning by
             masking its gradient to the blocks. SGDG builds its update only from products of
             R1 and its gradient, so a block-diagonal gradient gives a block-diagonal step. Set
             it to the activation quantization group size. None keeps R1 full-width.
         log_every: Print the mean loss of the last log_every steps, with the learning rate and
             R1's distance from orthogonality, every log_every steps. An epoch average alone
-            hides a search that diverges and recovers. 0 disables it.
+            hides a learning run that diverges and recovers. 0 disables it.
         model_name: The model being rotated, saved in the checkpoint so applying it to another model is refused.
 
     Returns:
         ``(R1, R2s)``, the learned rotations, also saved to path; R1 is ``{stream: R1}`` when
         hidden_size is a mapping.
     """
-    if objective not in ("kl", "ce"):
-        raise ValueError(f"objective must be 'kl' or 'ce', got {objective!r}")
-    if objective == "ce" and compute_loss is None:
-        raise ValueError("objective='ce' needs compute_loss")
     if activation_bits is not None and not activation_roles:
         raise ValueError("activation quantization needs activation_roles")
     if activation_bits is not None:
@@ -1779,7 +1739,7 @@ def learn_rotations(
     if activation_bits is None:
         print(
             "WARNING: no activation quantization; the output does not depend on the rotation, "
-            "so the search will not change it"
+            "so learning will not change it"
         )
     else:
         quantizers = build_activation_quantizers(
@@ -1794,22 +1754,20 @@ def learn_rotations(
         use_r2=learn_r2, fc2_online_hadamard=fc2_online_hadamard,
     )
 
-    objective_loss, objective_name, full_precision = _search_objective(
-        model, objective, compute_logits, compute_loss, quantizers
-    )
-    with full_precision():
-        verify("rotation patching")
+    def loss_fn(batch, grad):
+        with torch.set_grad_enabled(grad):
+            return compute_loss(model, batch)
 
+    with quantizers_disabled(quantizers):
+        verify("rotation patching")
+        if quantizers:
+            print(f"training loss in full precision: {float(loss_fn(reference_batch, grad=False)):.6f}")
     if quantizers:
-        if objective == "ce":
-            with torch.no_grad(), full_precision():
-                unquantized = float(compute_loss(model, reference_batch))
-            print(f"training loss in full precision: {unquantized:.6f}")
-        _report_initial_objective(objective_loss, objective_name, reference_batch, activation_bits)
+        _report_initial_loss(loss_fn, reference_batch, activation_bits)
 
     _cayley_sgd(
-        r1_parameters + list(R2s.values()), r1_masks, objective_loss, train_loader, epochs,
-        learning_rate, objective_name, log_every, device,
+        r1_parameters + list(R2s.values()), r1_masks, loss_fn, train_loader, epochs,
+        learning_rate, log_every, device,
     )
 
     _save_rotations(path, R1, R2s, multi_stream, {
@@ -1819,72 +1777,60 @@ def learn_rotations(
         "fc2_online_hadamard": fc2_online_hadamard,
         "hadamard_sign_seed": hadamard_sign_seed or None,
         "r1_block_size": r1_block_size,
-        "objective": objective,
+        "objective": "ce",
         "activation_quantization": {
             "bits": activation_bits,
             "group_size": activation_group_size,
             "symmetric": activation_symmetric,
             "groupwise_roles": None if groupwise_roles is None else sorted(groupwise_roles),
         },
-        "search": {"name": "cayley"},
     })
     return R1, R2s
 
 
 def check_rotation_settings(
-    path: str, activation: Mapping, weight: Optional[Mapping] = None, checkpoint: Optional[Mapping] = None,
-    model_name: Optional[str] = None,
+    path: str, activation: Mapping, checkpoint: Optional[Mapping] = None, model_name: Optional[str] = None,
 ) -> None:
-    """Raise when a saved rotation was searched under different quantization settings than the run applying it.
+    """Raise when a saved rotation was learned under different quantization settings than the run applying it.
 
-    A rotation is searched against a quantizer, so applying it under another one is unsound: the search's
-    fitness is the KL of exactly the quantization being used. The checkpoint records what it assumed in
-    ``activation_quantization`` and, for the weight-only searches that used to be supported, in
-    ``search["weight_quantization"]``, which is still read so those checkpoints stay checked.
+    A rotation is learned against a quantizer, so applying it under another one is unsound: its loss was
+    measured under exactly the quantization being used. The checkpoint records what it assumed in
+    ``activation_quantization``.
 
     Args:
         path: The checkpoint's path, for the message.
         activation: The run's ``{"bits", "group_size", "symmetric", "groupwise_roles"}``; bits None or >= 16
             means activations are not quantized.
-        weight: The run's ``{"bits", "group_size", "symmetric"}``, checked against a weight-only search.
         checkpoint: The loaded checkpoint; read from path when not given.
-        model_name: The model being quantized, checked against the one the rotation was searched for.
+        model_name: The model being quantized, checked against the one the rotation was learned for.
     """
     checkpoint = torch.load(path, map_location="cpu") if checkpoint is None else checkpoint
-    searched_model = checkpoint.get("model")
-    if model_name is not None and searched_model is not None and searched_model != model_name:
+    learned_model = checkpoint.get("model")
+    if model_name is not None and learned_model is not None and learned_model != model_name:
         raise ValueError(
-            f"the rotation in {path} was searched for {searched_model}, but this run quantizes {model_name}. "
-            f"A rotation belongs to the model it was searched on; search one for this model."
+            f"the rotation in {path} was learned for {learned_model}, but this run quantizes {model_name}. "
+            f"A rotation belongs to the model it was learned on; learning one for this model."
         )
     saved = dict(checkpoint.get("activation_quantization") or {})
-    search = checkpoint.get("search") or {}
     mismatches = []
     bits = activation.get("bits")
     bits = None if bits is None or bits >= 16 else bits
     saved_bits = saved.get("bits")
     if saved_bits != bits:
-        mismatches.append(f"activation bits {saved_bits} searched, {bits} requested")
+        mismatches.append(f"activation bits {saved_bits} learned, {bits} requested")
     elif bits is not None:
         for key in ("group_size", "symmetric"):
             if saved.get(key) != activation.get(key):
-                mismatches.append(f"activation {key} {saved.get(key)!r} searched, {activation.get(key)!r} requested")
+                mismatches.append(f"activation {key} {saved.get(key)!r} learned, {activation.get(key)!r} requested")
         roles = activation.get("groupwise_roles")
         roles = None if roles is None else sorted(roles)
         if saved.get("groupwise_roles") != roles:
-            mismatches.append(f"group-wise roles {saved.get('groupwise_roles')} searched, {roles} requested")
-    searched_weights = search.get("weight_quantization") if search.get("quantization") == "weights" else None
-    if searched_weights is not None and weight is not None:
-        for key in ("bits", "group_size", "symmetric"):
-            if searched_weights.get(key) != weight.get(key):
-                mismatches.append(
-                    f"weight {key} {searched_weights.get(key)!r} searched, {weight.get(key)!r} requested"
-                )
+            mismatches.append(f"group-wise roles {saved.get('groupwise_roles')} learned, {roles} requested")
     if mismatches:
         raise ValueError(
-            f"the rotation in {path} was searched under different quantization settings: "
+            f"the rotation in {path} was learned under different quantization settings: "
             + "; ".join(mismatches)
-            + ". Search a rotation for these settings, or set transform.check_settings=false to apply it anyway."
+            + ". Learn a rotation for these settings, or set transform.check_settings=false to apply it anyway."
         )
 
 
@@ -1901,18 +1847,18 @@ def _load_rotations(checkpoint, device):
 def _check_rotations_fit_model(path, checkpoint, model, layers_to_rotate, R1, R2s, use_r2) -> None:
     """Raise if a saved rotation does not match the model it is about to be folded into.
 
-    A rotation searched for another model can still line up in some dimensions, so both halves are
+    A rotation learned for another model can still line up in some dimensions, so both halves are
     checked: one R2 per attention module this model has, and an R1 as wide as the residual stream
     each group reads. Without this the folds raise an opaque shape error somewhere in the middle of
     a half-rotated model, or none at all.
     """
-    searched_for = f" It records {checkpoint['model']}." if checkpoint.get("model") else ""
+    learned_for = f" It records {checkpoint['model']}." if checkpoint.get("model") else ""
     if use_r2:
         missing = [group[0] for group in layers_to_rotate if group[0] not in R2s]
         if missing:
             raise ValueError(
                 f"the rotation in {path} has no R2 for {len(missing)} of this model's attention modules, the "
-                f"first being {missing[0]!r}; it was searched for a different model." + searched_for
+                f"first being {missing[0]!r}; it was learned for a different model." + learned_for
             )
     moduledict = dict(model.named_modules())
     for group in layers_to_rotate:
@@ -1922,7 +1868,7 @@ def _check_rotations_fit_model(path, checkpoint, model, layers_to_rotate, R1, R2
         if rotation.shape[0] != width:
             raise ValueError(
                 f"the rotation in {path} has a {tuple(rotation.shape)} R1, but {first_layer} of this model reads "
-                f"{width} channels; it was searched for a different model." + searched_for
+                f"{width} channels; it was learned for a different model." + learned_for
             )
 
 
@@ -1937,19 +1883,18 @@ def apply_rotations(
 ):
     """Fold saved rotations into a model's weights, for inference.
 
-    Mirrors learn_rotations without the search: the norms are folded first, then the rotations
+    Mirrors learn_rotations without learning: the norms are folded first, then the rotations
     read from path are folded into the weights instead of patched into the forward passes. The
     norm fold has to come first because the rotation folds assume the norms carry no scale --
     only then does the residual stream commute with R1.
 
-    Which rotations exist is read from the checkpoint: a rotation searched without R2 or without
+    Which rotations exist is read from the checkpoint: a rotation learned without R2 or without
     FC2's online Hadamard is folded without them, and a checkpoint that predates those options is
     folded with both.
 
-    The online Hadamard becomes an OnlineHadamard module after each FC2's activation, running
-    humming's kernel, rather than the dense matmul used during the search. Both apply the same
-    matrix, so the searched rotation stays valid; see online_hadamard_matrix for why it is built
-    from the kernel in the first place.
+    The online Hadamard becomes an OnlineHadamard module after each FC2's activation, applied
+    block by block rather than as the dense matmul used during learning. Both apply the same
+    matrix, so the learned rotation stays valid; see block_hadamard.
 
     Args:
         model: The model to rotate, modified in place.
@@ -1958,7 +1903,7 @@ def apply_rotations(
             with a fourth element naming the residual stream for a checkpoint with one R1 per stream.
         norm_layers: ``(norm_name, previous_names, next_names)`` entries.
         hadamard_block_size: Block size of the online Hadamard. Must match the value the
-            rotation was searched with, which is stored in the checkpoint and checked here.
+            rotation was learned with, which is stored in the checkpoint and checked here.
         online_hadamard_layers: ``(activation_name, fc2_name)`` pairs, one for every
             ROT_OUTPUT_R1 layer.
         attach_rotation_hooks: ``fn(model, R1, persistent) -> handles``, called with
@@ -1979,7 +1924,7 @@ def apply_rotations(
     saved_block_size = checkpoint.get("hadamard_block_size")
     if fc2_online_hadamard and saved_block_size not in (None, hadamard_block_size):
         raise ValueError(
-            f"the rotation in {path} was searched with hadamard_block_size="
+            f"the rotation in {path} was learned with hadamard_block_size="
             f"{saved_block_size}, but {hadamard_block_size} was requested. The absorbed and "
             f"the online Hadamard have to be the same matrix, so these cannot differ."
         )
@@ -2005,6 +1950,5 @@ def apply_rotations(
     fold_rotations(
         model, layers_to_rotate, R1, R2s, hadamard_block_size, online_hadamard_layers,
         hadamard_signs, use_r2=use_r2, fc2_online_hadamard=fc2_online_hadamard,
-        hadamard_sign_seed=hadamard_sign_seed,
     )
     return handles

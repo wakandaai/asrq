@@ -11,13 +11,13 @@
 #          which keep one scale per group of 128 (activation_groupwise_roles).
 #          Rotation: Cayley SGD on R1 and a head-wise R2 per attention module, from random Hadamards, over 800
 #          calibration utterances for one epoch at learning rate 0.5, with the activations fake-quantized as
-#          evaluation will quantize them. The objective is transform.objective=auto, which for Cayley is the
-#          model's own training loss on the calibration transcripts. Here the search has something to find:
+#          evaluation will quantize them. The objective is the
+#          model's own training loss on the calibration transcripts. Here learning has something to find:
 #          the rotation only changes the output because the activations are quantized, and what it is fitting
 #          is how well the rotation spreads the outliers the quantizer has to round. One rotation per model and
 #          activation width, since the objective depends on the activation grid, and asrq/exp.py refuses a
-#          rotation searched under other activation settings. On Parakeet the loss is the CTC loss, whose
-#          backward has no deterministic CUDA kernel, so its search passes deterministic=false.
+#          rotation learned under other activation settings. On Parakeet the loss is the CTC loss, whose
+#          backward has no deterministic CUDA kernel, so its learning passes deterministic=false.
 #          Quantization: GPTQ on 2048 calibration utterances with layer_weight_recovery -- every quantized
 #          weight refit, just before it is quantized, onto the output it had before anything in its block was
 #          quantized, which also makes each block quantize its layers in the order they run.
@@ -35,7 +35,7 @@
 #          results/evaluations/wa_layer_recovery_<model>_wa_layer_recovery_w4a<bits>_.../{results.csv,config.yaml},
 #          one directory per run. Every run is logged to wandb in the group wa_layer_recovery.
 #
-# A search is skipped when its rotation file already exists, so the script can be re-run after an interruption.
+# A learning run is skipped when its rotation file already exists, so the script can be re-run after an interruption.
 # Run a subset with MODELS=whisper ABITS=4 bash scripts/wa_layer_recovery_w4a4_w4a8.sh
 #
 # Usage: bash scripts/wa_layer_recovery_w4a4_w4a8.sh [conda activate script] [project directory]
@@ -44,7 +44,7 @@ PROJECT_DIR=${2:-/home/ubuntu/asrq}
 source "$CONDA_ACTIVATE" asrq
 cd "$PROJECT_DIR"
 declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
-# Parakeet's CE objective is the CTC loss, and ctc_loss_backward has no deterministic CUDA kernel, so its search
+# Parakeet's CE objective is the CTC loss, and ctc_loss_backward has no deterministic CUDA kernel, so its learning
 # warns instead of refusing. The candidate draws and the dataloader stay seeded; only the gradient is affected.
 declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
 # Only the Conformer models have block-output Linears; quantizing them at 4 bits keeps this run's weights
@@ -56,7 +56,7 @@ declare -A BLOCK_OUT=(
 )
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 EXPERIMENT="exp_name=wa_layer_recovery wandb.enabled=true"
-# The search and the quantization must agree on these; asrq/exp.py refuses a rotation searched under other
+# Learning and the quantization must agree on these; asrq/exp.py refuses a rotation learned under other
 # activation settings.
 ACTIVATIONS="activation_symmetric=True activation_group_size=128"
 GRID="quantizer=gptq quantizer.bits=4 quantizer.symmetric=True quantizer.group_size=128"
@@ -74,7 +74,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
         transform.learning_rate=0.5 2>&1 | tr '\r' '\n'
       stamp "$model W4A$abits Cayley rotation end"
     else
-      stamp "$model W4A$abits rotation exists, skipping the search"
+      stamp "$model W4A$abits rotation exists, skipping learning"
     fi
 
     stamp "$model W4A$abits quantize and evaluate start"

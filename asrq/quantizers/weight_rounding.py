@@ -1,7 +1,4 @@
-"""The weight grid of the RTN and GPTQ quantizers, as functions of a ``(out, in)`` weight.
-
-Kept free of the quantizer registry so the rotation search can round weights exactly as the quantizers will.
-"""
+"""The weight grid of the RTN and GPTQ quantizers, as functions of a ``(out, in)`` weight."""
 
 import torch
 

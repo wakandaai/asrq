@@ -2,7 +2,7 @@
 
 The tests run asrq.experiment's learn_rotation_experiment and run_experiment, the functions behind
 asrq/rot-exp.py and asrq/exp.py, on a real model at the smallest scale that still exercises every step:
-8 calibration utterances (2 search steps, GPTQ on 8 utterances) and 8 evaluation utterances. Scaling runs
+8 calibration utterances (2 learning steps, GPTQ on 8 utterances) and 8 evaluation utterances. Scaling runs
 at W4A8: without a rotation, 4-bit activations break the models, and what is tested is the pipeline. They
 need a GPU, the model and the Open ASR Leaderboard LibriSpeech split in the Hugging Face cache, and the
 local calibration set; otherwise they are skipped. Deselect them with ``pytest -m "not integration"``.

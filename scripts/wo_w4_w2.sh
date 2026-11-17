@@ -8,15 +8,15 @@
 # Varies:  the model (whisper, parakeet, canary_qwen) and the weight width (4, 2).
 # Fixed:   groups of 128, activations in full precision (activation_bits=16).
 #          Rotation: Cayley SGD on R1 and a head-wise R2 per attention module, from random Hadamards, over 800
-#          calibration utterances for one epoch at learning rate 0.5, with transform.objective=auto, which for
-#          Cayley is the model's own training loss. Note what that search can and cannot do here: every rewrite
+#          calibration utterances for one epoch at learning rate 0.5, minimising
+#          the model's own training loss. Note what that learning can and cannot do here: every rewrite
 #          a rotation makes is exact, so with the activations in full precision the model's output does not
 #          depend on the rotation and the objective is flat -- learn_rotations says so and warns. The pass
 #          therefore returns the random Hadamard it starts from, and the rotation still earns its place by
-#          making the weights easier to round, not by anything the search found. Set transform.epochs=0 to skip
-#          the pass and save the same random Hadamard in a minute. The weight-only search that used to fit a
+#          making the weights easier to round, not by anything learning found. Set transform.epochs=0 to skip
+#          the pass and save the same random Hadamard in a minute. The weight-only learning that used to fit a
 #          rotation against rounded weights has been removed; see the git history of asrq/transforms/rotation.
-#          On Parakeet the loss is the CTC loss, whose backward has no deterministic CUDA kernel, so its search
+#          On Parakeet the loss is the CTC loss, whose backward has no deterministic CUDA kernel, so its learning
 #          passes deterministic=false.
 #          Quantization: GPTQ on 2048 calibration utterances, with
 #            - scale_recovery: a per-input-channel scale on every layer a norm feeds, fitted inside GPTQ and
@@ -35,7 +35,7 @@
 #          per run. Every run is logged to wandb in the group wo_w4_w2, named
 #          wo_w4_w2_<model>_<method>.
 #
-# A search is skipped when its rotation file already exists, so the script can be re-run after an interruption.
+# A learning run is skipped when its rotation file already exists, so the script can be re-run after an interruption.
 # Roughly 1-2 hours per evaluation; run a subset with MODELS=whisper BITS=2 bash scripts/wo_w4_w2.sh
 # Usage: bash scripts/<name>.sh [conda activate script] [project directory]
 CONDA_ACTIVATE=${1:-/home/ubuntu/miniconda3/bin/activate}
@@ -46,7 +46,7 @@ declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
 # W2 asymmetric and W4 symmetric, as in the earlier runs.
 declare -A SYMMETRIC=( [4]=True [2]=False )
 # Parakeet's CE objective is the CTC loss, and ctc_loss_backward has no deterministic CUDA kernel, so its
-# search warns instead of refusing. The candidate draws and the dataloader stay seeded.
+# learning warns instead of refusing. The candidate draws and the dataloader stay seeded.
 declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
 # Only the Conformer models have block-output Linears to quantize; Whisper has no such setting at all, and
 # weight_recovery simply finds nothing to refit there.
@@ -73,7 +73,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
         transform.learning_rate=0.5 2>&1 | tr '\r' '\n'
       stamp "$model W$bits Cayley rotation end"
     else
-      stamp "$model W$bits rotation exists, skipping the search"
+      stamp "$model W$bits rotation exists, skipping learning"
     fi
 
     stamp "$model W$bits quantize and evaluate start"

@@ -133,7 +133,7 @@ class ModelQ(ABC):
         """``{layer_name: role}`` for every layer whose input is activation-quantized.
 
         Roles decide which layers are quantized group-wise; see asrq.quantizers.activation. Evaluation,
-        the rotation search, the scaling transform's layer lists and to_asrq_linear all use this one
+        rotation learning, the scaling transform's layer lists and to_asrq_linear all use this one
         mapping, so each model defines it.
         """
         raise NotImplementedError(f"{type(self).__name__} must implement activation_quantization_roles()")

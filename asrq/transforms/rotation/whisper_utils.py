@@ -1,6 +1,6 @@
 """Whisper-specific inputs for learn_rotations.
 
-Provides the four things the generic rotation search needs for a Whisper model: a calibration
+Provides the four things the generic rotation learning needs for a Whisper model: a calibration
 dataloader, a logits function, the norm-to-neighbour mapping, and the list of layers to rotate.
 
 The mappings are derived from WhisperEncoder/WhisperDecoder's forward pass. Both stacks carry a
@@ -73,7 +73,7 @@ def build_whisper_decoder_targets(
 
 
 class WhisperCalibrationDataset(torch.utils.data.Dataset):
-    """Calibration utterances as teacher-forcing batches for the rotation search.
+    """Calibration utterances as teacher-forcing batches for rotation learning.
 
     Takes the ``(waveform, text)`` pairs asrq.calibration.data loads, whose text is the
     full-precision model's own transcript. The text is used verbatim: normalizing it would put
@@ -119,7 +119,7 @@ def whisper_collate_fn(batch, pad_token_id: int):
 
 
 def whisper_logits_fn(model, batch):
-    """Teacher-forced logits, and the positions the rotation objective counts.
+    """Teacher-forced logits, and the positions rotation learning counts.
 
     The mask is the labels' non-ignored positions: the text and end-of-text targets, without
     the forced prefix or padding. decoder_input_ids are passed explicitly so HF does not derive
@@ -143,8 +143,7 @@ def whisper_logits_fn(model, batch):
 def whisper_loss_fn(model, batch):
     """Teacher-forced cross-entropy over the text and end-of-text targets.
 
-    The training loss for learn_rotations' ``"ce"`` objective. The positions are the ones
-    whisper_logits_fn counts, so both objectives see the same tokens.
+    The training loss learn_rotations minimises, over the positions whisper_logits_fn counts.
     """
     logits, mask = whisper_logits_fn(model, batch)
     return F.cross_entropy(logits[mask].float(), batch["labels"].to(logits.device)[mask])
@@ -289,8 +288,8 @@ def get_whisper_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[str, 
 def get_whisper_activation_roles(model) -> Dict[str, str]:
     """Return ``{layer_name: role}`` for every layer whose input is activation-quantized.
 
-    The single definition used by both the rotation search and evaluation, so a rotation is
-    searched against the same quantized layers it is evaluated with. Every attention projection
+    The single definition used by both rotation learning and evaluation, so a rotation is
+    learned against the same quantized layers it is evaluated with. Every attention projection
     in both stacks, the decoder's cross-attention included, and both feed-forward layers; fc2's
     input is the online Hadamard's output once a rotation is applied. Roles are described in
     asrq.quantizers.activation.
@@ -350,7 +349,7 @@ def attach_whisper_rotation_hooks(model, R1, persistent: bool = False) -> List:
         model: A WhisperForConditionalGeneration.
         R1: The residual-stream rotation.
         persistent: Attach the transforms as ResidualStreamRotation modules that are saved with
-            the model, for a final rotation; the search leaves this False.
+            the model, for a final rotation; learning leaves this False.
 
     Returns:
         Hook handles, each with a ``.remove()``.

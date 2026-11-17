@@ -9,15 +9,12 @@ path: ""
 learn_rotation: False
 hadamard_block_size: 128
 # random +-1 signs before the fc2 online Hadamard (X @ D @ H); a plain Hadamard spikes GELU outputs.
-# Saved as one seed; humming (third_party/humming) generates the signs from it inside its kernel.
+# Saved as one seed; the signs are regenerated from it when the rotation is applied.
 hadamard_random_signs: True
 # learn a head-wise R2 per attention module (False: R1 only, attn_out input unrotated)
 learn_r2: True
 # online Hadamard on every fc2 input (False: fc2 input unrotated)
 fc2_online_hadamard: True
-# What the search minimises: ce (the model's training loss on the calibration transcripts), kl (the divergence
-# from the full-precision model's logits, which costs a teacher pass) or auto, which is ce.
-objective: auto
 # 0: full-width R1; otherwise block-diagonal R1 with this block width (use the group size)
 r1_block_size: 0
 use: True

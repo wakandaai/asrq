@@ -9,9 +9,9 @@
 # Fixed:   W2 asymmetric weights in groups of 128. Activations 8-bit symmetric, per token, except attn_out and
 #          fc2, which keep one scale per group of 128 (activation_groupwise_roles).
 #          Rotation: the saved weight-only W2 rotation, reused with transform.check_settings=false --
-#          its weight grid is exactly this run's (gptq, 2 bits, groups of 128, asymmetric), but it was searched
+#          its weight grid is exactly this run's (gptq, 2 bits, groups of 128, asymmetric), but it was learned
 #          with activations in full precision, so the check that a rotation matches the run's quantizer has to
-#          be turned off. No rotation has been searched against an 8-bit activation quantizer.
+#          be turned off. No rotation has been learned against an 8-bit activation quantizer.
 #          Quantization: GPTQ on 2048 calibration utterances, scale recovery on the transformer blocks, block
 #          output refitting on the Conformer blocks. The inserted Conformer output Linears stay in full
 #          precision, as in the weight-only W2 recipe, where quantizing them was measured worse.

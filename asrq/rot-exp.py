@@ -21,7 +21,7 @@ def set_seed(seed=42, deterministic=True):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    # warn_only lets an operation without a deterministic kernel run anyway. A Cayley search on Parakeet needs
+    # warn_only lets an operation without a deterministic kernel run anyway. Cayley SGD on Parakeet needs
     # it: the CE objective is the CTC loss, whose backward has no deterministic CUDA implementation.
     torch.use_deterministic_algorithms(True, warn_only=not deterministic)
     transformers.set_seed(seed)

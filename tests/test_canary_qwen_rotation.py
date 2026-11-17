@@ -85,7 +85,8 @@ def learned(tmp_path_factory):
     layers = cq.get_canary_qwen_rotation_layers(model)
     utils.learn_rotations(
         model, str(path), hidden_size={cq.ENCODER: 64, cq.LLM: 64}, learning_rate=0.5,
-        compute_logits=_logits, train_loader=_batches(), epochs=1, hadamard_block_size=BLOCK,
+        compute_logits=_logits, compute_loss=lambda m, b: _logits(m, b)[0].float().pow(2).mean(),
+        train_loader=_batches(), epochs=1, hadamard_block_size=BLOCK,
         tolerance=TOLERANCE, activation_bits=4, activation_group_size=BLOCK,
         groupwise_roles=["attn_out", "fc2"], activation_roles=cq.get_canary_qwen_activation_roles(model),
         **layers,
@@ -93,7 +94,7 @@ def learned(tmp_path_factory):
     return path
 
 
-def test_the_search_saves_one_r1_per_stream_and_r2s_for_both(learned):
+def test_the_learning_saves_one_r1_per_stream_and_r2s_for_both(learned):
     checkpoint = torch.load(learned, weights_only=False)
     assert {k: tuple(v.shape) for k, v in checkpoint["R1"].items()} == {cq.ENCODER: (64, 64), cq.LLM: (64, 64)}
     assert set(checkpoint["R2s"]) == {
@@ -158,7 +159,7 @@ def test_humming_takes_the_down_projection_hadamard_into_its_asrq_linear(learned
     names = [f"llm.model.layers.{i}.mlp.down_proj" for i in range(2)]
     replaced = replace_with_asrq_linear(rotated, {n: (8, 16, 0) for n in names}, BLOCK, {n: None for n in names})
     assert all(isinstance(m, ASRQLinear) and m.hadamard_block_size == BLOCK for m in replaced.values())
-    assert all(m.hadamard_sign_seed > 0 and m.hadamard_signs is None for m in replaced.values())
+    assert all(m.hadamard_sign_seed == 0 and m.hadamard_signs is not None for m in replaced.values())
     with torch.no_grad():
         got, _ = _logits(rotated, {**batch, "features": batch["features"].half()})
     assert (got.float() - expected.float()).abs().max() / expected.float().abs().max() < 5e-2

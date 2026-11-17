@@ -8,6 +8,7 @@ activations itself, with its own float16 arithmetic, so agreement is to kernel r
 below the quantization error being reproduced, which each test checks as well.
 """
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -18,10 +19,23 @@ from asrq.core.linear import ASRQLinear, replace_with_asrq_linear
 from asrq.quantizers.activation import fake_quantize_activations
 from asrq.quantizers.base import QuantConfig
 from asrq.quantizers.rtn import RTNQuantizer
-from asrq.transforms.rotation.utils import OnlineHadamard, random_hadamard_signs, seeded_hadamard_signs
+from asrq.transforms.rotation.utils import OnlineHadamard, random_hadamard_signs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="humming needs CUDA")
 DEVICE = "cuda"
+
+
+def _humming_seeded_signs(seed, width, device):
+    """The +-1 vector humming's input kernel generates for ``hadamard_sign_seed=seed``: channel j gets -1 when
+    bit 0 of lowbias32(j + seed * 0x9E3779B9 mod 2**32) is set (third_party/humming, branch hadamard-sign-seed)."""
+    mask = np.uint64(0xFFFFFFFF)
+    x = (np.arange(width, dtype=np.uint64) + np.uint64(seed * 0x9E3779B9 & 0xFFFFFFFF)) & mask
+    x ^= x >> np.uint64(16)
+    x = (x * np.uint64(0x7FEB352D)) & mask
+    x ^= x >> np.uint64(15)
+    x = (x * np.uint64(0x846CA68B)) & mask
+    x ^= x >> np.uint64(16)
+    return torch.from_numpy(np.where(x & np.uint64(1), -1.0, 1.0).astype(np.float32)).to(device)
 
 
 def _fake_quantized(layer, bits=4, group_size=128):
@@ -196,7 +210,7 @@ def test_a_seeded_hadamard_matches_the_stored_signs_bit_for_bit(bits):
     torch.manual_seed(0)
     layer = nn.Linear(5120, 1280).to(DEVICE)
     seed = 99
-    signs = seeded_hadamard_signs(seed, 5120, DEVICE)
+    signs = _humming_seeded_signs(seed, 5120, DEVICE)
     group = 128 if bits < 16 else 0
     stored = ASRQLinear.from_linear(layer, 4, 128, bits, group, hadamard_block_size=128, hadamard_signs=signs)
     seeded = ASRQLinear.from_linear(layer, 4, 128, bits, group, hadamard_block_size=128, hadamard_sign_seed=seed)

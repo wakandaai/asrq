@@ -77,21 +77,14 @@ class RotationTransformConfig(TransformConfig):
         # channels that share a quantization scale, and mixing wider than the group measurably
         # hurts. It is saved with the rotation and checked when the rotation is applied.
         self.hadamard_block_size = cfg.hadamard_block_size
-        # Activation fake quantization applied to the rotated layers' inputs during the search.
-        # Without it the output is independent of the rotation and the search learns nothing,
+        # Activation fake quantization applied to the rotated layers' inputs during learning.
+        # Without it the output is independent of the rotation and nothing is learned,
         # so match the activation quantization used at evaluation. exp.py and rot-exp.py set
         # these four from the top-level activation_* settings, the same ones evaluation reads;
         # abits of 16 or more means no quantization.
         self.abits = cfg.abits
         if self.abits is not None and self.abits >= 16:
             self.abits = None
-        # "kl" matches the full-precision model's output distribution; "ce" minimises the model's training loss
-        # on the calibration labels, which needs no teacher pass and is what "auto" selects. See learn_rotations.
-        self.objective = cfg.objective
-        if self.objective not in ("kl", "ce", "auto"):
-            raise ValueError(f"transform.objective must be 'kl', 'ce' or 'auto', got {self.objective!r}")
-        if self.objective == "auto":
-            self.objective = "ce"
         self.activation_group_size = cfg.activation_group_size
         self.activation_symmetric = cfg.activation_symmetric
         # Roles quantized group-wise, the rest per token; see asrq.quantizers.activation. Set
@@ -108,16 +101,13 @@ class RotationTransformConfig(TransformConfig):
         # inputs stay unrotated and should be quantized group-wise (activation_groupwise_roles).
         self.learn_r2 = cfg.learn_r2
         self.fc2_online_hadamard = cfg.fc2_online_hadamard
-        # Conformer models: quantize the inserted block-output Linears' inputs during the search,
+        # Conformer models: quantize the inserted block-output Linears' inputs during learning,
         # as evaluation will. Copied from the model config by exp.py and rot-exp.py.
         self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
-        # Refuse a rotation searched under other quantization settings; see check_rotation_settings.
+        # Refuse a rotation learned under other quantization settings; see check_rotation_settings.
         self.check_settings = bool(cfg.get("check_settings", True))
-        # The run's weight quantization, set from the quantizer by experiment.py. Only checked against a
-        # checkpoint from a weight-only search, which no longer exists but whose rotations still apply.
+        # The run's weight bit width, set from the quantizer by experiment.py; it names the default path.
         self.wbits = cfg.get("wbits", 4)
-        self.wgroup = cfg.get("wgroup", None)
-        self.wsymmetric = cfg.get("wsymmetric", True)
         if self.abits is not None:
             check_hadamard_matches_groups(
                 self.hadamard_block_size, self.activation_group_size,
@@ -129,7 +119,7 @@ class RotationTransformConfig(TransformConfig):
 class RotationTransform(BaseTransform):
     """QuaRot/SpinQuant-style rotation, learned over the Stiefel manifold with Cayley SGD.
 
-    obtain_transform learns R1 and R2 against the configured objective and saves them;
+    obtain_transform learns R1 and R2 against the model's training loss and saves them;
     apply_transform folds a saved pair into the weights. Both begin by converting every
     LayerNorm to a scale-free, shift-free normalization, which is what makes the residual
     stream commute with R1 -- so a model that has had the rotation applied has also had its
@@ -176,7 +166,6 @@ class RotationTransform(BaseTransform):
             hadamard_random_signs=self.cfg.hadamard_random_signs,
             learn_r2=self.cfg.learn_r2,
             fc2_online_hadamard=self.cfg.fc2_online_hadamard,
-            objective=self.cfg.objective,
             activation_group_size=self.cfg.activation_group_size,
             activation_symmetric=self.cfg.activation_symmetric,
             model_name=self.cfg.model_name,
@@ -204,7 +193,6 @@ class RotationTransform(BaseTransform):
                     "symmetric": self.cfg.activation_symmetric,
                     "groupwise_roles": self.cfg.activation_groupwise_roles,
                 },
-                {"bits": self.cfg.wbits, "group_size": self.cfg.wgroup, "symmetric": self.cfg.wsymmetric},
                 model_name=self.cfg.model_name,
             )
         original_text = self.transcribe(modelQ)

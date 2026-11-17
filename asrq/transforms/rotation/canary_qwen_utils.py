@@ -248,7 +248,7 @@ def canary_qwen_logits_fn(model, batch):
 
 
 def canary_qwen_loss_fn(model, batch):
-    """Cross-entropy on the transcript tokens: the training loss for the ``"ce"`` objective."""
+    """Cross-entropy on the transcript tokens: the training loss learn_rotations minimises."""
     logits, targets = _teacher_forced(model, batch)
     return F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten(), ignore_index=-100)
 

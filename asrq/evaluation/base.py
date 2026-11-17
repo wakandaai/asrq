@@ -33,7 +33,7 @@ def apply_activation_quantization(modelQ, model, cfg):
     """Fake-quantize activations as the top-level config says, for evaluation.
 
     Reads activation_bits, activation_group_size, activation_symmetric and
-    activation_groupwise_roles -- the settings the rotation search is also given -- and attaches a
+    activation_groupwise_roles -- the settings rotation learning is also given -- and attaches a
     quantizer to the input of every layer in modelQ.activation_quantization_roles(). Roles in
     activation_groupwise_roles get groups of activation_group_size; the rest are quantized per
     token. Does nothing at 16 bits or more.

@@ -2,20 +2,20 @@
 #
 # Weight-only W4 and W2 with an unlearned Hadamard rotation, scale recovery and per-layer weight recovery.
 #
-# Question: with the rotation taken as given rather than searched, how far do the two fitted recoveries get on
+# Question: with the rotation taken as given rather than learned, how far do the two fitted recoveries get on
 #           their own? Compared line for line with gptq_recovery_w4_w2.sh, which is the same recovery pair
 #           without a rotation, and with wo_w4_w2.sh, which adds the Conformer block output refit.
 #
 # Varies:  the model (whisper, parakeet, canary_qwen) and the weight width (4, 2).
 # Fixed:   groups of 128, W4 symmetric and W2 asymmetric as in the other weight-only runs, activations in full
 #          precision (activation_bits=16).
-#          Rotation: the random Hadamard R1 and head-wise R2s that a search would start from, saved with
+#          Rotation: the random Hadamard R1 and head-wise R2s that a learning run would start from, saved with
 #          transform.epochs=0 and no Cayley step. Nothing is learned and nothing could be: every rewrite a
 #          rotation makes is exact, so with the activations in full precision the model's output does not
-#          depend on the rotation and the search objective is flat -- learn_rotations says as much and warns.
+#          depend on the rotation and learning objective is flat -- learn_rotations says as much and warns.
 #          The rotation earns its place by making the weights easier to round, which is a property of its
-#          structure, not of a search. One rotation per model serves both widths, since nothing about it
-#          depends on the weight grid, and it is seeded by cfg.seed. The search's calibration arguments are
+#          structure, not of a learning run. One rotation per model serves both widths, since nothing about it
+#          depends on the weight grid, and it is seeded by cfg.seed. Learning's calibration arguments are
 #          kept small because no step is taken: the data is loaded only for the objective it prints once.
 #          Quantization: GPTQ on 2048 calibration utterances, with
 #            - scale_recovery: a per-input-channel scale on every layer a norm feeds, fitted inside GPTQ and
@@ -55,7 +55,7 @@ declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
 # W2 asymmetric and W4 symmetric, as in the other weight-only runs.
 declare -A SYMMETRIC=( [4]=True [2]=False )
 # Parakeet's objective is the CTC loss, whose backward has no deterministic CUDA kernel. No step is taken
-# here, but the flag costs nothing and keeps the command the same as the searching scripts'.
+# here, but the flag costs nothing and keeps the command the same as the learning scripts'.
 declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
 # Only the Conformer models have block-output Linears. block_output_linear_bits is left null, which gives them
 # the run's own bits; see ModelQ.layer_quant_cfg. Whisper has no such setting.

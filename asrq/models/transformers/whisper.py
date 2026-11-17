@@ -786,7 +786,7 @@ class WhisperQ(ModelQ):
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Every attention projection and both feed-forward layers, fc2 included; the same
-        mapping the rotation search quantizes."""
+        mapping rotation learning quantizes."""
         return get_whisper_activation_roles(self.model)
 
     def scale_recovery_targets(self) -> List[ScaleTarget]:

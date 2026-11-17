@@ -1,9 +1,7 @@
 """GPTQ on a weight and its Hessian, split into the Hessian's factorisation and the column pass.
 
-The GPTQ quantizer collects a layer's Hessian from calibration inputs and runs both halves once. The rotation
-search runs them for every candidate rotation, on Hessians collected once: gptq_factors depends only on the
-Hessian, so a layer whose input does not change with the rotation reuses its factors. Kept free of the
-quantizer registry so the search can import it directly.
+The GPTQ quantizer collects a layer's Hessian from calibration inputs and runs both halves once; scale recovery
+(asrq.quantizers.scale_recovery) calls them itself. gptq_factors depends only on the Hessian.
 
 The algorithm is act-order GPTQ with static groups: scales and zeros come from the unpermuted weight, columns
 are quantized in order of decreasing Hessian diagonal, each column's rounding error is spread over the columns

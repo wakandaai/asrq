@@ -40,9 +40,9 @@ class BaseTransform(ABC):
         sf.write("outputs/rotation_test_audio.wav", self.audio, self.sr)
         if not self.cfg.path: # type: ignore
             if hasattr(self.cfg, "wbits") and hasattr(self.cfg, "abits"):
-                self.cfg.path = f"outputs/{self.cfg.name}/{self.cfg.model_name.replace('/','-')}_{self.cfg.name}_w{self.cfg.wbits}a{self.cfg.abits}_{self.cfg.type}.pt" # type: ignore
+                self.cfg.path = f"outputs/{self.cfg.name}/{self.cfg.model_name.replace('/','-')}_{self.cfg.name}_w{self.cfg.wbits}a{self.cfg.abits}_{getattr(self.cfg, 'type', '')}.pt" # type: ignore
             else:
-                self.cfg.path = f"outputs/{self.cfg.name}/{self.cfg.model_name.replace('/','-')}_{self.cfg.name}{f'_{self.cfg.type}' if hasattr(self.cfg, 'type') else ''}.pt" # type: ignore
+                self.cfg.path = f"outputs/{self.cfg.name}/{self.cfg.model_name.replace('/','-')}_{self.cfg.name}{getattr(self.cfg, 'type', '')}.pt" # type: ignore
 
     @staticmethod
     def from_config(transform_cfg: TransformConfig) -> "BaseTransform":

@@ -11,6 +11,15 @@ import torch
 import torch.nn as nn
 
 
+ATTENTION_OUTPUTS = ("linear_out", "o_proj", "out_proj")
+# The smallest scale and weight maximum obtain_scales allows, as SmoothQuant's reference code clamps them.
+MIN_SCALE = 1e-5
+
+
+def _is_attention_output(name: str) -> bool:
+    return any(key in name for key in ATTENTION_OUTPUTS)
+
+
 def channels_last(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Put the contracted axis last: Conv1d activations are ``(B, C, T)``, linears ``(B, T, C)``."""
     return x.transpose(1, 2) if isinstance(module, nn.Conv1d) else x
@@ -97,14 +106,6 @@ class ScalingTransformConfig(TransformConfig):
         if not 0 <= self.alpha <= 1:
             raise ValueError(f"transform.alpha must be between 0 and 1, got {self.alpha}")
 
-
-ATTENTION_OUTPUTS = ("linear_out", "o_proj", "out_proj")
-# The smallest scale and weight maximum obtain_scales allows, as SmoothQuant's reference code clamps them.
-MIN_SCALE = 1e-5
-
-
-def _is_attention_output(name: str) -> bool:
-    return any(key in name for key in ATTENTION_OUTPUTS)
 
 
 def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, type="smoothquant", alpha=0.5):

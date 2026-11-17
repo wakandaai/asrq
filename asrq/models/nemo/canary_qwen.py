@@ -227,7 +227,7 @@ class CanaryQwenQ(ModelQ):
 
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Encoder attention, feed-forward and pointwise-conv layers and every LLM projection; the same
-        mapping the rotation search quantizes."""
+        mapping rotation learning quantizes."""
         return get_canary_qwen_activation_roles(self.model, self.quant_cfg.quantize_block_output_linear)
 
     def online_hadamard_layers(self) -> Dict[str, Optional[str]]:
