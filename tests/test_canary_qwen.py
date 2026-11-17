@@ -81,7 +81,8 @@ def test_exp_rotates_merges_quantizes_with_gptq_and_evaluates(learned_rotation, 
         assert sum(isinstance(m, OnlineHadamard) for m in modules.values()) == 3 * 32 + 28
         assert sum(isinstance(m, ResidualStreamRotation) for m in modules.values()) == 4
         quantized = set(modelQ.qparams)
-        assert sum(n.startswith("perception.encoder.layers.") for n in quantized) == 11 * 32
+        assert sum(n.startswith("perception.encoder.layers.") for n in quantized) == 11 * 32 + 31
+        assert sum(n.endswith(".norm_out.1") for n in quantized) == 31
         assert sum(n.startswith("llm.model.layers.") for n in quantized) == 7 * 28
         (row,) = results(results_file)
         assert (row["dataset"], row["split"], row["abits"]) == ("librispeech", "test.clean", "4")
