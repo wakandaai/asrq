@@ -228,16 +228,6 @@ class ModelQ(ABC):
         cuda_empty_cache()
         print("Quantization complete.")
 
-    def layer_quant_cfg(self, name: str):
-        """The quantizer config for one layer: the experiment's, or a copy with block_output_linear_bits for the
-        Linear a rotation inserts after a Conformer block's output norm."""
-        bits = getattr(self.quant_cfg, "block_output_linear_bits", None)
-        if bits is None or not name.endswith(".norm_out.1"):
-            return self.quant_cfg
-        config = copy.copy(self.quant_cfg)
-        config.bits = bits
-        return config
-
     def should_quantize_module(self, name, module):
         """Check if a module should be quantized based on its name and type."""
         if name in self.quant_cfg.exclude_modules:
@@ -355,11 +345,73 @@ class ModelQ(ABC):
             return None
         return []
 
+    def recovers_previous_block_error(self) -> bool:
+        """Whether weight recovery fits against the previous block's output from before it was quantized
+        (quantizer.recover_previous_block_error), which needs one of the two weight recoveries to be on."""
+        cfg = self.quant_cfg
+        return bool(getattr(cfg, "recover_previous_block_error", False)) and bool(
+            getattr(cfg, "weight_recovery", False) or getattr(cfg, "layer_weight_recovery", False)
+        )
+
+    def _block_position(self, block_name: str) -> Tuple[int, int]:
+        """``(index, number of blocks)`` of a block in its stack, from its ``<stack>.<index>`` name."""
+        stack, index = block_name.rsplit(".", 1)
+        return int(index), len(self.model.get_submodule(stack))
+
+    def reference_stream(self, block_name: str) -> Optional[list]:
+        """The previous block's output for every calibration sample, from before that block was quantized, when
+        weight recovery recovers the previous block's error; None otherwise.
+
+        A block loop feeds each block the previous block's quantized output. This is the other stream: what the
+        previous block produced, on the same input, while its weights were still full precision. Running the
+        block being quantized on it gives targets that the previous block's quantization error has not
+        reached. A stack's first block has no previous block, so it has none.
+        """
+        if not self.recovers_previous_block_error() or self._block_position(block_name)[0] == 0:
+            self._reference_stream = None
+        return getattr(self, "_reference_stream", None)
+
+    def capture_block_outputs(self, block_name: str) -> Optional[list]:
+        """A list to collect a block's outputs in before its layers are quantized, which keep_reference_stream
+        hands to the next block; None when nothing will read them, as for a stack's last block."""
+        if not self.recovers_previous_block_error():
+            return None
+        index, count = self._block_position(block_name)
+        return [] if index < count - 1 else None
+
+    def keep_reference_stream(self, outputs: Optional[list]) -> None:
+        """Make a block's outputs from before it was quantized the next block's reference_stream."""
+        self._reference_stream = outputs
+
+    def reference_targets(self, block: nn.Module, targets: Optional[list], run_reference, num_samples: int) -> Optional[list]:
+        """The targets apply_weight_recovery refits a block's output layer to, moved onto the reference stream.
+
+        ``targets`` are the block's outputs on its own input. With a reference stream they are replaced by its
+        outputs on that stream, so the output layer is refit to undo the previous block's error along with this
+        block's. Call it before any of the block's layers is quantized, and after the hooks collecting Hessians
+        are removed, since it runs the block.
+
+        Args:
+            block: The block, still unquantized.
+            targets: The list capture_weight_recovery returned, filled; None when the output layer is not refit.
+            run_reference: ``run_reference(block, index)`` runs a block on the reference stream's sample
+                ``index``, or None when there is no reference stream.
+            num_samples: The number of calibration samples.
+        """
+        if targets is None or run_reference is None:
+            return targets
+        moved = []
+        with torch.no_grad():
+            for index in range(num_samples):
+                output = run_reference(block, index)
+                moved.append((output[0] if isinstance(output, tuple) else output).detach().cpu())
+        return moved
+
     def apply_weight_recovery(self, block_name: str, quantizers: Dict[str, Any], run, targets: Optional[list]) -> None:
         """After a block's other layers are quantized, refit its output layer to the full-precision outputs in
         targets; see asrq.quantizers.weight_recovery. ``run(i)`` runs the block on calibration sample i.
 
-        An output layer that is quantized itself (``quantize_block_output_linear``) is refit first and quantized
+        The output layer is quantized like every other layer, so it is refit first and quantized
         afterwards, so it keeps the correction and still ends up on the grid. Its Hessian is collected in the
         same pass, from the quantized block's inputs, which is what it will see; quantize_layers leaves it to
         this method (see weight_recovery_quantizes).
@@ -439,7 +491,7 @@ class ModelQ(ABC):
         order += [name for name in quantizers if name not in order]
         return {name: quantizers[name] for name in order}
 
-    def layer_recovery(self, block: nn.Module, quantizers: Dict[str, Any], run, num_samples: int):
+    def layer_recovery(self, block: nn.Module, quantizers: Dict[str, Any], run, num_samples: int, run_reference=None):
         """``recover(name)`` for quantize_layers, which refits a layer onto its full-precision output just
         before it is quantized; None when per-layer weight recovery is off.
 
@@ -450,15 +502,20 @@ class ModelQ(ABC):
         place; the layer is refit to map Z onto Y and is quantized afterwards, so GPTQ puts the refit weight
         on the grid. See asrq.quantizers.weight_recovery.
 
-        Both runs read the same block input, so the fit corrects the error this block's own quantized layers
-        introduce, as the block output refit does; error inherited from earlier blocks sits in Y as much as in
-        Z. Reaching for that inherited error instead was measured worse: a single linear map undoes only the
-        part of it that its own input spans.
+        Which error the fit corrects depends on what the copy is run on:
 
-        A layer with no quantized layer upstream of it therefore sees Z equal to Y's input, where the fit
-        returns the weights the layer already has, and is skipped. One calibration sample decides that: the
-        two runs are the same computation except where a quantized layer lies between the block input and the
-        layer. Which layers those are depends on the order the block is quantized in; see in_execution_order.
+        - Without ``run_reference`` both runs read the same block input, so the fit corrects the error this
+          block's own quantized layers introduce, as the block output refit does; error inherited from earlier
+          blocks sits in Y as much as in Z. A layer with no quantized layer upstream of it then sees Z equal
+          to Y's input, where the fit returns the weights the layer already has, and is skipped.
+        - With ``run_reference`` (quantizer.recover_previous_block_error) the copy reads the previous block's
+          output from before that block was quantized; see reference_stream. Y is then free of the previous
+          block's error while Z carries it, so every layer is refit against that error as well, the first
+          layers of the block included.
+
+        One calibration sample decides whether a layer is skipped: the two runs are the same computation
+        except where something differs between the block input and the layer. Which layers have a quantized
+        layer upstream depends on the order the block is quantized in; see in_execution_order.
 
         The layer's Hessian is collected again in the same pass, from the inputs it is about to be quantized
         on. The one from the calibration pass is stale twice over: refitting a layer and quantizing it both
@@ -469,6 +526,8 @@ class ModelQ(ABC):
             quantizers: ``{layer name: quantizer}`` for the block, as quantize_layers takes them.
             run: ``run(block, index)`` runs a given block on calibration sample ``index``.
             num_samples: The number of calibration samples ``run`` accepts.
+            run_reference: ``run_reference(block, index)`` runs a given block on sample ``index`` of the
+                reference stream; the copy is run with it instead of ``run``. None runs both on the same input.
 
         Returns:
             ``recover(name)``, or None when quantizer.layer_weight_recovery is off.
@@ -482,8 +541,10 @@ class ModelQ(ABC):
             name: teacher_modules[sub_names[id(quantizer.module)]] for name, quantizer in quantizers.items()
         }
 
-        def first_input(layer, source):
-            """The layer's input on the first calibration sample, running ``source`` in place of the block."""
+        run_teacher = run_reference or run
+
+        def first_input(layer, source, runner):
+            """The layer's input on the first calibration sample, as ``runner`` runs ``source``."""
             captured = {}
 
             def hook(_module, inputs, _output):
@@ -492,7 +553,7 @@ class ModelQ(ABC):
             handle = layer.register_forward_hook(hook)
             try:
                 with torch.no_grad():
-                    run(source, 0)
+                    runner(source, 0)
             finally:
                 handle.remove()
             return captured.get("x")
@@ -500,7 +561,7 @@ class ModelQ(ABC):
         def recover(name):
             quantizer = quantizers[name]
             layer, teacher_layer = quantizer.module, teacher_layers[name]
-            reference, current = first_input(teacher_layer, teacher), first_input(layer, block)
+            reference, current = first_input(teacher_layer, teacher, run_teacher), first_input(layer, block, run)
             if reference is None or current is None or torch.equal(reference, current):
                 return
             refit = WeightRecovery(layer)
@@ -523,7 +584,7 @@ class ModelQ(ABC):
             try:
                 with torch.no_grad():
                     for index in range(num_samples):
-                        run(teacher, index)
+                        run_teacher(teacher, index)
                         run(block, index)
             finally:
                 for handle in handles:
@@ -569,7 +630,7 @@ class ModelQ(ABC):
         groupwise = set(cfg.activation_groupwise_roles)
         layers = {
             name: (
-                self.layer_quant_cfg(name).bits,
+                self.quant_cfg.bits,
                 activation_bits,
                 cfg.activation_group_size if role in groupwise else 0,
             )

@@ -54,7 +54,6 @@ for batch in ${BATCHES:-1 128}; do
       python -u asrq/exp.py $COMMON $EXPERIMENT transform=rotation transform.path=$ROTATION \
         quantizer=gptq quantizer.bits=4 quantizer.symmetric=True quantizer.group_size=128 \
         quantizer.scale_recovery=true quantizer.weight_recovery=true \
-        model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4 \
         activation_bits=4 activation_symmetric=True activation_group_size=128 \
         inference=humming calibration.num_samples=128 quantized_path=auto \
         model.eval_batch_size=$batch eval_batches=${BATCHES_OF[$batch]} method=w4a4_b$batch 2>&1 | tr '\r' '\n'

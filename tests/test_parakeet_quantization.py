@@ -12,10 +12,8 @@ from asrq.models.nemo.parakeet_ctc import ParakeetCTCQ
 from asrq.quantizers.base import QuantConfig
 
 
-def _modelq(exclude=(), quantize_block_output_linear=None):
+def _modelq(exclude=()):
     cfg = {"name": "rtn", "bits": 4, "group_size": 128, "symmetric": True, "exclude_modules": list(exclude)}
-    if quantize_block_output_linear is not None:
-        cfg["quantize_block_output_linear"] = quantize_block_output_linear
     modelq = object.__new__(ParakeetCTCQ)
     modelq.quant_cfg = QuantConfig.from_dictconfig(OmegaConf.create(cfg))
     return modelq
@@ -29,12 +27,11 @@ def test_linears_and_pointwise_convs_are_quantized():
     assert modelq.should_quantize_module("encoder.layers.3.conv.pointwise_conv2", nn.Conv1d(1024, 1024, 1))
 
 
-def test_depthwise_convs_norms_and_inserted_block_output_linears_are_not():
+def test_depthwise_convs_and_norms_are_not():
     modelq = _modelq()
     depthwise = nn.Conv1d(1024, 1024, 9, groups=1024)
     assert not modelq.should_quantize_module("encoder.layers.3.conv.depthwise_conv.conv", depthwise)
     assert not modelq.should_quantize_module("encoder.layers.3.norm_conv", nn.LayerNorm(1024))
-    assert not modelq.should_quantize_module("encoder.layers.3.norm_out.1", nn.Linear(1024, 1024))
 
 
 def test_excluded_modules_are_respected():
@@ -42,10 +39,8 @@ def test_excluded_modules_are_respected():
     assert not modelq.should_quantize_module("encoder.layers.0.conv.pointwise_conv1", nn.Conv1d(1024, 1024, 1))
 
 
-def test_the_inserted_block_output_linears_are_quantized_only_when_configured():
+def test_the_inserted_block_output_linears_are_quantized_unless_excluded():
     linear = nn.Linear(1024, 1024)
-    assert not _modelq().should_quantize_module("encoder.layers.3.norm_out.1", linear)
-    assert not _modelq(quantize_block_output_linear=False).should_quantize_module("encoder.layers.3.norm_out.1", linear)
-    assert _modelq(quantize_block_output_linear=True).should_quantize_module("encoder.layers.3.norm_out.1", linear)
-    excluded = _modelq(exclude=["encoder.layers.3.norm_out.1"], quantize_block_output_linear=True)
+    assert _modelq().should_quantize_module("encoder.layers.3.norm_out.1", linear)
+    excluded = _modelq(exclude=["encoder.layers.3.norm_out.1"])
     assert not excluded.should_quantize_module("encoder.layers.3.norm_out.1", linear)

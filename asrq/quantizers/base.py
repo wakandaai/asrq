@@ -22,14 +22,6 @@ class QuantConfig(ABC):
         self.name = cfg.name
         self.bits = cfg.bits
         self.exclude_modules = cfg.exclude_modules
-        # Conformer models: also quantize the Linear a rotation inserts after each block's output
-        # norm. Set from the model config, like exclude_modules; see ParakeetCTCQ.
-        self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
-        # Bits for the Linear a rotation inserts after a Conformer block's output norm, when it is quantized;
-        # None gives it the same bits as every other layer. Its error lands straight in the residual stream, so
-        # it can be worth keeping it wider than the rest.
-        bits = cfg.get("block_output_linear_bits", None)
-        self.block_output_linear_bits = int(bits) if bits else None
         self.scale_recovery = bool(cfg.get("scale_recovery", False))
         self.scale_recovery_ridge = float(cfg.get("scale_recovery_ridge", 0.01))
         self.scale_recovery_method = str(cfg.get("scale_recovery_method", "lockstep"))
@@ -38,6 +30,8 @@ class QuantConfig(ABC):
         # The same refit on every quantized layer, before it is quantized; see ModelQ.layer_recovery.
         self.layer_weight_recovery = bool(cfg.get("layer_weight_recovery", False))
         self.layer_weight_recovery_ridge = float(cfg.get("layer_weight_recovery_ridge", 0.01))
+        # Fit both weight recoveries against the previous block's unquantized output; see ModelQ.reference_stream.
+        self.recover_previous_block_error = bool(cfg.get("recover_previous_block_error", False))
 
 
 class LinearQuantConfig(QuantConfig):

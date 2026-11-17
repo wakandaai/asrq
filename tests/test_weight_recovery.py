@@ -274,3 +274,118 @@ def test_a_layer_the_pass_never_calls_keeps_its_place_at_the_end():
     block = OrderedBlock(8)
     block.unused = nn.Linear(8, 8)
     assert _order(block, [torch.randn(1, 5, 8)]) == ["first", "second", "unused"]
+
+
+# --------------------------------------------------------------------------------------
+# recovering the previous block's error (quantizer.recover_previous_block_error)
+# --------------------------------------------------------------------------------------
+
+
+class _ReferenceModelQ:
+    """The part of ModelQ the reference stream needs, on a bare model."""
+
+    recovers_previous_block_error = ModelQ.recovers_previous_block_error
+    _block_position = ModelQ._block_position
+    reference_stream = ModelQ.reference_stream
+    capture_block_outputs = ModelQ.capture_block_outputs
+    keep_reference_stream = ModelQ.keep_reference_stream
+    reference_targets = ModelQ.reference_targets
+
+    def __init__(self, model, **config):
+        self.model = model
+        self.quant_cfg = SimpleNamespace(**config)
+
+
+def _stack(blocks=3, width=8):
+    model = nn.Module()
+    model.layers = nn.ModuleList([Block(width) for _ in range(blocks)])
+    return model
+
+
+def test_the_switch_needs_a_weight_recovery_to_be_on():
+    model = _stack()
+    assert not _ReferenceModelQ(model, recover_previous_block_error=True).recovers_previous_block_error()
+    assert not _ReferenceModelQ(model, layer_weight_recovery=True).recovers_previous_block_error()
+    for recovery in ("weight_recovery", "layer_weight_recovery"):
+        assert _ReferenceModelQ(model, recover_previous_block_error=True, **{recovery: True}).recovers_previous_block_error()
+
+
+def test_block_outputs_are_kept_for_every_block_but_a_stacks_last():
+    on = _ReferenceModelQ(_stack(), recover_previous_block_error=True, layer_weight_recovery=True)
+    assert on.capture_block_outputs("layers.0") == [] and on.capture_block_outputs("layers.1") == []
+    assert on.capture_block_outputs("layers.2") is None
+    off = _ReferenceModelQ(_stack(), layer_weight_recovery=True)
+    assert off.capture_block_outputs("layers.0") is None
+
+
+def test_the_reference_stream_is_the_previous_blocks_outputs_and_a_first_block_has_none():
+    modelq = _ReferenceModelQ(_stack(), recover_previous_block_error=True, layer_weight_recovery=True)
+    assert modelq.reference_stream("layers.0") is None
+    outputs = [torch.randn(1, 4, 8)]
+    modelq.keep_reference_stream(outputs)
+    assert modelq.reference_stream("layers.1") is outputs
+    assert modelq.reference_stream("layers.0") is None, "a new stack must not read the last stack's outputs"
+    assert modelq.reference_stream("layers.1") is None
+
+    off = _ReferenceModelQ(_stack(), layer_weight_recovery=True)
+    off.keep_reference_stream(outputs)
+    assert off.reference_stream("layers.1") is None
+
+
+def test_reference_targets_are_the_blocks_outputs_on_the_reference_stream():
+    model, reference = _model_and_samples()
+    block = model.layers[0]
+    modelq = _ReferenceModelQ(model, recover_previous_block_error=True, weight_recovery=True)
+    targets = [torch.zeros(1, 40, 32) for _ in reference]
+
+    def run_reference(b, i):
+        return (b(reference[i]), "cache")
+
+    assert modelq.reference_targets(block, targets, None, len(reference)) is targets
+    assert modelq.reference_targets(block, None, run_reference, len(reference)) is None
+    moved = modelq.reference_targets(block, targets, run_reference, len(reference))
+    with torch.no_grad():
+        assert all(torch.equal(got, block(x)) for got, x in zip(moved, reference))
+
+
+def test_with_a_reference_stream_a_layer_reading_the_block_input_is_refit_onto_the_reference():
+    """Without one ff is left alone (its input is the same in both runs); with one its input carries the
+    previous block's error and the refit maps it back onto what ff produced on the reference."""
+    model, reference = _model_and_samples()
+    block = model.layers[0]
+    torch.manual_seed(1)
+    samples = [0.8 * x + 0.05 * torch.randn_like(x) for x in reference]
+    with torch.no_grad():
+        targets = [block.ff(x) for x in reference]
+
+    def error():
+        with torch.no_grad():
+            return sum(float((block.ff(x) - t).pow(2).sum()) for x, t in zip(samples, targets)) / sum(
+                float(t.pow(2).sum()) for t in targets)
+
+    quantizers = _block_quantizers(block)
+    modelq = SimpleNamespace(quant_cfg=SimpleNamespace(layer_weight_recovery=True, layer_weight_recovery_ridge=0.0))
+    recover = ModelQ.layer_recovery(
+        modelq, block, quantizers, lambda b, i: b(samples[i]), len(samples), lambda b, i: b(reference[i]),
+    )
+    before = error()
+    recover("layers.0.ff")
+    assert error() < 0.5 * before
+    quantizer = quantizers["layers.0.ff"]
+    assert quantizer.nsamples == 0 and quantizer.tokens == sum(x.shape[1] for x in samples)
+
+
+def test_the_reference_stream_does_not_change_which_input_the_refit_layer_reads():
+    """Z must come from the block's own input: a layer refit on the reference input would learn nothing."""
+    model, reference = _model_and_samples()
+    block = model.layers[0]
+    samples = [x + 1.0 for x in reference]
+    seen = []
+    quantizers = _block_quantizers(block)
+    quantizers["layers.0.ff"].add_batch = lambda batch: seen.append(batch[0].clone())
+    modelq = SimpleNamespace(quant_cfg=SimpleNamespace(layer_weight_recovery=True, layer_weight_recovery_ridge=0.0))
+    recover = ModelQ.layer_recovery(
+        modelq, block, quantizers, lambda b, i: b(samples[i]), len(samples), lambda b, i: b(reference[i]),
+    )
+    recover("layers.0.ff")
+    assert len(seen) == len(samples) and all(torch.equal(got, x) for got, x in zip(seen, samples))

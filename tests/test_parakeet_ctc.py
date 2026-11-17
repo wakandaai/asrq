@@ -59,7 +59,7 @@ def test_exp_rotates_quantizes_with_gptq_and_evaluates(learned_rotation, tmp_pat
         assert sum(isinstance(m, ResidualStreamRotation) for m in modules) == 2
         quantized = set(modelQ.qparams)
         assert sum(".conv.pointwise_conv" in name for name in quantized) == 2 * 42
-        assert not any(name.endswith(".norm_out.1") for name in quantized)
+        assert sum(name.endswith(".norm_out.1") for name in quantized) == 41
         (row,) = results(results_file)
         assert (row["dataset"], row["split"], row["abits"]) == ("librispeech", "test.clean", "4")
         assert float(row["wer"]) < WER_CEILING

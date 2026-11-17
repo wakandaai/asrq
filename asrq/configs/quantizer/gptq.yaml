@@ -4,10 +4,6 @@ group_size: 128
 block_size: 128
 symmetric: True
 percdamp: 0.01
-# Bits for the Linear a rotation inserts after each Conformer block's output norm, when the model config quantizes
-# it (model.quantize_block_output_linear). null gives it the same bits as the rest; its error lands straight in the
-# residual stream and nothing downstream corrects it, so it can be worth keeping wider.
-block_output_linear_bits: null
 # Give every quantized layer a transformer block's norms feed a per-input-channel scale, fitted inside GPTQ as each
 # column is rounded and folded into that norm (asrq/quantizers/scale_recovery.py; weight error only).
 # scale_recovery_ridge pulls s toward 1.
@@ -32,3 +28,10 @@ weight_recovery_ridge: 0.01
 # against the drift of everything feeding it; see ModelQ.in_execution_order.
 layer_weight_recovery: False
 layer_weight_recovery_ridge: 0.01
+# What the two weight recoveries above recover from. False: only the error of the block's own quantized layers; the
+# full-precision target and the layer being refit read the same block input. True: the previous block's error as
+# well; the target comes from running the block on the previous block's output from before that block was
+# quantized, while the layer being refit reads its quantized output. Every layer of a block is then refit, and
+# those outputs are kept for the whole calibration set (on the CPU). Does nothing unless weight_recovery or
+# layer_weight_recovery is on; a stack's first block has no previous block and is recovered as with False.
+recover_previous_block_error: False

@@ -540,7 +540,7 @@ class WhisperQ(ModelQ):
         for name, module in block.named_modules():
             name = f"{block_name}.{name}"
             if self.should_quantize_module(name, module):
-                quant_methods[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
+                quant_methods[name] = self.quant_cls(module, name, self.quant_cfg)
                 submodules[name] = module
         
         def get_hook(name):
@@ -554,21 +554,33 @@ class WhisperQ(ModelQ):
             hooks.append(layer.register_forward_hook(get_hook(name)))
 
         # forward pass through the block
+        reference = self.reference_stream(block_name)
+        block_outputs = self.capture_block_outputs(block_name)
         recovery_targets = self.capture_weight_recovery(block_name)
         for i in range(num_samples):
             with torch.no_grad():
                 out = block(*inp_args[i], **inp_kwargs[i])
-            if recovery_targets is not None:
-                recovery_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
+            if recovery_targets is not None or block_outputs is not None:
+                hidden = (out[0] if isinstance(out, tuple) else out).detach().cpu()
+                if recovery_targets is not None:
+                    recovery_targets.append(hidden)
+                if block_outputs is not None:
+                    block_outputs.append(hidden)
         # remove hooks
         for h in hooks:
             h.remove()
+        # the block on the previous block's output from before that block was quantized; see reference_stream
+        run_reference = None
+        if reference is not None:
+            def run_reference(b, i):
+                return b(reference[i].to(inp_args[i][0].device), *inp_args[i][1:], **inp_kwargs[i])
+        recovery_targets = self.reference_targets(block, recovery_targets, run_reference, num_samples)
         groups = self.capture_scale_recovery(quant_methods)
         quant_methods = self.in_execution_order(
             quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]),
         )
         recover = self.layer_recovery(
-            block, quant_methods, lambda b, i: b(*inp_args[i], **inp_kwargs[i]), num_samples,
+            block, quant_methods, lambda b, i: b(*inp_args[i], **inp_kwargs[i]), num_samples, run_reference,
         )
         # quantize layers
         for name in self.quantize_layers(
@@ -586,6 +598,7 @@ class WhisperQ(ModelQ):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
         self.apply_weight_recovery(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), recovery_targets)
+        self.keep_reference_stream(block_outputs)
 
         # get input into the next block
         for i in range(num_samples):
@@ -724,7 +737,7 @@ class WhisperQ(ModelQ):
         for name, module in block.named_modules():
             name = f"model.decoder.layers.{block_idx}.{name}"
             if self.should_quantize_module(name, module):
-                quant_methods[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
+                quant_methods[name] = self.quant_cls(module, name, self.quant_cfg)
                 submodules[name] = module
         
         def get_hook(name):
@@ -738,21 +751,33 @@ class WhisperQ(ModelQ):
             hooks.append(layer.register_forward_hook(get_hook(name)))
 
         # forward pass through the block
+        reference = self.reference_stream(block_name)
+        block_outputs = self.capture_block_outputs(block_name)
         recovery_targets = self.capture_weight_recovery(block_name)
         for i in range(num_samples):
             with torch.no_grad():
                 out = block(*inp_args[i], **inp_kwargs[i])
-            if recovery_targets is not None:
-                recovery_targets.append((out[0] if isinstance(out, tuple) else out).detach().cpu())
+            if recovery_targets is not None or block_outputs is not None:
+                hidden = (out[0] if isinstance(out, tuple) else out).detach().cpu()
+                if recovery_targets is not None:
+                    recovery_targets.append(hidden)
+                if block_outputs is not None:
+                    block_outputs.append(hidden)
         # remove hooks
         for h in hooks:
             h.remove()
+        # the block on the previous block's output from before that block was quantized; see reference_stream
+        run_reference = None
+        if reference is not None:
+            def run_reference(b, i):
+                return b(reference[i].to(inp_args[i][0].device), *inp_args[i][1:], **inp_kwargs[i])
+        recovery_targets = self.reference_targets(block, recovery_targets, run_reference, num_samples)
         groups = self.capture_scale_recovery(quant_methods)
         quant_methods = self.in_execution_order(
             quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]),
         )
         recover = self.layer_recovery(
-            block, quant_methods, lambda b, i: b(*inp_args[i], **inp_kwargs[i]), num_samples,
+            block, quant_methods, lambda b, i: b(*inp_args[i], **inp_kwargs[i]), num_samples, run_reference,
         )
         # quantize layers
         for name in self.quantize_layers(
@@ -770,6 +795,7 @@ class WhisperQ(ModelQ):
                 module.quantize_()
             tqdm.write(f"Quantized layer {name}")
         self.apply_weight_recovery(block_name, quant_methods, lambda i: block(*inp_args[i], **inp_kwargs[i]), recovery_targets)
+        self.keep_reference_stream(block_outputs)
 
         # get input into the next block
         for i in range(num_samples):

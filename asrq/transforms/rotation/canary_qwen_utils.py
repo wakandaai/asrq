@@ -112,7 +112,7 @@ def get_canary_qwen_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[s
     return groups
 
 
-def get_canary_qwen_activation_roles(model, quantize_block_output_linear: bool = False) -> Dict[str, str]:
+def get_canary_qwen_activation_roles(model) -> Dict[str, str]:
     """``{layer_name: role}`` for every layer whose input is activation-quantized, in both streams.
 
     The encoder's roles are Parakeet's. In the LLM, q/k/v take their own roles, o is attn_out, gate and
@@ -120,7 +120,7 @@ def get_canary_qwen_activation_roles(model, quantize_block_output_linear: bool =
     """
     roles = {
         _prefixed(PERCEPTION, name): role
-        for name, role in get_parakeet_activation_roles(model.perception, quantize_block_output_linear).items()
+        for name, role in get_parakeet_activation_roles(model.perception).items()
     }
     for i in range(len(model.llm.model.layers)):
         p = _llm_layer(i)
@@ -269,8 +269,7 @@ def build_canary_qwen_dataloader(
 
 
 def get_canary_qwen_rotation_inputs(
-    model, samples: Sequence[Tuple[np.ndarray, str]], quantize_block_output_linear: bool = False,
-    **dataloader_kwargs,
+    model, samples: Sequence[Tuple[np.ndarray, str]], **dataloader_kwargs,
 ) -> Dict:
     """Everything learn_rotations needs for Canary-Qwen, as keyword arguments.
 
@@ -283,7 +282,7 @@ def get_canary_qwen_rotation_inputs(
             ENCODER: model.perception.encoder.layers[0].self_attn.linear_q.in_features,
             LLM: model.llm.config.hidden_size,
         },
-        "activation_roles": get_canary_qwen_activation_roles(model, quantize_block_output_linear),
+        "activation_roles": get_canary_qwen_activation_roles(model),
         "compute_logits": canary_qwen_logits_fn,
         "compute_loss": canary_qwen_loss_fn,
         "train_loader": build_canary_qwen_dataloader(model, samples, **dataloader_kwargs),

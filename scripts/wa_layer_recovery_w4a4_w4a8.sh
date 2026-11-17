@@ -47,13 +47,6 @@ declare -A BATCH=( [whisper]=64 [parakeet]=128 [canary_qwen]=128 )
 # Parakeet's CE objective is the CTC loss, and ctc_loss_backward has no deterministic CUDA kernel, so its learning
 # warns instead of refusing. The candidate draws and the dataloader stay seeded; only the gradient is affected.
 declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
-# Only the Conformer models have block-output Linears; quantizing them at 4 bits keeps this run's weights
-# comparable with spinquant_w4a4_w4a8.sh's. Whisper has no such setting.
-declare -A BLOCK_OUT=(
-  [parakeet]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
-  [canary_qwen]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
-  [whisper]=""
-)
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 EXPERIMENT="exp_name=wa_layer_recovery wandb.enabled=true"
 # Learning and the quantization must agree on these; asrq/exp.py refuses a rotation learned under other
@@ -79,7 +72,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
 
     stamp "$model W4A$abits quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=rotation transform.path=$rotation $GRID $EXPERIMENT \
-      $ACTIVATIONS activation_bits=$abits quantizer.layer_weight_recovery=true ${BLOCK_OUT[$model]} \
+      $ACTIVATIONS activation_bits=$abits quantizer.layer_weight_recovery=true \
       calibration.num_samples=2048 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False \
       method=wa_layer_recovery_w4a$abits 2>&1 | tr '\r' '\n'

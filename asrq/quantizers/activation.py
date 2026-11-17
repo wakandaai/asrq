@@ -9,7 +9,7 @@ Which layers are quantized, and how, is decided by each layer's role:
     attn_out   the attention output projection
     fc1        the first layer of a feed-forward or pointwise-convolution module
     fc2        the second one, which reads a nonlinearity's output
-    block_out  the Linear a rotation inserts after a Conformer block's output norm, when quantized
+    block_out  the Linear a rotation inserts after a Conformer block's output norm
 
 A model supplies the ``{layer_name: role}`` mapping; the configuration names which roles are
 quantized group-wise, and every other role is quantized per token. A role says which basis a

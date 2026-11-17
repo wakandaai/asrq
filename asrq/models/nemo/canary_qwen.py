@@ -106,11 +106,9 @@ class CanaryQwenQ(ModelQ):
         return next(self.model.parameters()).device
 
     def should_quantize_module(self, name, module) -> bool:
-        """Every nn.Linear and pointwise Conv1d in the quantized blocks; see ParakeetCTCQ for the
-        block-output Linears a rotation inserts into the encoder."""
+        """Every nn.Linear and pointwise Conv1d in the quantized blocks, including the block-output Linears a
+        rotation inserts into the encoder; see ParakeetCTCQ."""
         if name in self.quant_cfg.exclude_modules:
-            return False
-        if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
             return False
         return isinstance(module, nn.Linear) or is_pointwise_conv1d(module)
 
@@ -152,25 +150,40 @@ class CanaryQwenQ(ModelQ):
                 full_name = f"{prefix}.{index}.{name}"
                 if not name or not self.should_quantize_module(full_name, module):
                     continue
-                quantizers[full_name] = self.quant_cls(module, full_name, self.layer_quant_cfg(full_name))
+                quantizers[full_name] = self.quant_cls(module, full_name, self.quant_cfg)
 
                 def hook(_module, inputs, output, _name=full_name):
                     quantizers[_name].add_batch((inputs[0], output))
                 hooks.append(module.register_forward_hook(hook))
             block_name = f"{prefix}.{index}"
+            reference = self.reference_stream(block_name)
+            block_outputs = self.capture_block_outputs(block_name)
             recovery_targets = self.capture_weight_recovery(block_name)
             for args, kwargs in zip(args_list, kwargs_list):
                 output = block(*args, **kwargs)
-                if recovery_targets is not None:
-                    recovery_targets.append((output[0] if isinstance(output, tuple) else output).detach().cpu())
+                if recovery_targets is not None or block_outputs is not None:
+                    hidden = (output[0] if isinstance(output, tuple) else output).detach().cpu()
+                    if recovery_targets is not None:
+                        recovery_targets.append(hidden)
+                    if block_outputs is not None:
+                        block_outputs.append(hidden)
             for hook in hooks:
                 hook.remove()
+            # the block on the previous block's output from before that block was quantized; see reference_stream
+            run_reference = None
+            if reference is not None:
+                def run_reference(b, i, reference=reference):
+                    args, kwargs = args_list[i], kwargs_list[i]
+                    if stream_key in kwargs:
+                        return b(*args, **{**kwargs, stream_key: reference[i].to(kwargs[stream_key].device)})
+                    return b(reference[i].to(args[0].device), *args[1:], **kwargs)
+            recovery_targets = self.reference_targets(block, recovery_targets, run_reference, len(args_list))
             groups = self.capture_scale_recovery(quantizers)
             quantizers = self.in_execution_order(
                 quantizers, lambda i: block(*args_list[i], **kwargs_list[i]),
             )
             recover = self.layer_recovery(
-                block, quantizers, lambda b, i: b(*args_list[i], **kwargs_list[i]), len(args_list),
+                block, quantizers, lambda b, i: b(*args_list[i], **kwargs_list[i]), len(args_list), run_reference,
             )
             for name in self.quantize_layers(
                 quantizers, groups, self.weight_recovery_quantizes(block_name, quantizers), recover,
@@ -181,6 +194,7 @@ class CanaryQwenQ(ModelQ):
                 return block(*args_list[i], **kwargs_list[i])
 
             self.apply_weight_recovery(block_name, quantizers, run, recovery_targets)
+            self.keep_reference_stream(block_outputs)
             for j, (args, kwargs) in enumerate(zip(args_list, kwargs_list)):
                 output = block(*args, **kwargs)
                 output = output[0] if isinstance(output, tuple) else output
@@ -228,7 +242,7 @@ class CanaryQwenQ(ModelQ):
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Encoder attention, feed-forward and pointwise-conv layers and every LLM projection; the same
         mapping rotation learning quantizes."""
-        return get_canary_qwen_activation_roles(self.model, self.quant_cfg.quantize_block_output_linear)
+        return get_canary_qwen_activation_roles(self.model)
 
     def online_hadamard_layers(self) -> Dict[str, Optional[str]]:
         """Each fc2-like layer and the activation feeding its online Hadamard (None: at its own input)."""

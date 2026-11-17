@@ -399,7 +399,7 @@ class ParakeetCTCQ(ModelQ):
                 name = f"encoder.layers.{idx}.{name}"
                 if self.should_quantize_module(name, module):
                     sublayers[name] = module
-                    quantizers[name] = self.quant_cls(module, name, self.layer_quant_cfg(name))
+                    quantizers[name] = self.quant_cls(module, name, self.quant_cfg)
             # hooks
             def add_hook(name):
                 def hook(module, input, output):
@@ -412,21 +412,35 @@ class ParakeetCTCQ(ModelQ):
             
             # run calibration samples through the model to collect stats
             block_name = f"encoder.layers.{idx}"
+            reference = self.reference_stream(block_name)
+            block_outputs = self.capture_block_outputs(block_name)
             recovery_targets = self.capture_weight_recovery(block_name)
             for i in range(len(self.calibration_samples)):  # type: ignore[arg-type]
                 audio_signal = block(
                     **inp_kwargs[i],
                 )
-                if recovery_targets is not None:
-                    recovery_targets.append(audio_signal.detach().cpu())
+                if recovery_targets is not None or block_outputs is not None:
+                    hidden = audio_signal.detach().cpu()
+                    if recovery_targets is not None:
+                        recovery_targets.append(hidden)
+                    if block_outputs is not None:
+                        block_outputs.append(hidden)
 
             # remove hooks
             for hook in hooks:
                 hook.remove()
+            # the block on the previous block's output from before that block was quantized; see reference_stream
+            run_reference = None
+            if reference is not None:
+                def run_reference(b, i, reference=reference):
+                    return b(**{**inp_kwargs[i], "x": reference[i].to(inp_kwargs[i]["x"].device)})
+            recovery_targets = self.reference_targets(
+                block, recovery_targets, run_reference, len(self.calibration_samples),
+            )
             groups = self.capture_scale_recovery(quantizers)
             quantizers = self.in_execution_order(quantizers, lambda i: block(**inp_kwargs[i]))
             recover = self.layer_recovery(
-                block, quantizers, lambda b, i: b(**inp_kwargs[i]), len(self.calibration_samples),
+                block, quantizers, lambda b, i: b(**inp_kwargs[i]), len(self.calibration_samples), run_reference,
             )
 
             # quanitze
@@ -435,6 +449,7 @@ class ParakeetCTCQ(ModelQ):
             ):
                 tqdm.write(f"Quantized {name}")
             self.apply_weight_recovery(block_name, quantizers, lambda i, block=block: block(**inp_kwargs[i]), recovery_targets)
+            self.keep_reference_stream(block_outputs)
 
             # get the output of the block and use it as input for the next block
             for i in range(len(self.calibration_samples)):  # type: ignore[arg-type]
@@ -446,18 +461,15 @@ class ParakeetCTCQ(ModelQ):
             block.to("cpu")
 
     def should_quantize_module(self, name, module) -> bool:
-        """Every encoder nn.Linear and pointwise Conv1d, and the block-output Linears only if configured.
+        """Every encoder nn.Linear and pointwise Conv1d, the block-output Linears included.
 
         The convolution module's pointwise_conv1 and pointwise_conv2 are linear maps over channels,
         rotated and activation-quantized like the feed-forward linears, so their weights are
         quantized with them. The identity Linear a rotation inserts after each block's norm_out
         (``encoder.layers.{i}.norm_out.1``) carries that norm's scale and shift, which the original
-        model kept in a LayerNorm; it is quantized only with ``quantize_block_output_linear``, which
-        also gives it an activation role.
+        model kept in a LayerNorm; it is quantized at the same bits as every other layer.
         """
         if name in self.quant_cfg.exclude_modules:
-            return False
-        if name.endswith(".norm_out.1") and not self.quant_cfg.quantize_block_output_linear:
             return False
         return isinstance(module, nn.Linear) or is_pointwise_conv1d(module)
 
@@ -479,5 +491,5 @@ class ParakeetCTCQ(ModelQ):
     def activation_quantization_roles(self) -> Dict[str, str]:
         """Attention projections, feed-forward linears and pointwise convs, fc2-like layers
         included; the same mapping rotation learning quantizes."""
-        return get_parakeet_activation_roles(self.model, self.quant_cfg.quantize_block_output_linear)
+        return get_parakeet_activation_roles(self.model)
 

@@ -1330,8 +1330,7 @@ def patch_rotations(
     quantize_inputs maps a layer name to the quantizer applied to that layer's input, as
     asrq.quantizers.activation.build_activation_quantizers returns for the model's activation
     roles -- the same quantizers evaluation attaches. A layer missing from the mapping is left
-    unquantized, which includes the identity Linear inserted after a Conformer block's output
-    norm: it carries only the folded centering and has no activation role.
+    unquantized.
 
     Args:
         model: The model to patch.

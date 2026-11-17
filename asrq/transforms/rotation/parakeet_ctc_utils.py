@@ -262,7 +262,7 @@ def get_parakeet_layers_to_rotate(model) -> List[Tuple[str, int, List[Tuple[str,
     return groups
 
 
-def get_parakeet_activation_roles(model, quantize_block_output_linear: bool = False) -> Dict[str, str]:
+def get_parakeet_activation_roles(model) -> Dict[str, str]:
     """Return ``{layer_name: role}`` for every layer whose input is activation-quantized.
 
     The single definition used by both rotation learning and evaluation. The convolution
@@ -271,21 +271,19 @@ def get_parakeet_activation_roles(model, quantize_block_output_linear: bool = Fa
     online Hadamard.
 
     The identity Linear inserted after each block's output norm (see
-    insert_conformer_block_output_linears) is left out unless quantize_block_output_linear is set;
-    it then gets the ``block_out`` role. It exists only once a rotation has inserted it, so a model
-    without one has no such layers either way. It reads the rotated residual stream and writes it
-    back, a dense d_model x d_model matmul the original model did not have (about 2% of W4A4 GPU
-    time on Parakeet-CTC-1.1B).
+    insert_conformer_block_output_linears) gets the ``block_out`` role. It exists only once a
+    rotation has inserted it, so a model without one has no such layers. It reads the rotated
+    residual stream and writes it back, a dense d_model x d_model matmul the original model did not
+    have (about 2% of W4A4 GPU time on Parakeet-CTC-1.1B).
 
     Args:
         model: A model whose ``.encoder`` is a ConformerEncoder.
-        quantize_block_output_linear: Give the inserted block-output Linears the ``block_out`` role.
     """
     roles: Dict[str, str] = {}
     for i in range(len(model.encoder.layers)):
         p = f"encoder.layers.{i}"
         norm_out_name, block_output = _block_output_names(model, i)
-        if quantize_block_output_linear and block_output != norm_out_name:
+        if block_output != norm_out_name:
             roles[block_output] = "block_out"
         roles.update({
             f"{p}.self_attn.linear_q": "q",
@@ -371,20 +369,17 @@ def get_parakeet_rotation_layers(model) -> Dict:
 
 
 def get_parakeet_rotation_inputs(
-    model, samples: Sequence[Tuple[np.ndarray, str]], quantize_block_output_linear: bool = False,
-    **dataloader_kwargs,
+    model, samples: Sequence[Tuple[np.ndarray, str]], **dataloader_kwargs,
 ) -> Dict:
     """Everything learn_rotations needs for a Parakeet CTC model, as keyword arguments.
 
     samples are the ``(waveform, transcript)`` calibration pairs, the same ones GPTQ uses.
-    quantize_block_output_linear also quantizes the inputs of the inserted block-output Linears
-    during learning, as evaluation will; see get_parakeet_activation_roles.
     """
     layers = get_parakeet_rotation_layers(model)
     return {
         **layers,
         "hidden_size": model.encoder.layers[0].self_attn.linear_q.in_features,
-        "activation_roles": get_parakeet_activation_roles(model, quantize_block_output_linear),
+        "activation_roles": get_parakeet_activation_roles(model),
         "compute_logits": parakeet_ctc_logits_fn,
         "compute_loss": parakeet_ctc_loss_fn,
         "train_loader": build_parakeet_dataloader(model, samples, **dataloader_kwargs),

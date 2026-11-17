@@ -1313,15 +1313,14 @@ def test_r1_only_works_on_a_conformer_with_pointwise_convs(tmp_path):
     assert (got - expected).abs().max() / expected.abs().max() < TOLERANCE
 
 
-def test_the_block_output_linears_get_the_block_out_role_only_when_asked():
+def test_the_block_output_linears_get_the_block_out_role_once_a_rotation_inserts_them():
     parakeet_utils, build = _parakeet()
     model = build()
-    assert "block_out" not in parakeet_utils.get_parakeet_activation_roles(model, True).values()
+    assert "block_out" not in parakeet_utils.get_parakeet_activation_roles(model).values()
     parakeet_utils.get_parakeet_rotation_layers(model)
-    roles = parakeet_utils.get_parakeet_activation_roles(model, quantize_block_output_linear=True)
+    roles = parakeet_utils.get_parakeet_activation_roles(model)
     inserted = {name for name, role in roles.items() if role == "block_out"}
     assert inserted == {"encoder.layers.0.norm_out.1", "encoder.layers.1.norm_out.1"}
-    assert "block_out" not in parakeet_utils.get_parakeet_activation_roles(model).values()
 
 
 def test_a_learning_that_quantizes_the_block_output_linears_still_folds_exactly(tmp_path):
@@ -1344,7 +1343,7 @@ def test_a_learning_that_quantizes_the_block_output_linears_still_folds_exactly(
     expected = encode(build())
     learned = build()
     layers = parakeet_utils.get_parakeet_rotation_layers(learned)
-    roles = parakeet_utils.get_parakeet_activation_roles(learned, quantize_block_output_linear=True)
+    roles = parakeet_utils.get_parakeet_activation_roles(learned)
     quantized_inputs = {}
     original = utils.patch_rotations
 

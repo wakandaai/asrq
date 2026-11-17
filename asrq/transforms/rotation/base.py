@@ -34,7 +34,7 @@ from asrq.transforms.rotation.whisper_utils import (
 # mapping and the layers to rotate.
 _ROTATION_INPUTS_FNS = {
     ModelNames.OPENAI_WHISPER_LARGE_V3: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_whisper_rotation_inputs(
+        lambda modelQ, num_samples, batch_size: get_whisper_rotation_inputs(
             modelQ.model,
             modelQ.processor,
             modelQ.calibration_samples[:num_samples],
@@ -42,15 +42,13 @@ _ROTATION_INPUTS_FNS = {
         )
     ),
     ModelNames.NVIDIA_PARAKEET_CTC_1_1B: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_parakeet_rotation_inputs(
-            modelQ.model, modelQ.calibration_samples[:num_samples],
-            quantize_block_output_linear=quantize_block_output_linear, batch_size=batch_size,
+        lambda modelQ, num_samples, batch_size: get_parakeet_rotation_inputs(
+            modelQ.model, modelQ.calibration_samples[:num_samples], batch_size=batch_size,
         )
     ),
     ModelNames.NVIDIA_CANARY_QWEN_2_5B: (
-        lambda modelQ, num_samples, batch_size, quantize_block_output_linear: get_canary_qwen_rotation_inputs(
-            modelQ.model, modelQ.calibration_samples[:num_samples],
-            quantize_block_output_linear=quantize_block_output_linear, batch_size=batch_size,
+        lambda modelQ, num_samples, batch_size: get_canary_qwen_rotation_inputs(
+            modelQ.model, modelQ.calibration_samples[:num_samples], batch_size=batch_size,
         )
     ),
 }
@@ -101,9 +99,6 @@ class RotationTransformConfig(TransformConfig):
         # inputs stay unrotated and should be quantized group-wise (activation_groupwise_roles).
         self.learn_r2 = cfg.learn_r2
         self.fc2_online_hadamard = cfg.fc2_online_hadamard
-        # Conformer models: quantize the inserted block-output Linears' inputs during learning,
-        # as evaluation will. Copied from the model config by exp.py and rot-exp.py.
-        self.quantize_block_output_linear = bool(cfg.get("quantize_block_output_linear", False))
         # Refuse a rotation learned under other quantization settings; see check_rotation_settings.
         self.check_settings = bool(cfg.get("check_settings", True))
         # The run's weight bit width, set from the quantizer by experiment.py; it names the default path.
@@ -141,7 +136,6 @@ class RotationTransform(BaseTransform):
             modelQ,
             num_samples=self.cfg.num_samples,
             batch_size=self.cfg.batch_size,
-            quantize_block_output_linear=self.cfg.quantize_block_output_linear,
         )
 
     def _rotation_layers(self, modelQ) -> dict:

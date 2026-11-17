@@ -27,8 +27,8 @@
 #              output it had before anything in its block was quantized. It also makes each block quantize its
 #              layers in the order they run.
 #            - weight_recovery: the Conformer block output refit, which the two models that have an inserted
-#              block-output Linear use; their Linears are refit and then quantized at 4 bits whatever the rest
-#              of the model uses. Whisper has no such layer and nothing to refit.
+#              block-output Linear use; their Linears are refit and then quantized at the run's own bits.
+#              Whisper has no such layer and nothing to refit.
 #          Evaluation: all seven leaderboard datasets.
 # Output:  outputs/rotation/cayley_wo_w<bits>_<model>.pt, and
 #          results/evaluations/wo_w4_w2_<model>_wo_w<bits>_.../{results.csv,config.yaml}, one directory
@@ -48,13 +48,6 @@ declare -A SYMMETRIC=( [4]=True [2]=False )
 # Parakeet's CE objective is the CTC loss, and ctc_loss_backward has no deterministic CUDA kernel, so its
 # learning warns instead of refusing. The candidate draws and the dataloader stay seeded.
 declare -A DETERMINISTIC=( [parakeet]="deterministic=false" [whisper]="" [canary_qwen]="" )
-# Only the Conformer models have block-output Linears to quantize; Whisper has no such setting at all, and
-# weight_recovery simply finds nothing to refit there.
-declare -A BLOCK_OUT=(
-  [parakeet]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
-  [canary_qwen]="model.quantize_block_output_linear=true quantizer.block_output_linear_bits=4"
-  [whisper]=""
-)
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 EXPERIMENT="exp_name=wo_w4_w2 wandb.enabled=true"
 RECOVERY="quantizer.scale_recovery=true quantizer.layer_weight_recovery=true quantizer.weight_recovery=true"
@@ -78,7 +71,7 @@ for model in ${MODELS:-parakeet whisper canary_qwen}; do
 
     stamp "$model W$bits quantize and evaluate start"
     python -u asrq/exp.py model=$model transform=rotation transform.path=$rotation $grid $EXPERIMENT \
-      $RECOVERY ${BLOCK_OUT[$model]} \
+      $RECOVERY \
       activation_bits=16 calibration.num_samples=2048 quantized_path=null \
       model.eval_batch_size=${BATCH[$model]} create_audio_files=False method=wo_w$bits 2>&1 | tr '\r' '\n'
     stamp "$model W$bits quantize and evaluate end"

@@ -27,8 +27,7 @@ from asrq import tracking
 def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
     """Copy the settings the quantizer and transform read from elsewhere in the config, in place.
 
-    The model config supplies the modules to leave unquantized and, for Conformer models, whether the
-    Linear a rotation inserts after each block's output norm is quantized. The top-level activation
+    The model config supplies the modules to leave unquantized. The top-level activation
     settings are the ones evaluation uses; rotation learning gets the same ones, so a rotation is
     learned against the quantization it will be evaluated with.
 
@@ -45,10 +44,8 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
         learn_rotation: For the rotation transform, whether obtain_transform learns a rotation
             (rot-exp.py) or only a saved one is applied (exp.py).
     """
-    quantize_block_output_linear = cfg.model.get("quantize_block_output_linear", False)
     with open_dict(cfg.quantizer):
         cfg.quantizer.exclude_modules = cfg.model.exclude_modules
-        cfg.quantizer.quantize_block_output_linear = quantize_block_output_linear
         if cfg.activation_bits < 16 and cfg.quantizer.get("scale_recovery", False):
             print(
                 f"scale_recovery is off: activation_bits={cfg.activation_bits} quantizes the activations, "
@@ -57,7 +54,6 @@ def prepare_experiment_config(cfg: DictConfig, learn_rotation: bool) -> None:
             cfg.quantizer.scale_recovery = False
     with open_dict(cfg.transform):
         cfg.transform.model_name = cfg.model.name
-        cfg.transform.quantize_block_output_linear = quantize_block_output_linear
         cfg.transform.wbits = cfg.quantizer.bits
         cfg.transform.abits = cfg.activation_bits
         cfg.transform.activation_group_size = cfg.activation_group_size
