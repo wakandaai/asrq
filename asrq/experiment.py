@@ -164,6 +164,9 @@ def run_experiment(cfg: DictConfig, results_dir: str = "results/evaluations") ->
 
 def _run_experiment(cfg: DictConfig, results_dir: str) -> Tuple[ModelQ, Optional[str]]:
     """run_experiment's body, inside the tracking run."""
+    if cfg.evaluate:
+        # created before the transform and the quantization, so a directory that cannot be made fails here
+        os.makedirs(results_dir, exist_ok=True)
     modelQ = ModelQ.from_pretrained(
         cfg.model.name, QuantConfig.from_dictconfig(cfg.quantizer), CalibConfig.from_dictconfig(cfg.calibration)
     )

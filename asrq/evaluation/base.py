@@ -80,8 +80,7 @@ def evaluation_splits(cfg):
 
 
 def evaluate_openasr(modelQ, cfg, generate_fn, evaluation_results_file, create_audio_files=False):
-    if not os.path.exists("results"):
-        os.makedirs("results")
+    os.makedirs(os.path.dirname(evaluation_results_file) or ".", exist_ok=True)
     if not os.path.exists(evaluation_results_file):
         with open(evaluation_results_file, "w") as f:
             f.write("model,method,quantizer,transform,wbits,abits,dataset,split,wer\n")

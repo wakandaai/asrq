@@ -93,8 +93,7 @@ def write_manifest(
     )
 
     basedir = "./results/"
-    if not os.path.exists(basedir):
-        os.makedirs(basedir)
+    os.makedirs(basedir, exist_ok=True)
 
     manifest_path = os.path.join(
         basedir, f"MODEL_{model_id}_DATASET_{dataset_name}_{split}.jsonl"

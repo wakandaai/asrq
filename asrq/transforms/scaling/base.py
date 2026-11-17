@@ -7,6 +7,8 @@ from asrq.transforms.rotation.canary_qwen_utils import canary_qwen_logits_fn
 from asrq.transforms.scaling.canary_qwen_utils import get_canary_qwen_layers_to_scale
 from asrq.transforms.scaling.parakeet_ctc_utils import get_parakeet_ctc_layers_to_scale
 from asrq.transforms.scaling.whisper_utils import get_whisper_layers_to_scale
+import os
+
 import torch
 import torch.nn as nn
 
@@ -186,6 +188,7 @@ def obtain_scales(modelQ, layers_to_scale, scale_path, forward_fn, head_dim, typ
             scale = activation ** alpha
         final_scales[layer_names[0]] = scale.clamp(min=MIN_SCALE).cpu()
     print(f"alpha={alpha:.2f} for all {len(final_scales)} entries; saving the scales to {scale_path}")
+    os.makedirs(os.path.dirname(scale_path) or ".", exist_ok=True)
     torch.save(final_scales, scale_path)
 
 

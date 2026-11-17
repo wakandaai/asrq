@@ -1,3 +1,4 @@
+import os
 import types
 from contextlib import contextmanager
 from typing import Callable, Mapping, Optional, Sequence, Tuple, Union
@@ -1418,6 +1419,7 @@ def fold_rotations(
 
 def _save_rotations(path, R1, R2s, multi_stream, settings) -> None:
     """Save a learned rotation in the checkpoint format apply_rotations reads, with its settings."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(
         {
             "R1": (
